@@ -1,0 +1,35 @@
+defaults:
+  - base_dataset
+
+dataset_dir: /scr2/shared/world_model/libero
+cache_dir: /scr2/hyeonhoo/libero_cache
+horizon: 16
+val_horizon: 200
+aug_mode: none
+skip_frame: 1
+pad_after: 7
+pad_before: 1
+skip_idx: 2
+use_cache: true
+resolution: 128
+val_ratio: 0.1
+obs_keys: [image]
+goal_sample: intermediate
+
+shape_meta:
+  action:
+    shape:
+    - 7
+  obs:
+    image:
+      shape:
+      - 3   # C
+      - 128  # H
+      - 128  # W
+      type: rgb
+    wrist_image:
+      shape:
+      - 3   # C
+      - 128  # H
+      - 128  # W
+      type: rgb
