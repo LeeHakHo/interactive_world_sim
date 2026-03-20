@@ -43,11 +43,66 @@ def _decode_image(img_dict: dict, h: int, w: int) -> np.ndarray:
     return img_np
 
 
+_FLOW_STORAGE_SIZE = (256, 256)  # spatial resolution stored in zarr
+
+
+def _load_flow_frame(flow_dir: str, episode_idx: int, frame_idx: int, split: str = "train") -> Optional[np.ndarray]:
+    """Load one frame of optical flow from a per-episode .pt file.
+
+    File format: {flow_dir}/{split}/{episode_idx}/0.pt  shape (T, 2, H, W)
+    Returns (2, 64, 64) float32 numpy array, or None if file missing.
+    """
+    flow_path = os.path.join(flow_dir, split, str(episode_idx), "0.pt")
+    if not os.path.exists(flow_path):
+        return None
+    episode_flow = torch.load(flow_path, map_location="cpu", weights_only=True)  # (T, 2, H, W)
+    if not isinstance(episode_flow, torch.Tensor) or episode_flow.ndim != 4:
+        return None
+    frame_idx = min(frame_idx, episode_flow.shape[0] - 1)
+    frame = episode_flow[frame_idx].unsqueeze(0)  # (1, 2, H, W)
+    frame = torch.nn.functional.interpolate(
+        frame, size=_FLOW_STORAGE_SIZE, mode="bilinear", align_corners=False
+    )  # (1, 2, 64, 64)
+    return frame.squeeze(0).float().numpy()  # (2, 64, 64)
+
+
+def _load_episode_flow(flow_dir: str, episode_idx: int, episode_length: int, split: str = "train") -> Optional[np.ndarray]:
+    """Load full episode flow and downsample. Returns (T, 2, 64, 64) or None."""
+    flow_path = os.path.join(flow_dir, split, str(episode_idx), "0.pt")
+    if not os.path.exists(flow_path):
+        return None
+    episode_flow = torch.load(flow_path, map_location="cpu", weights_only=True)  # (T, 2, H, W)
+    if not isinstance(episode_flow, torch.Tensor) or episode_flow.ndim != 4:
+        return None
+    # clip/pad to episode_length
+    T = episode_flow.shape[0]
+    if T > episode_length:
+        episode_flow = episode_flow[:episode_length]
+    elif T < episode_length:
+        pad = episode_flow[-1:].expand(episode_length - T, -1, -1, -1)
+        episode_flow = torch.cat([episode_flow, pad], dim=0)
+    episode_flow = torch.nn.functional.interpolate(
+        episode_flow, size=_FLOW_STORAGE_SIZE, mode="bilinear", align_corners=False
+    )  # (T, 2, 64, 64)
+    return episode_flow.float().numpy()
+
+
+def _detect_flow_available(flow_dir: str, episode_indices: List[int], split: str = "train") -> bool:
+    """Check if flow data exists for at least one episode."""
+    for epi_idx in episode_indices:
+        flow_path = os.path.join(flow_dir, split, str(epi_idx), "0.pt")
+        if os.path.exists(flow_path):
+            return True
+    return False
+
+
 def _convert_libero_to_replay(
     store: zarr.storage.Store,
     shape_meta: dict,
     dataset_dir: str,
     episode_indices: List[int],
+    flow_dir: Optional[str] = None,
+    flow_split: str = "train",
     n_workers: Optional[int] = None,
     max_inflight_tasks: Optional[int] = None,
 ) -> ReplayBuffer:
@@ -77,23 +132,64 @@ def _convert_libero_to_replay(
     chunks_size = info["chunks_size"]
     data_path_template = info["data_path"]
 
-    episode_ends: list = []
-    prev_end = 0
+    # detect flow availability before the main loop
+    has_flow = False
+    if flow_dir is not None:
+        has_flow = _detect_flow_available(flow_dir, episode_indices, split=flow_split)
+        if has_flow:
+            print(f"Flow features detected: storing at {_FLOW_STORAGE_SIZE}")
+        else:
+            print("Warning: flow_dir provided but no flow files found. Skipping flow.")
+
+    # first pass: collect episode lengths to know total steps
+    episode_lengths: list = []
+    for epi_idx in tqdm(episode_indices, desc="Scanning episodes"):
+        chunk_idx = epi_idx // chunks_size
+        parquet_path = os.path.join(
+            dataset_dir,
+            data_path_template.format(episode_chunk=chunk_idx, episode_index=epi_idx),
+        )
+        df = pd.read_parquet(parquet_path, columns=["actions"])
+        episode_lengths.append(len(df))
+
+    episode_ends = list(np.cumsum(episode_lengths))
+    n_steps = episode_ends[-1]
+    meta_group.array(
+        "episode_ends", episode_ends, dtype=np.int64, compressor=None, overwrite=True
+    )
+
+    # pre-allocate zarr arrays for lowdim and flow
+    lowdim_zarr: dict = {}
+    action_shape = (n_steps, 7)  # placeholder; real shape set after first episode
+    for key in ["action"] + lowdim_keys:
+        lowdim_zarr[key] = None  # lazily initialized after first episode
+
+    flow_zarr = None
+    if has_flow:
+        fh, fw = _FLOW_STORAGE_SIZE
+        flow_zarr = data_group.zeros(
+            name="flow",
+            shape=(n_steps, 2, fh, fw),
+            chunks=(min(64, n_steps), 2, fh, fw),
+            dtype=np.float32,
+            overwrite=True,
+        )
+
     lowdim_data_dict: dict = {"action": []}
     for key in lowdim_keys:
         lowdim_data_dict[key] = []
     rgb_data_dict: dict = {k: [] for k in rgb_keys}
 
-    for epi_idx in tqdm(episode_indices, desc="Loading episodes"):
+    write_ptr = 0
+    for epi_idx, episode_length in tqdm(
+        zip(episode_indices, episode_lengths), desc="Loading episodes", total=len(episode_indices)
+    ):
         chunk_idx = epi_idx // chunks_size
         parquet_path = os.path.join(
             dataset_dir,
             data_path_template.format(episode_chunk=chunk_idx, episode_index=epi_idx),
         )
         df = pd.read_parquet(parquet_path)
-        episode_length = len(df)
-        episode_ends.append(prev_end + episode_length)
-        prev_end += episode_length
 
         lowdim_data_dict["action"].append(
             np.stack(df["actions"].values).astype(np.float32)
@@ -109,10 +205,14 @@ def _convert_libero_to_replay(
             )  # (T, H, W, C)
             rgb_data_dict[key].append(imgs)
 
-    n_steps = episode_ends[-1]
-    meta_group.array(
-        "episode_ends", episode_ends, dtype=np.int64, compressor=None, overwrite=True
-    )
+        # write flow incrementally to avoid large RAM spike
+        if flow_zarr is not None:
+            epi_flow = _load_episode_flow(flow_dir, epi_idx, episode_length, split=flow_split)
+            if epi_flow is None:
+                epi_flow = np.zeros((episode_length, 2, *_FLOW_STORAGE_SIZE), dtype=np.float32)
+            flow_zarr[write_ptr:write_ptr + episode_length] = epi_flow
+
+        write_ptr += episode_length
 
     for key, data in lowdim_data_dict.items():
         arr = np.concatenate(data, axis=0)
@@ -171,6 +271,8 @@ def load_replay_buffer(
     episode_indices: List[int],
     cache_name: str = "cache",
     cache_dir: Optional[str] = None,
+    flow_dir: Optional[str] = None,
+    flow_split: str = "train",
 ) -> ReplayBuffer:
     if cache_dir is None:
         cache_dir = dataset_dir
@@ -188,6 +290,8 @@ def load_replay_buffer(
                         shape_meta=shape_meta,
                         dataset_dir=dataset_dir,
                         episode_indices=episode_indices,
+                        flow_dir=flow_dir,
+                        flow_split=flow_split,
                     )
                     print("Saving cache to disk.")
                     with zarr.ZipStore(cache_zarr_path) as zip_store:
@@ -209,6 +313,8 @@ def load_replay_buffer(
             shape_meta=shape_meta,
             dataset_dir=dataset_dir,
             episode_indices=episode_indices,
+            flow_dir=flow_dir,
+            flow_split=flow_split,
         )
     return replay_buffer
 
@@ -249,6 +355,8 @@ class LiberoDataset(BaseImageDataset):
 
         cache_dir = cfg.cache_dir if "cache_dir" in cfg else None
         self._cache_dir = cache_dir
+        flow_dir = cfg.flow_dir if "flow_dir" in cfg else None
+        self._flow_dir = flow_dir
 
         self.replay_buffer = load_replay_buffer(
             dataset_dir=dataset_dir,
@@ -257,6 +365,8 @@ class LiberoDataset(BaseImageDataset):
             episode_indices=train_episode_indices,
             cache_name="cache_train",
             cache_dir=cache_dir,
+            flow_dir=flow_dir,
+            flow_split="train",
         )
 
         rgb_keys: list = []
@@ -272,6 +382,8 @@ class LiberoDataset(BaseImageDataset):
         train_mask = np.ones((self.replay_buffer.n_episodes,), dtype=bool)
         all_keys = list(self.replay_buffer.keys())
 
+        intermediate_keys = ["action"]
+
         self.sampler = SequenceSampler(
             replay_buffer=self.replay_buffer,
             sequence_length=horizon,
@@ -281,7 +393,7 @@ class LiberoDataset(BaseImageDataset):
             goal_sample=cfg.goal_sample,
             keys=all_keys,
             skip_frame=cfg.skip_frame,
-            keys_to_keep_intermediate=["action"],
+            keys_to_keep_intermediate=intermediate_keys,
         )
 
         self.shape_meta = shape_meta
@@ -328,8 +440,11 @@ class LiberoDataset(BaseImageDataset):
             episode_indices=self._val_episode_indices,
             cache_name="cache_val",
             cache_dir=self._cache_dir,
+            flow_dir=self._flow_dir,
+            flow_split="val",
         )
         val_mask = np.ones((val_set.replay_buffer.n_episodes,), dtype=bool)
+        val_keys = list(val_set.replay_buffer.keys())
         val_set.sampler = SequenceSampler(
             replay_buffer=val_set.replay_buffer,
             sequence_length=self.val_horizon,
@@ -339,6 +454,7 @@ class LiberoDataset(BaseImageDataset):
             skip_idx=self.skip_idx,
             goal_sample=self.goal_sample,
             skip_frame=self.skip_frame,
+            keys=val_keys,
             keys_to_keep_intermediate=["action"],
         )
         val_set.train_mask = val_mask
@@ -372,6 +488,8 @@ class LiberoDataset(BaseImageDataset):
             "is_early_stop": torch.from_numpy(np.array([sample["is_early_stop"]])),
             "rel_stop_idx": torch.from_numpy(np.array([sample["rel_stop_idx"]])),
         }
+        if "flow" in sample:
+            data["flow"] = torch.from_numpy(sample["flow"].astype(np.float32))
         return data
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:

@@ -24,6 +24,9 @@ training_stage: 1
 load_ae: ${eval:'None'}
 dtype: ${torch:float}
 mask_prev_action: False
+use_optical_flow: false
+flow_emb_dim: 128
+flow_rec_loss_weight: 1.0
 
 device: cuda
 noise_level: log_normal
