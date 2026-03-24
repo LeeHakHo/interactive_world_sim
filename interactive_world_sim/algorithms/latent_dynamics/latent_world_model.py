@@ -21,7 +21,7 @@ from interactive_world_sim.algorithms.common.metrics import (
     LearnedPerceptualImagePatchSimilarity,
 )
 from interactive_world_sim.algorithms.models.cm_decoder import CMDecoder
-from interactive_world_sim.algorithms.models.flownet import FlowDecoder, FlowPredictor
+from interactive_world_sim.algorithms.models.flownet import FlowPredictor
 from interactive_world_sim.algorithms.models.utils import EinopsWrapper
 from interactive_world_sim.utils.cm_utils import DDPMScheduler
 from interactive_world_sim.utils.logging_utils import (
@@ -102,11 +102,9 @@ class LatentWorldModel(BasePytorchAlgo):
 
         # optical flow modules (only built when use_optical_flow=True)
         if self.use_optical_flow:
-            self.flow_decoder = FlowDecoder(flow_emb_dim=self.flow_emb_dim)
             self.flow_predictor = FlowPredictor(
                 latent_ch=self.num_latent_channel,
                 action_dim=self.cfg.action_dim,
-                flow_emb_dim=self.flow_emb_dim,
             )
 
         # encoder
@@ -130,18 +128,19 @@ class LatentWorldModel(BasePytorchAlgo):
             cfg_path = f"{load_ae_dir}/.hydra/config.yaml"
             cfg_cp = OmegaConf.load(cfg_path)
             cfg_cp.load_ae = None
+            cfg_cp.algorithm.use_optical_flow = self.use_optical_flow  
             diffae = LatentWorldModel.load_from_checkpoint(
                 self.load_ae,
                 cfg=cfg_cp.algorithm,
                 map_location=self.device,
                 weights_only=False,
+                strict=False,
             )
             self.encoder.load_state_dict(diffae.encoder.state_dict())
             if self.training_stage == 3:
                 self.dynamics.load_state_dict(diffae.dynamics.state_dict())
             self.decoder.load_state_dict(diffae.decoder.state_dict())
-            if self.use_optical_flow and hasattr(diffae, "flow_decoder"):
-                self.flow_decoder.load_state_dict(diffae.flow_decoder.state_dict())
+            if self.use_optical_flow and hasattr(diffae, "flow_predictor"):
                 self.flow_predictor.load_state_dict(diffae.flow_predictor.state_dict())
 
         self.validation_fid_model = (
@@ -167,7 +166,6 @@ class LatentWorldModel(BasePytorchAlgo):
             ]
             if self.use_optical_flow:
                 stage1_params += [
-                    {"params": self.flow_decoder.parameters(), "lr": self.cfg.lr},
                     {"params": self.flow_predictor.parameters(), "lr": self.cfg.lr},
                 ]
             param_groups = stage1_params
@@ -217,19 +215,22 @@ class LatentWorldModel(BasePytorchAlgo):
             },
         }
 
-    def encoder_forward(self, obs: torch.Tensor) -> torch.Tensor:
+    def encoder_forward(self, obs: torch.Tensor, return_raw: bool = False):
         """Forward pass of the encoder
 
         Args:
             obs: (B, C, H, W)
+            return_raw: if True, also return the unnormalized latent
 
         Returns:
             z: (B, C_latent, H_latent, W_latent)
+            z_raw (optional): unnormalized latent, returned when return_raw=True
         """
         assert (
             len(obs.shape) == 4
         ), f"Expected obs to have shape (B, C, H, W) but got {obs.shape}"
-        z = self.encoder(obs)
+        z_raw = self.encoder(obs)
+        z = z_raw.clone()
         num_views = len(self.obs_keys)
         c_per_v = z.shape[1] // num_views
         for i in range(num_views):
@@ -237,6 +238,8 @@ class LatentWorldModel(BasePytorchAlgo):
             z[:, i * c_per_v : (i + 1) * c_per_v] = z_chunk / (
                 torch.norm(z_chunk, dim=(1), keepdim=True) + 1e-8
             )
+        if return_raw:
+            return z, z_raw
         return z
 
     def optimizer_step(
@@ -430,7 +433,7 @@ class LatentWorldModel(BasePytorchAlgo):
             z_seq = z_gt
         z_seq = rearrange(z_seq, "b t c h w -> (b t) c h w")
 
-        # render images
+        # render images (limit to first 2 batches to avoid OOM)
         if self.val_render and batch_idx < 2:
             xs_pred = render_img_cm(
                 self, z_seq, xs.shape[-1], self.normalizer, num_views=self.num_views, batch_size=10
@@ -550,7 +553,7 @@ class LatentWorldModel(BasePytorchAlgo):
 
         if self.training_stage == 1:
             # stage 1: train encoder and decoder
-            z = self.encoder_forward(xs)  # (B*T, C, H, W)
+            z, z_raw = self.encoder_forward(xs, return_raw=True)  # (B*T, C, H, W)
             if self.robust_latent:
                 z += torch.randn_like(z) * 0.02
 
@@ -620,11 +623,10 @@ class LatentWorldModel(BasePytorchAlgo):
             # flow auxiliary loss (Stage 1 only): (z, action) → predict flow
             self.log("training/img_rec_loss", loss)
             if self.use_optical_flow and "flow" in batch:
-                flow_raw = batch["flow"].float()                          # (B, T, 2, H, W)
+                flow_raw = batch["flow"].float()                              # (B, T, 2, H, W)
                 flow_flat = rearrange(flow_raw, "b t c h w -> (b t) c h w")  # (B*T, 2, H, W)
-                action_flat = rearrange(action, "b t a -> (b t) a")      # (B*T, A)
-                flow_emb = self.flow_predictor(z, action_flat)            # (B*T, flow_emb_dim)
-                flow_pred = self.flow_decoder(flow_emb)                   # (B*T, 2, 256, 256)
+                action_flat = rearrange(action, "b t a -> (b t) a")          # (B*T, A)
+                flow_pred = self.flow_predictor(z_raw, action_flat)           # (B*T, 2, H_lat, W_lat)
                 if flow_flat.shape[-2:] != flow_pred.shape[-2:]:
                     flow_flat = F.interpolate(
                         flow_flat, size=flow_pred.shape[-2:], mode="bilinear", align_corners=False
@@ -824,8 +826,7 @@ class LatentWorldModel(BasePytorchAlgo):
         z_show = z[:n_show]                                          # (N, latent_ch, H, W)
         action_flat = rearrange(action, "b t a -> (b t) a")[:n_show] # (N, A)
 
-        flow_emb = self.flow_predictor(z_show, action_flat)          # (N, flow_emb_dim)
-        flow_pred = self.flow_decoder(flow_emb)                      # (N, 2, 256, 256)
+        flow_pred = self.flow_predictor(z_show, action_flat)          # (N, 2, H_lat, W_lat)
         if flow_show.shape[-2:] != flow_pred.shape[-2:]:
             flow_show = F.interpolate(
                 flow_show, size=flow_pred.shape[-2:], mode="bilinear", align_corners=False
