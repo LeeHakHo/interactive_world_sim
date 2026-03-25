@@ -216,21 +216,43 @@ class LatentWorldModel(BasePytorchAlgo):
             },
         }
 
-    def encoder_forward(self, obs: torch.Tensor, return_raw: bool = False):
+    def encoder_forward(self, obs: torch.Tensor, return_raw: bool = False, return_feats: bool = False):
         """Forward pass of the encoder
 
         Args:
             obs: (B, C, H, W)
             return_raw: if True, also return the unnormalized latent
+            return_feats: if True, also return intermediate encoder features
+                          (feat0 at full res, feat1 at half res)
 
         Returns:
             z: (B, C_latent, H_latent, W_latent)
-            z_raw (optional): unnormalized latent, returned when return_raw=True
+            z_raw (optional): unnormalized latent, returned when return_raw=True or return_feats=True
+            feat0 (optional): (B, C_latent, H, W) - after first conv, full resolution
+            feat1 (optional): (B, C_latent, H/2, W/2) - after first downsample block
         """
         assert (
             len(obs.shape) == 4
         ), f"Expected obs to have shape (B, C, H, W) but got {obs.shape}"
-        z_raw = self.encoder(obs)
+
+        if return_feats:
+            # Run layer-by-layer to capture intermediate features
+            # encoder[0]: Conv2d -> feat0 at full res
+            x = self.encoder[0](obs)
+            feat0 = x
+            # each downsample block = 4 layers (SiLU, Conv, SiLU, Conv(stride=2))
+            block_start = 1
+            feats_after_blocks = []
+            for _ in range(self.num_latent_downsample):
+                for j in range(4):
+                    x = self.encoder[block_start + j](x)
+                feats_after_blocks.append(x)
+                block_start += 4
+            z_raw = feats_after_blocks[-1]   # (B, C, H/4, W/4) for num_latent_downsample=2
+            feat1 = feats_after_blocks[0]    # (B, C, H/2, W/2)
+        else:
+            z_raw = self.encoder(obs)
+
         z = z_raw.clone()
         num_views = len(self.obs_keys)
         c_per_v = z.shape[1] // num_views
@@ -239,6 +261,8 @@ class LatentWorldModel(BasePytorchAlgo):
             z[:, i * c_per_v : (i + 1) * c_per_v] = z_chunk / (
                 torch.norm(z_chunk, dim=(1), keepdim=True) + 1e-8
             )
+        if return_feats:
+            return z, z_raw, feat0, feat1
         if return_raw:
             return z, z_raw
         return z
@@ -390,7 +414,10 @@ class LatentWorldModel(BasePytorchAlgo):
         # compute gt latent
         xs = obs
         xs = rearrange(xs, "b t c h w -> (b t) c h w")
-        z_gt = self.encoder_forward(xs)
+        if self.use_optical_flow and "flow" in batch:
+            z_gt, z_raw_val, feat0_val, feat1_val = self.encoder_forward(xs, return_feats=True)
+        else:
+            z_gt = self.encoder_forward(xs)
         z_gt = rearrange(z_gt, "(b t) c h w -> b t c h w", b=obs.shape[0])
 
         if self.training_stage in [1]:
@@ -454,7 +481,10 @@ class LatentWorldModel(BasePytorchAlgo):
             and self.logger
             and self.training_stage == 1
         ):
-            self._log_flow_images(batch, action, namespace, z=z_seq)
+            self._log_flow_images(
+                batch, action, namespace,
+                z_raw=z_raw_val, feat0=feat0_val, feat1=feat1_val,
+            )
         return
 
     # ========= training  ============
@@ -554,7 +584,10 @@ class LatentWorldModel(BasePytorchAlgo):
 
         if self.training_stage == 1:
             # stage 1: train encoder and decoder
-            z, z_raw = self.encoder_forward(xs, return_raw=True)  # (B*T, C, H, W)
+            if self.use_optical_flow:
+                z, z_raw, feat0, feat1 = self.encoder_forward(xs, return_feats=True)  # (B*T, C, H, W)
+            else:
+                z, z_raw = self.encoder_forward(xs, return_raw=True)  # (B*T, C, H, W)
 
             if self.img_rec_loss_weight > 0:
                 if self.robust_latent:
@@ -628,14 +661,17 @@ class LatentWorldModel(BasePytorchAlgo):
             else:
                 loss = torch.tensor(0.0, device=self.device, dtype=xs.dtype)
 
-            # flow auxiliary loss (Stage 1 only): (z, action) → predict flow
+            # flow auxiliary loss (Stage 1 only): (encoder feats, action) -> predict flow
             if self.use_optical_flow and "flow" in batch:
                 B_seq, T_seq = action.shape[0], action.shape[1]
-                z_raw_seq = rearrange(z_raw, "(b t) c h w -> b t c h w", b=B_seq, t=T_seq)
-                # stride-2 flow: flow[i] = motion of frame 2i → 2i+2
+                # stride-2 flow: flow[i] = motion of frame 2i -> 2i+2
                 # use even frames (0, 2, 4, ...) to match flow indices
-                z_raw_seq = rearrange(z_raw, "(b t) c h w -> b t c h w", b=B_seq, t=T_seq)
-                z_raw_even = z_raw_seq[:, ::2]                                 # (B, T//2, C, H, W)
+                z_raw_seq  = rearrange(z_raw,  "(b t) c h w -> b t c h w", b=B_seq, t=T_seq)
+                feat0_seq  = rearrange(feat0,  "(b t) c h w -> b t c h w", b=B_seq, t=T_seq)
+                feat1_seq  = rearrange(feat1,  "(b t) c h w -> b t c h w", b=B_seq, t=T_seq)
+                z_raw_even = z_raw_seq[:, ::2]                                 # (B, T//2, C, H/4, W/4)
+                feat0_even = feat0_seq[:, ::2]                                 # (B, T//2, C, H,   W)
+                feat1_even = feat1_seq[:, ::2]                                 # (B, T//2, C, H/2, W/2)
                 a1 = action[:, ::2]                                             # (B, ceil(T/2), A)
                 a2 = action[:, 1::2]                                            # (B, floor(T/2), A)
                 min_t = min(a1.shape[1], a2.shape[1])
@@ -648,13 +684,12 @@ class LatentWorldModel(BasePytorchAlgo):
                     action_even = a1
                 T_even = z_raw_even.shape[1]
                 flow_raw = batch["flow"][:, :T_even].float()                   # (B, T//2, 2, H, W)
-                flow_flat = rearrange(flow_raw, "b t c h w -> (b t) c h w")
-                action_flat = rearrange(action_even, "b t a -> (b t) a")
-                z_raw_flat = rearrange(z_raw_even, "b t c h w -> (b t) c h w")
-                z_raw_flat = F.interpolate(
-                    z_raw_flat, size=flow_flat.shape[-2:], mode="bilinear", align_corners=False
-                )
-                flow_pred = self.flow_predictor(z_raw_flat, action_flat)
+                flow_flat    = rearrange(flow_raw,    "b t c h w -> (b t) c h w")
+                action_flat  = rearrange(action_even, "b t a -> (b t) a")
+                z_raw_flat   = rearrange(z_raw_even,  "b t c h w -> (b t) c h w")
+                feat0_flat   = rearrange(feat0_even,  "b t c h w -> (b t) c h w")
+                feat1_flat   = rearrange(feat1_even,  "b t c h w -> (b t) c h w")
+                flow_pred = self.flow_predictor(z_raw_flat, feat1_flat, feat0_flat, action_flat)
                 flow_flat_norm = torch.sign(flow_flat) * torch.sqrt(torch.abs(flow_flat) / 20.0 + 1e-7)
                 flow_pred_loss = F.mse_loss(flow_pred, flow_flat_norm.detach())
                 loss = loss + self.flow_rec_loss_weight * flow_pred_loss
@@ -840,27 +875,37 @@ class LatentWorldModel(BasePytorchAlgo):
 
     @torch.no_grad()
     def _log_flow_images(
-        self, batch: dict, action: torch.Tensor, namespace: str, z: torch.Tensor = None
+        self,
+        batch: dict,
+        action: torch.Tensor,
+        namespace: str,
+        z_raw: torch.Tensor = None,
+        feat0: torch.Tensor = None,
+        feat1: torch.Tensor = None,
     ) -> None:
         """Log GT vs predicted optical flow images to wandb (Stage 1 only)."""
-        if self.training_stage != 1 or z is None:
+        if self.training_stage != 1 or z_raw is None:
             return
 
         import wandb
 
         B_seq, T_seq = action.shape[0], action.shape[1]
-        z_raw_seq = rearrange(z, "(b t) c h w -> b t c h w", b=B_seq, t=T_seq)
+        z_raw_seq  = rearrange(z_raw,  "(b t) c h w -> b t c h w", b=B_seq, t=T_seq)
+        feat0_seq  = rearrange(feat0,  "(b t) c h w -> b t c h w", b=B_seq, t=T_seq)
+        feat1_seq  = rearrange(feat1,  "(b t) c h w -> b t c h w", b=B_seq, t=T_seq)
+
         T_even = z_raw_seq[:, ::2].shape[1]
         flow_raw = batch["flow"][:, :T_even].float()
         flow_flat = rearrange(flow_raw, "b t c h w -> (b t) c h w")
         n_show = min(4, flow_flat.shape[0])
 
-        flow_show = flow_flat[:n_show]
-        z_show = rearrange(z_raw_seq[:, ::2], "b t c h w -> (b t) c h w")[:n_show]
+        flow_show   = flow_flat[:n_show]
+        z_show      = rearrange(z_raw_seq[:,  ::2], "b t c h w -> (b t) c h w")[:n_show]
+        feat0_show  = rearrange(feat0_seq[:, ::2],  "b t c h w -> (b t) c h w")[:n_show]
+        feat1_show  = rearrange(feat1_seq[:, ::2],  "b t c h w -> (b t) c h w")[:n_show]
         action_flat = rearrange(action[:, ::2], "b t a -> (b t) a")[:n_show]
 
-        z_show = F.interpolate(z_show, size=flow_show.shape[-2:], mode="bilinear", align_corners=False)
-        flow_pred = self.flow_predictor(z_show, action_flat)          # (N, 2, H, W)
+        flow_pred = self.flow_predictor(z_show, feat1_show, feat0_show, action_flat)  # (N, 2, H, W)
 
         # normalize GT flow to tanh target range for fair comparison
         flow_show_norm = torch.sign(flow_show) * torch.sqrt(torch.abs(flow_show) / 20.0 + 1e-7)

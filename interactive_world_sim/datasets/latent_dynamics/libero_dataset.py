@@ -50,7 +50,7 @@ def _load_flow_frame(flow_dir: str, episode_idx: int, frame_idx: int, split: str
     """Load one frame of optical flow from a per-episode .pt file.
 
     File format: {flow_dir}/{split}/{episode_idx}/0.pt  shape (T, 2, H, W)
-    Returns (2, 64, 64) float32 numpy array, or None if file missing.
+    Returns (2, H, W) float32 numpy array at native resolution, or None if file missing.
     """
     flow_path = os.path.join(flow_dir, split, str(episode_idx), "0.pt")
     if not os.path.exists(flow_path):
@@ -59,15 +59,11 @@ def _load_flow_frame(flow_dir: str, episode_idx: int, frame_idx: int, split: str
     if not isinstance(episode_flow, torch.Tensor) or episode_flow.ndim != 4:
         return None
     frame_idx = min(frame_idx, episode_flow.shape[0] - 1)
-    frame = episode_flow[frame_idx].unsqueeze(0)  # (1, 2, H, W)
-    frame = torch.nn.functional.interpolate(
-        frame, size=_FLOW_STORAGE_SIZE, mode="bilinear", align_corners=False
-    )  # (1, 2, 64, 64)
-    return frame.squeeze(0).float().numpy()  # (2, 64, 64)
+    return episode_flow[frame_idx].float().numpy()  # (2, H, W)
 
 
 def _load_episode_flow(flow_dir: str, episode_idx: int, episode_length: int, split: str = "train") -> Optional[np.ndarray]:
-    """Load full episode flow and downsample. Returns (T, 2, 64, 64) or None."""
+    """Load full episode flow at native resolution. Returns (T, 2, H, W) or None."""
     flow_path = os.path.join(flow_dir, split, str(episode_idx), "0.pt")
     if not os.path.exists(flow_path):
         return None
@@ -81,9 +77,6 @@ def _load_episode_flow(flow_dir: str, episode_idx: int, episode_length: int, spl
     elif T < episode_length:
         pad = episode_flow[-1:].expand(episode_length - T, -1, -1, -1)
         episode_flow = torch.cat([episode_flow, pad], dim=0)
-    episode_flow = torch.nn.functional.interpolate(
-        episode_flow, size=_FLOW_STORAGE_SIZE, mode="bilinear", align_corners=False
-    )  # (T, 2, 64, 64)
     return episode_flow.float().numpy()
 
 
