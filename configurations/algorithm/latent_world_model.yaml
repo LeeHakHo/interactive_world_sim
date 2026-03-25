@@ -18,7 +18,7 @@ x_shape:
 norm_scale: 6.0
 num_latent_downsample: 2
 num_views: ${eval:'len(${dataset.obs_keys})'}
-num_latent_channel: ${eval:'4 * ${algorithm.num_views}'}
+num_latent_channel: ${eval:'16 * ${algorithm.num_views}'}
 latent_resolution: ${eval:'${dataset.resolution} // int(2 ** ${algorithm.num_latent_downsample})'}
 training_stage: 1
 load_ae: ${eval:'None'}
@@ -27,6 +27,8 @@ mask_prev_action: False
 use_optical_flow: false
 flow_emb_dim: 128
 flow_rec_loss_weight: 1.0
+img_rec_loss_weight: 1.0
+
 
 device: cuda
 noise_level: log_normal

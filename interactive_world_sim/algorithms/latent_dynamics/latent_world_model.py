@@ -45,6 +45,7 @@ class LatentWorldModel(BasePytorchAlgo):
         self.use_optical_flow = cfg.use_optical_flow if "use_optical_flow" in cfg else False
         self.flow_emb_dim = cfg.flow_emb_dim if "flow_emb_dim" in cfg else 128
         self.flow_rec_loss_weight = cfg.flow_rec_loss_weight if "flow_rec_loss_weight" in cfg else 1.0
+        self.img_rec_loss_weight = cfg.img_rec_loss_weight if "img_rec_loss_weight" in cfg else 1.0
         super().__init__(cfg)
         self.normalizer = LinearNormalizer()
         self.validation_step_outputs: list = []
@@ -103,7 +104,7 @@ class LatentWorldModel(BasePytorchAlgo):
         # optical flow modules (only built when use_optical_flow=True)
         if self.use_optical_flow:
             self.flow_predictor = FlowPredictor(
-                latent_ch=self.num_latent_channel,
+                latent_ch=self.cfg.x_shape[0],  # raw RGB channels (experiment: bypass encoder)
                 action_dim=self.cfg.action_dim,
             )
 
@@ -128,7 +129,7 @@ class LatentWorldModel(BasePytorchAlgo):
             cfg_path = f"{load_ae_dir}/.hydra/config.yaml"
             cfg_cp = OmegaConf.load(cfg_path)
             cfg_cp.load_ae = None
-            cfg_cp.algorithm.use_optical_flow = self.use_optical_flow  
+            cfg_cp.algorithm.use_optical_flow = self.use_optical_flow
             diffae = LatentWorldModel.load_from_checkpoint(
                 self.load_ae,
                 cfg=cfg_cp.algorithm,
@@ -554,84 +555,107 @@ class LatentWorldModel(BasePytorchAlgo):
         if self.training_stage == 1:
             # stage 1: train encoder and decoder
             z, z_raw = self.encoder_forward(xs, return_raw=True)  # (B*T, C, H, W)
-            if self.robust_latent:
-                z += torch.randn_like(z) * 0.02
 
-            t, s = self._generate_noise_levels(xs[None], self.dec_infer_steps)  # (1, B)
-            weights_t = self.noise_scheduler.get_weights(t)[0]  # (1, B)
-            weights_s = self.noise_scheduler.get_weights(s)[0]  # (1, B)
-            noisy_xs_t, noisy_xs_s = self.noise_scheduler.add_noise_to_t_s(
-                xs[None], t, s
-            )  # (1, B, C, H, W)
-            noisy_xs_t = noisy_xs_t.squeeze(0)  # (B, C, H, W)
-            noisy_xs_s = noisy_xs_s.squeeze(0)  # (B, C, H, W)
-            t = t.squeeze(0)  # (B)
-            s = s.squeeze(0)  # (B)
+            if self.img_rec_loss_weight > 0:
+                if self.robust_latent:
+                    z += torch.randn_like(z) * 0.02
 
-            u = torch.zeros_like(t).to(self.device)
-            pred_s = self._forward(
-                self.decoder,
-                noisy_xs_t,
-                t,
-                s,
-                external_cond=z,
-            )
-            if self.dec_infer_steps > 1:
-                pred_u = self._forward(
+                t, s = self._generate_noise_levels(xs[None], self.dec_infer_steps)  # (1, B)
+                weights_t = self.noise_scheduler.get_weights(t)[0]  # (1, B)
+                weights_s = self.noise_scheduler.get_weights(s)[0]  # (1, B)
+                noisy_xs_t, noisy_xs_s = self.noise_scheduler.add_noise_to_t_s(
+                    xs[None], t, s
+                )  # (1, B, C, H, W)
+                noisy_xs_t = noisy_xs_t.squeeze(0)  # (B, C, H, W)
+                noisy_xs_s = noisy_xs_s.squeeze(0)  # (B, C, H, W)
+                t = t.squeeze(0)  # (B)
+                s = s.squeeze(0)  # (B)
+
+                u = torch.zeros_like(t).to(self.device)
+                pred_s = self._forward(
                     self.decoder,
-                    noisy_xs_s,
+                    noisy_xs_t,
+                    t,
                     s,
-                    u,
                     external_cond=z,
                 )
-
-            if self.last_frame_loss_only:
-                loss_s = F.mse_loss(
-                    pred_s[-1:], noisy_xs_s[-1:].detach(), reduction="none"
-                )
-                weights_t = weights_t.view(
-                    *weights_t.shape, *((1,) * (loss_s.ndim - 2))
-                )[-1:]
-                loss_s = loss_s * weights_t
                 if self.dec_infer_steps > 1:
-                    loss_u = F.mse_loss(pred_u[-1:], xs[-1:].detach(), reduction="none")
-                    weights_s = weights_s.view(
-                        *weights_s.shape, *((1,) * (loss_u.ndim - 2))
-                    )[-1:]
-                    loss_u = loss_u * weights_s
-                    loss = loss_s + loss_u
-                else:
-                    loss = loss_s
-                loss = loss.mean()
-            else:
-                loss_s = F.mse_loss(pred_s, noisy_xs_s.detach(), reduction="none")
-                weights_t = weights_t.view(
-                    *weights_t.shape, *((1,) * (loss_s.ndim - 1))
-                )
-                loss_s = loss_s * weights_t
-                if self.dec_infer_steps > 1:
-                    loss_u = F.mse_loss(pred_u, xs.detach(), reduction="none")
-                    weights_s = weights_s.view(
-                        *weights_s.shape, *((1,) * (loss_s.ndim - 1))
+                    pred_u = self._forward(
+                        self.decoder,
+                        noisy_xs_s,
+                        s,
+                        u,
+                        external_cond=z,
                     )
-                    loss_u = loss_u * weights_s
-                    loss = loss_s + loss_u
+
+                if self.last_frame_loss_only:
+                    loss_s = F.mse_loss(
+                        pred_s[-1:], noisy_xs_s[-1:].detach(), reduction="none"
+                    )
+                    weights_t = weights_t.view(
+                        *weights_t.shape, *((1,) * (loss_s.ndim - 2))
+                    )[-1:]
+                    loss_s = loss_s * weights_t
+                    if self.dec_infer_steps > 1:
+                        loss_u = F.mse_loss(pred_u[-1:], xs[-1:].detach(), reduction="none")
+                        weights_s = weights_s.view(
+                            *weights_s.shape, *((1,) * (loss_u.ndim - 2))
+                        )[-1:]
+                        loss_u = loss_u * weights_s
+                        loss = loss_s + loss_u
+                    else:
+                        loss = loss_s
+                    loss = loss.mean()
                 else:
-                    loss = loss_s
-                loss = loss.mean()
+                    loss_s = F.mse_loss(pred_s, noisy_xs_s.detach(), reduction="none")
+                    weights_t = weights_t.view(
+                        *weights_t.shape, *((1,) * (loss_s.ndim - 1))
+                    )
+                    loss_s = loss_s * weights_t
+                    if self.dec_infer_steps > 1:
+                        loss_u = F.mse_loss(pred_u, xs.detach(), reduction="none")
+                        weights_s = weights_s.view(
+                            *weights_s.shape, *((1,) * (loss_s.ndim - 1))
+                        )
+                        loss_u = loss_u * weights_s
+                        loss = loss_s + loss_u
+                    else:
+                        loss = loss_s
+                    loss = loss.mean()
+
+                self.log("training/img_rec_loss", loss)
+                loss = loss * self.img_rec_loss_weight
+            else:
+                loss = torch.tensor(0.0, device=self.device, dtype=xs.dtype)
 
             # flow auxiliary loss (Stage 1 only): (z, action) → predict flow
-            self.log("training/img_rec_loss", loss)
             if self.use_optical_flow and "flow" in batch:
-                flow_raw = batch["flow"].float()                              # (B, T, 2, H, W)
-                flow_flat = rearrange(flow_raw, "b t c h w -> (b t) c h w")  # (B*T, 2, H, W)
-                action_flat = rearrange(action, "b t a -> (b t) a")          # (B*T, A)
-                flow_pred = self.flow_predictor(z_raw, action_flat)           # (B*T, 2, H_lat, W_lat)
+                B_seq, T_seq = action.shape[0], action.shape[1]
+                z_raw_seq = rearrange(z_raw, "(b t) c h w -> b t c h w", b=B_seq, t=T_seq)
+                # stride-2 flow: flow[i] = motion of frame 2i → 2i+2
+                # use even frames (0, 2, 4, ...) to match flow indices
+                xs_seq = rearrange(xs, "(b t) c h w -> b t c h w", b=B_seq, t=T_seq)
+                xs_even = xs_seq[:, ::2]                                        # (B, T//2, C, H, W)
+                a1 = action[:, ::2]                                             # (B, ceil(T/2), A)
+                a2 = action[:, 1::2]                                            # (B, floor(T/2), A)
+                min_t = min(a1.shape[1], a2.shape[1])
+                # sum of consecutive actions = total displacement over 2 frames
+                if min_t > 0:
+                    action_even = torch.zeros_like(a1)
+                    action_even[:, :min_t] = a1[:, :min_t] + a2[:, :min_t]
+                    action_even[:, min_t:] = a1[:, min_t:]
+                else:
+                    action_even = a1
+                T_even = xs_even.shape[1]
+                flow_raw = batch["flow"][:, :T_even].float()                   # (B, T//2, 2, H, W)
+                flow_flat = rearrange(flow_raw, "b t c h w -> (b t) c h w")
+                action_flat = rearrange(action_even, "b t a -> (b t) a")
+                xs_flat = rearrange(xs_even, "b t c h w -> (b t) c h w")      # raw RGB, no encoder
+                flow_pred = self.flow_predictor(xs_flat, action_flat)
                 if flow_flat.shape[-2:] != flow_pred.shape[-2:]:
-                    flow_flat = F.interpolate(
-                        flow_flat, size=flow_pred.shape[-2:], mode="bilinear", align_corners=False
-                    )
-                flow_pred_loss = F.mse_loss(flow_pred, flow_flat.detach())
+                    flow_flat = F.interpolate(flow_flat, size=flow_pred.shape[-2:], mode="bilinear", align_corners=False)
+                flow_flat_norm = torch.sign(flow_flat) * torch.sqrt(torch.abs(flow_flat) / 20.0 + 1e-7)
+                flow_pred_loss = F.mse_loss(flow_pred, flow_flat_norm.detach())
                 loss = loss + self.flow_rec_loss_weight * flow_pred_loss
                 self.log("training/flow_pred_loss", flow_pred_loss)
 
@@ -794,17 +818,22 @@ class LatentWorldModel(BasePytorchAlgo):
         return self.validation_step(*args, **kwargs, namespace="test")  # type: ignore
 
     @staticmethod
-    def _flow_to_rgb(flow: torch.Tensor) -> torch.Tensor:
+    def _flow_to_rgb(flow: torch.Tensor, vmax: float = None) -> torch.Tensor:
         """Convert optical flow (2, H, W) → RGB (3, H, W) float [0, 1].
         R = normalized dx, G = normalized dy, B = normalized magnitude.
+        If vmax is given, normalize by fixed range [-vmax, vmax] for consistent comparison.
         """
         dx = flow[0].float()
         dy = flow[1].float()
         mag = (dx ** 2 + dy ** 2).sqrt()
 
-        def _norm(t: torch.Tensor) -> torch.Tensor:
-            lo, hi = t.min(), t.max()
-            return (t - lo) / (hi - lo + 1e-5)
+        if vmax is not None:
+            def _norm(t: torch.Tensor) -> torch.Tensor:
+                return (t.clamp(-vmax, vmax) + vmax) / (2 * vmax + 1e-5)
+        else:
+            def _norm(t: torch.Tensor) -> torch.Tensor:
+                lo, hi = t.min(), t.max()
+                return (t - lo) / (hi - lo + 1e-5)
 
         return torch.stack([_norm(dx), _norm(dy), _norm(mag)], dim=0)
 
@@ -818,24 +847,31 @@ class LatentWorldModel(BasePytorchAlgo):
 
         import wandb
 
-        flow_raw = batch["flow"].float()                              # (B, T, 2, H, W)
-        flow_flat = rearrange(flow_raw, "b t c h w -> (b t) c h w")  # (B*T, 2, H, W)
+        B_seq, T_seq = action.shape[0], action.shape[1]
+        T_even = T_seq // 2 + T_seq % 2
+        flow_raw = batch["flow"][:, :T_even].float()
+        flow_flat = rearrange(flow_raw, "b t c h w -> (b t) c h w")
         n_show = min(4, flow_flat.shape[0])
 
-        flow_show = flow_flat[:n_show]                               # (N, 2, H, W)
-        z_show = z[:n_show]                                          # (N, latent_ch, H, W)
-        action_flat = rearrange(action, "b t a -> (b t) a")[:n_show] # (N, A)
+        flow_show = flow_flat[:n_show]
+        # use raw obs images (experiment: bypass encoder)
+        obs_ls = [self.normalizer[k].normalize(batch["obs"][k]) for k in self.obs_keys]
+        obs = torch.cat(obs_ls, dim=2).float()  # (B, T, C, H, W)
+        xs_show = rearrange(obs[:, ::2], "b t c h w -> (b t) c h w")[:n_show]
+        action_flat = rearrange(action[:, ::2], "b t a -> (b t) a")[:n_show]
 
-        flow_pred = self.flow_predictor(z_show, action_flat)          # (N, 2, H_lat, W_lat)
-        if flow_show.shape[-2:] != flow_pred.shape[-2:]:
-            flow_show = F.interpolate(
-                flow_show, size=flow_pred.shape[-2:], mode="bilinear", align_corners=False
-            )
+        if flow_show.shape[-2:] != xs_show.shape[-2:]:
+            flow_show = F.interpolate(flow_show, size=xs_show.shape[-2:], mode="bilinear", align_corners=False)
+        flow_pred = self.flow_predictor(xs_show, action_flat)          # (N, 2, H, W)
+
+        # normalize GT flow to tanh target range for fair comparison
+        flow_show_norm = torch.sign(flow_show) * torch.sqrt(torch.abs(flow_show) / 20.0 + 1e-7)
+        vmax = 0.3  # most flow values after adaptive_normalize are in ~(-0.3, 0.3)
 
         images = []
         for i in range(n_show):
-            gt_rgb = self._flow_to_rgb(flow_show[i]).permute(1, 2, 0).cpu().numpy()
-            pr_rgb = self._flow_to_rgb(flow_pred[i]).permute(1, 2, 0).cpu().numpy()
+            gt_rgb = self._flow_to_rgb(flow_show_norm[i], vmax=vmax).permute(1, 2, 0).cpu().numpy()
+            pr_rgb = self._flow_to_rgb(flow_pred[i], vmax=vmax).permute(1, 2, 0).cpu().numpy()
             images.append(wandb.Image((gt_rgb * 255).astype(np.uint8), caption=f"GT {i}"))
             images.append(wandb.Image((pr_rgb * 255).astype(np.uint8), caption=f"pred {i}"))
 
