@@ -104,7 +104,7 @@ class LatentWorldModel(BasePytorchAlgo):
         # optical flow modules (only built when use_optical_flow=True)
         if self.use_optical_flow:
             self.flow_predictor = FlowPredictor(
-                latent_ch=self.cfg.x_shape[0],  # raw RGB channels (experiment: bypass encoder)
+                latent_ch=self.num_latent_channel,
                 action_dim=self.cfg.action_dim,
             )
 
@@ -634,8 +634,8 @@ class LatentWorldModel(BasePytorchAlgo):
                 z_raw_seq = rearrange(z_raw, "(b t) c h w -> b t c h w", b=B_seq, t=T_seq)
                 # stride-2 flow: flow[i] = motion of frame 2i → 2i+2
                 # use even frames (0, 2, 4, ...) to match flow indices
-                xs_seq = rearrange(xs, "(b t) c h w -> b t c h w", b=B_seq, t=T_seq)
-                xs_even = xs_seq[:, ::2]                                        # (B, T//2, C, H, W)
+                z_raw_seq = rearrange(z_raw, "(b t) c h w -> b t c h w", b=B_seq, t=T_seq)
+                z_raw_even = z_raw_seq[:, ::2]                                 # (B, T//2, C, H, W)
                 a1 = action[:, ::2]                                             # (B, ceil(T/2), A)
                 a2 = action[:, 1::2]                                            # (B, floor(T/2), A)
                 min_t = min(a1.shape[1], a2.shape[1])
@@ -646,14 +646,15 @@ class LatentWorldModel(BasePytorchAlgo):
                     action_even[:, min_t:] = a1[:, min_t:]
                 else:
                     action_even = a1
-                T_even = xs_even.shape[1]
+                T_even = z_raw_even.shape[1]
                 flow_raw = batch["flow"][:, :T_even].float()                   # (B, T//2, 2, H, W)
                 flow_flat = rearrange(flow_raw, "b t c h w -> (b t) c h w")
                 action_flat = rearrange(action_even, "b t a -> (b t) a")
-                xs_flat = rearrange(xs_even, "b t c h w -> (b t) c h w")      # raw RGB, no encoder
-                flow_pred = self.flow_predictor(xs_flat, action_flat)
-                if flow_flat.shape[-2:] != flow_pred.shape[-2:]:
-                    flow_flat = F.interpolate(flow_flat, size=flow_pred.shape[-2:], mode="bilinear", align_corners=False)
+                z_raw_flat = rearrange(z_raw_even, "b t c h w -> (b t) c h w")
+                z_raw_flat = F.interpolate(
+                    z_raw_flat, size=flow_flat.shape[-2:], mode="bilinear", align_corners=False
+                )
+                flow_pred = self.flow_predictor(z_raw_flat, action_flat)
                 flow_flat_norm = torch.sign(flow_flat) * torch.sqrt(torch.abs(flow_flat) / 20.0 + 1e-7)
                 flow_pred_loss = F.mse_loss(flow_pred, flow_flat_norm.detach())
                 loss = loss + self.flow_rec_loss_weight * flow_pred_loss
@@ -848,21 +849,18 @@ class LatentWorldModel(BasePytorchAlgo):
         import wandb
 
         B_seq, T_seq = action.shape[0], action.shape[1]
-        T_even = T_seq // 2 + T_seq % 2
+        z_raw_seq = rearrange(z, "(b t) c h w -> b t c h w", b=B_seq, t=T_seq)
+        T_even = z_raw_seq[:, ::2].shape[1]
         flow_raw = batch["flow"][:, :T_even].float()
         flow_flat = rearrange(flow_raw, "b t c h w -> (b t) c h w")
         n_show = min(4, flow_flat.shape[0])
 
         flow_show = flow_flat[:n_show]
-        # use raw obs images (experiment: bypass encoder)
-        obs_ls = [self.normalizer[k].normalize(batch["obs"][k]) for k in self.obs_keys]
-        obs = torch.cat(obs_ls, dim=2).float()  # (B, T, C, H, W)
-        xs_show = rearrange(obs[:, ::2], "b t c h w -> (b t) c h w")[:n_show]
+        z_show = rearrange(z_raw_seq[:, ::2], "b t c h w -> (b t) c h w")[:n_show]
         action_flat = rearrange(action[:, ::2], "b t a -> (b t) a")[:n_show]
 
-        if flow_show.shape[-2:] != xs_show.shape[-2:]:
-            flow_show = F.interpolate(flow_show, size=xs_show.shape[-2:], mode="bilinear", align_corners=False)
-        flow_pred = self.flow_predictor(xs_show, action_flat)          # (N, 2, H, W)
+        z_show = F.interpolate(z_show, size=flow_show.shape[-2:], mode="bilinear", align_corners=False)
+        flow_pred = self.flow_predictor(z_show, action_flat)          # (N, 2, H, W)
 
         # normalize GT flow to tanh target range for fair comparison
         flow_show_norm = torch.sign(flow_show) * torch.sqrt(torch.abs(flow_show) / 20.0 + 1e-7)
