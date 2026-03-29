@@ -493,6 +493,9 @@ class LiberoDataset(BaseImageDataset):
             )
             epi_end = self.replay_buffer.episode_ends[epi_idx]
             val_horizon = self.val_horizon
+            epi_len = epi_end - epi_start
+            offset = (idx % 4) * (epi_len // 4)  # 0%, 25%, 50%, 75% of episode
+            epi_start = epi_start + offset
             seq_end = min(epi_end, epi_start + val_horizon)
             sample = dict()
             for key in self.sampler.keys:

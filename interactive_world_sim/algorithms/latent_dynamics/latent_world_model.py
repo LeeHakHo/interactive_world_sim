@@ -81,6 +81,7 @@ class LatentWorldModel(BasePytorchAlgo):
             cfg.last_frame_loss_only if "last_frame_loss_only" in cfg else False
         )
         self.robust_latent = cfg.robust_latent if "robust_latent" in cfg else False
+        self.stage3_noise_scale = cfg.stage3_noise_scale if "stage3_noise_scale" in cfg else 0.02
         self.use_optical_flow = cfg.use_optical_flow if "use_optical_flow" in cfg else False
         self.flow_emb_dim = cfg.flow_emb_dim if "flow_emb_dim" in cfg else 128
         self.flow_rec_loss_weight = cfg.flow_rec_loss_weight if "flow_rec_loss_weight" in cfg else 1.0
@@ -128,7 +129,7 @@ class LatentWorldModel(BasePytorchAlgo):
             load_ae_dir = os.path.dirname(os.path.dirname(self.load_ae))
             cfg_path = f"{load_ae_dir}/.hydra/config.yaml"
             cfg_cp = OmegaConf.load(cfg_path)
-            cfg_cp.load_ae = None
+            cfg_cp.algorithm.load_ae = None
             cfg_cp.algorithm.use_optical_flow = self.use_optical_flow
             diffae = LatentWorldModel.load_from_checkpoint(
                 self.load_ae,
@@ -167,7 +168,7 @@ class LatentWorldModel(BasePytorchAlgo):
             ]
             if self.use_optical_flow:
                 stage1_params += [
-                    {"params": self.flow_predictor.parameters(), "lr": self.cfg.lr},
+                    {"params": self.flow_predictor.parameters(), "lr": self.cfg.lr * 0.5}, #different lr
                 ]
             param_groups = stage1_params
         elif self.training_stage == 2:
@@ -458,7 +459,30 @@ class LatentWorldModel(BasePytorchAlgo):
                 self.validation_metrics["dyn_loss"] = []
             self.validation_metrics["dyn_loss"].append(val_loss)
         else:
-            z_seq = z_gt
+            # stage 3: use dynamics rollout to reflect actual inference quality
+            z_0 = z_gt[:, 0]
+            z_seq_ls = []
+            z_last = z_0.clone()
+            horizon = z_gt.shape[1]
+
+            for i in range(1, action.shape[1], horizon):
+                action_chunk = action[:, i : i + horizon]
+                init_action_size = action_chunk.shape[1]
+                if init_action_size < horizon:
+                    action_chunk = F.pad(
+                        action_chunk,
+                        (0, 0, 0, horizon - action_chunk.shape[1]),
+                        mode="replicate",
+                    )
+                z_seq = self.dynamics_forward(
+                    z_last[:, None],
+                    action_chunk,
+                )
+                z_seq = z_seq[:, :init_action_size]
+                z_seq_ls.append(z_seq)
+                z_last = z_seq[:, -1].clone()
+            z_seq = torch.cat(z_seq_ls, 1)
+            z_seq = torch.cat([z_0.unsqueeze(1), z_seq], 1)
         z_seq = rearrange(z_seq, "b t c h w -> (b t) c h w")
 
         # render images (limit to first 2 batches to avoid OOM)
@@ -473,7 +497,7 @@ class LatentWorldModel(BasePytorchAlgo):
             xs = xs.detach().cpu()
             self.validation_step_outputs.append((xs_pred, xs))
 
-        # optical flow visualization (first batch only, Stage 1 only)
+        # optical flow visualization (Stage 1 only)
         if (
             self.use_optical_flow
             and "flow" in batch
@@ -675,10 +699,11 @@ class LatentWorldModel(BasePytorchAlgo):
                 a1 = action[:, ::2]                                             # (B, ceil(T/2), A)
                 a2 = action[:, 1::2]                                            # (B, floor(T/2), A)
                 min_t = min(a1.shape[1], a2.shape[1])
-                # sum of consecutive actions = total displacement over 2 frames
+                # average continuous dims over 2 frames, keep gripper (last dim) from a1 only
                 if min_t > 0:
                     action_even = torch.zeros_like(a1)
-                    action_even[:, :min_t] = a1[:, :min_t] + a2[:, :min_t]
+                    action_even[:, :min_t, :-1] = (a1[:, :min_t, :-1] + a2[:, :min_t, :-1]) / 2.0
+                    action_even[:, :min_t, -1:] = a1[:, :min_t, -1:]
                     action_even[:, min_t:] = a1[:, min_t:]
                 else:
                     action_even = a1
@@ -691,7 +716,10 @@ class LatentWorldModel(BasePytorchAlgo):
                 feat1_flat   = rearrange(feat1_even,  "b t c h w -> (b t) c h w")
                 flow_pred = self.flow_predictor(z_raw_flat, feat1_flat, feat0_flat, action_flat)
                 flow_flat_norm = torch.sign(flow_flat) * torch.sqrt(torch.abs(flow_flat) / 20.0 + 1e-7)
-                flow_pred_loss = F.mse_loss(flow_pred, flow_flat_norm.detach())
+                # magnitude weighting: high-motion pixels contribute more, static pixels contribute a little
+                weights = (flow_flat_norm.detach() ** 2).sum(dim=1, keepdim=True).sqrt() + 0.01  # (B*T, 1, H, W)
+                weights = weights / (weights.mean() + 1e-8)  # normalize to keep loss scale stable
+                flow_pred_loss = (F.mse_loss(flow_pred, flow_flat_norm.detach(), reduction='none') * weights).mean()
                 loss = loss + self.flow_rec_loss_weight * flow_pred_loss
                 self.log("training/flow_pred_loss", flow_pred_loss)
 
@@ -777,7 +805,7 @@ class LatentWorldModel(BasePytorchAlgo):
         elif self.training_stage == 3:
             with torch.no_grad():
                 z = self.encoder_forward(xs)  # (B*T, C, H, W)
-                z += torch.randn_like(z) * 0.02
+                z += torch.randn_like(z) * self.stage3_noise_scale
 
             t, s = self._generate_noise_levels(xs[None], self.dec_infer_steps)  # (1, B)
             weights_t = self.noise_scheduler.get_weights(t)[0]  # (1, B)
@@ -903,13 +931,26 @@ class LatentWorldModel(BasePytorchAlgo):
         z_show      = rearrange(z_raw_seq[:,  ::2], "b t c h w -> (b t) c h w")[:n_show]
         feat0_show  = rearrange(feat0_seq[:, ::2],  "b t c h w -> (b t) c h w")[:n_show]
         feat1_show  = rearrange(feat1_seq[:, ::2],  "b t c h w -> (b t) c h w")[:n_show]
-        action_flat = rearrange(action[:, ::2], "b t a -> (b t) a")[:n_show]
+        a1 = action[:, ::2]
+        a2 = action[:, 1::2]
+        min_t = min(a1.shape[1], a2.shape[1])
+        if min_t > 0:
+            action_even = torch.zeros_like(a1)
+            action_even[:, :min_t, :-1] = (a1[:, :min_t, :-1] + a2[:, :min_t, :-1]) / 2.0
+            action_even[:, :min_t, -1:] = a1[:, :min_t, -1:]
+            action_even[:, min_t:] = a1[:, min_t:]
+        else:
+            action_even = a1
+        action_flat = rearrange(action_even, "b t a -> (b t) a")[:n_show]
+
+
 
         flow_pred = self.flow_predictor(z_show, feat1_show, feat0_show, action_flat)  # (N, 2, H, W)
 
         # normalize GT flow to tanh target range for fair comparison
         flow_show_norm = torch.sign(flow_show) * torch.sqrt(torch.abs(flow_show) / 20.0 + 1e-7)
-        vmax = 0.3  # most flow values after adaptive_normalize are in ~(-0.3, 0.3)
+        # dynamic vmax: based on the max abs value across GT and pred for fair comparison
+        vmax = max(flow_show_norm.abs().max().item(), flow_pred.abs().max().item(), 1e-3)
 
         images = []
         for i in range(n_show):
