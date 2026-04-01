@@ -43,7 +43,7 @@ def _decode_image(img_dict: dict, h: int, w: int) -> np.ndarray:
     return img_np
 
 
-_FLOW_STORAGE_SIZE = (256, 256)  # spatial resolution stored in zarr
+_FLOW_STORAGE_SIZE = (256, 256)  # default spatial resolution stored in zarr
 
 
 def _load_flow_frame(flow_dir: str, episode_idx: int, frame_idx: int, split: str = "train") -> Optional[np.ndarray]:
@@ -96,6 +96,7 @@ def _convert_libero_to_replay(
     episode_indices: List[int],
     flow_dir: Optional[str] = None,
     flow_split: str = "train",
+    flow_storage_size: Optional[tuple] = None,
     n_workers: Optional[int] = None,
     max_inflight_tasks: Optional[int] = None,
 ) -> ReplayBuffer:
@@ -125,12 +126,15 @@ def _convert_libero_to_replay(
     chunks_size = info["chunks_size"]
     data_path_template = info["data_path"]
 
+    # resolve flow storage size
+    fh, fw = flow_storage_size if flow_storage_size is not None else _FLOW_STORAGE_SIZE
+
     # detect flow availability before the main loop
     has_flow = False
     if flow_dir is not None:
         has_flow = _detect_flow_available(flow_dir, episode_indices, split=flow_split)
         if has_flow:
-            print(f"Flow features detected: storing at {_FLOW_STORAGE_SIZE}")
+            print(f"Flow features detected: storing at ({fh}, {fw})")
         else:
             print("Warning: flow_dir provided but no flow files found. Skipping flow.")
 
@@ -159,7 +163,6 @@ def _convert_libero_to_replay(
 
     flow_zarr = None
     if has_flow:
-        fh, fw = _FLOW_STORAGE_SIZE
         flow_zarr = data_group.zeros(
             name="flow",
             shape=(n_steps, 2, fh, fw),
@@ -202,7 +205,19 @@ def _convert_libero_to_replay(
         if flow_zarr is not None:
             epi_flow = _load_episode_flow(flow_dir, epi_idx, episode_length, split=flow_split)
             if epi_flow is None:
-                epi_flow = np.zeros((episode_length, 2, *_FLOW_STORAGE_SIZE), dtype=np.float32)
+                epi_flow = np.zeros((episode_length, 2, fh, fw), dtype=np.float32)
+            elif epi_flow.shape[-2:] != (fh, fw):
+                # resize flow to target storage size
+                flow_tensor = torch.from_numpy(epi_flow)  # (T, 2, H, W)
+                flow_tensor = torch.nn.functional.interpolate(
+                    flow_tensor, size=(fh, fw), mode="bilinear", align_corners=False
+                )
+                # scale flow values proportionally to new resolution
+                scale_h = fh / epi_flow.shape[-2]
+                scale_w = fw / epi_flow.shape[-1]
+                flow_tensor[:, 0] *= scale_w
+                flow_tensor[:, 1] *= scale_h
+                epi_flow = flow_tensor.numpy()
             flow_zarr[write_ptr:write_ptr + episode_length] = epi_flow
 
         write_ptr += episode_length
@@ -266,6 +281,7 @@ def load_replay_buffer(
     cache_dir: Optional[str] = None,
     flow_dir: Optional[str] = None,
     flow_split: str = "train",
+    flow_storage_size: Optional[tuple] = None,
 ) -> ReplayBuffer:
     if cache_dir is None:
         cache_dir = dataset_dir
@@ -285,6 +301,7 @@ def load_replay_buffer(
                         episode_indices=episode_indices,
                         flow_dir=flow_dir,
                         flow_split=flow_split,
+                        flow_storage_size=flow_storage_size,
                     )
                     print("Saving cache to disk.")
                     with zarr.ZipStore(cache_zarr_path) as zip_store:
@@ -308,6 +325,7 @@ def load_replay_buffer(
             episode_indices=episode_indices,
             flow_dir=flow_dir,
             flow_split=flow_split,
+            flow_storage_size=flow_storage_size,
         )
     return replay_buffer
 
@@ -350,6 +368,9 @@ class LiberoDataset(BaseImageDataset):
         self._cache_dir = cache_dir
         flow_dir = cfg.flow_dir if "flow_dir" in cfg else None
         self._flow_dir = flow_dir
+        resolution = cfg.resolution if "resolution" in cfg else 256
+        flow_storage_size = (resolution, resolution)
+        self._flow_storage_size = flow_storage_size
 
         self.replay_buffer = load_replay_buffer(
             dataset_dir=dataset_dir,
@@ -360,6 +381,7 @@ class LiberoDataset(BaseImageDataset):
             cache_dir=cache_dir,
             flow_dir=flow_dir,
             flow_split="train",
+            flow_storage_size=flow_storage_size,
         )
 
         rgb_keys: list = []
@@ -435,6 +457,7 @@ class LiberoDataset(BaseImageDataset):
             cache_dir=self._cache_dir,
             flow_dir=self._flow_dir,
             flow_split="val",
+            flow_storage_size=self._flow_storage_size,
         )
         val_mask = np.ones((val_set.replay_buffer.n_episodes,), dtype=bool)
         val_keys = list(val_set.replay_buffer.keys())

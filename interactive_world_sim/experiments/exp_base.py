@@ -239,6 +239,7 @@ class BaseLightningExperiment(BaseExperiment):
             train_dataloaders=train_dataloader,
             val_dataloaders=val_dataloader,
             ckpt_path=self.ckpt_path,
+            weights_only=False,
         )
 
     def validation(self) -> None:
