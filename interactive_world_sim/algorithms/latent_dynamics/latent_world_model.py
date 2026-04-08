@@ -1252,6 +1252,74 @@ class LatentWorldModel(BasePytorchAlgo):
 
         self.validation_step_outputs.clear()
 
+        # Log training set visualization at the same frequency as validation
+        if namespace == "validation" and self.val_render and self.logger:
+            train_vis_pred_ls = []
+            train_vis_gt_ls = []
+            train_loader = self.trainer.train_dataloader
+            for batch_idx, batch in enumerate(train_loader):
+                if batch_idx >= 2:
+                    break
+                # move batch to device
+                batch = {
+                    k: {kk: vv.to(self.device) for kk, vv in v.items()} if isinstance(v, dict) else v.to(self.device)
+                    for k, v in batch.items()
+                }
+                obs_ls = [self.normalizer[k].normalize(batch["obs"][k]) for k in self.obs_keys]
+                obs = torch.cat(obs_ls, dim=2).float()
+                action = self.normalizer["action"].normalize(batch["action"]).float()
+
+                xs_raw = torch.cat([batch["obs"][k] for k in self.obs_keys], dim=2)
+
+                with torch.no_grad():
+                    _xs = rearrange(obs, "b t c h w -> (b t) c h w")
+                    z_gt = self.encoder_forward(_xs)
+                    z_gt = rearrange(z_gt, "(b t) c h w -> b t c h w", b=obs.shape[0])
+
+                    if self.training_stage in [1]:
+                        z_seq = z_gt
+                    else:
+                        z_0 = z_gt[:, 0]
+                        z_seq_ls = []
+                        z_last = z_0.clone()
+                        horizon = z_gt.shape[1]
+                        for i in range(1, action.shape[1], horizon):
+                            action_chunk = action[:, i : i + horizon]
+                            init_action_size = action_chunk.shape[1]
+                            if init_action_size < horizon:
+                                action_chunk = F.pad(
+                                    action_chunk,
+                                    (0, 0, 0, horizon - action_chunk.shape[1]),
+                                    mode="replicate",
+                                )
+                            z_seq = self.dynamics_forward(z_last[:, None], action_chunk)
+                            z_seq = z_seq[:, :init_action_size]
+                            z_seq_ls.append(z_seq)
+                            z_last = z_seq[:, -1].clone()
+                        z_seq = torch.cat(z_seq_ls, 1)
+                        z_seq = torch.cat([z_0.unsqueeze(1), z_seq], 1)
+
+                    z_seq_flat = rearrange(z_seq, "b t c h w -> (b t) c h w")
+                    xs_pred = render_img_cm(
+                        self, z_seq_flat, obs.shape[-1], self.normalizer, num_views=self.num_views, batch_size=10
+                    )
+                    xs_pred = rearrange(xs_pred, "(b t) c h w -> t b c h w", b=obs.shape[0])
+                    xs_raw_t = rearrange(xs_raw, "b t c h w -> t b c h w")
+                    train_vis_pred_ls.append(xs_pred.detach().cpu())
+                    train_vis_gt_ls.append(xs_raw_t.detach().cpu())
+
+            if train_vis_pred_ls:
+                xs_pred_train = torch.cat(train_vis_pred_ls, 1)
+                xs_gt_train = torch.cat(train_vis_gt_ls, 1)
+                log_video(
+                    xs_pred_train,
+                    xs_gt_train.clone(),
+                    step=self.global_step,
+                    namespace="train_vis",
+                    context_frames=0,
+                    logger=self.logger.experiment,
+                )
+
     def on_train_start(self) -> None:
         """Start tracing memory allocations"""
         tracemalloc.start()

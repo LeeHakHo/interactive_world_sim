@@ -167,7 +167,8 @@ def main() -> None:
     init_frame = gt_frames[0]
 
     if args.use_gt_action:
-        actions_np = gt_actions_np[:T].astype(np.float32)
+        # action[t] = action that causes transition z[t-1] -> z[t], so shift by 1
+        actions_np = gt_actions_np[1:T + 1].astype(np.float32)
         T = len(actions_np)
         print(f"Using GT actions: {T} steps")
 
@@ -264,11 +265,11 @@ def main() -> None:
             # GT flow 로드 (flow_dir 제공 시)
             gt_flows = None
             if args.flow_dir is not None:
-                flow_path = os.path.join(args.flow_dir, "val", str(args.init_episode), "0.pt")
+                flow_path = os.path.join(args.flow_dir, "train", str(args.init_episode), "0.pt")
                 if os.path.exists(flow_path):
                     episode_flow = torch.load(flow_path, map_location="cpu", weights_only=True)  # (T_flow, 2, H, W)
-                    # stride-2 flow: even frame i에 해당하는 GT flow는 episode_flow[even_idx[i]]
-                    gt_flows = episode_flow[:T_even].float()
+                    # flow[i] = frame i→i+2; take ::2 to match training convention (even frames only)  
+                    gt_flows = episode_flow[::2][:T_even].float()
                     # resize if needed
                     if gt_flows.shape[-1] != w or gt_flows.shape[-2] != h:
                         gt_flows = torch.nn.functional.interpolate(gt_flows, size=(h, w), mode="bilinear", align_corners=False)
