@@ -1,20 +1,21 @@
 """Headless inference script for LIBERO latent world model.
 
-Action sequence를 numpy 배열로 미리 정의해서 world model에 넣고 영상 생성.
+Predefines an action sequence as a numpy array and feeds it into the world model
+to generate a predicted video.
 
-Usage (Stage 1 — reconstruction, 초기 프레임만 encode 후 decode):
+Usage (Stage 1 -- reconstruction, encode initial frame then decode):
     python scripts/inference/libero_inference.py \
         --ckpt outputs/2026-03-13/15-18-43/checkpoints/epoch=0-step=90000.ckpt \
         --stage 1 --init_episode 99
 
-Usage (Stage 2 — custom action으로 미래 예측):
+Usage (Stage 2 -- future prediction with custom actions):
     python scripts/inference/libero_inference.py \
         --ckpt outputs/.../checkpoints/epoch=0-step=200000.ckpt \
         --stage 2 --init_episode 99
 
-Action 정의 (파일 하단 define_actions() 수정):
-    - shape: (T, 7) — T스텝, 7-DOF joint position delta
-    - 값 범위: 대략 -1 ~ 1 (normalizer 기준)
+Action definition (edit define_actions() at the bottom of this file):
+    - shape: (T, 7) -- T steps, 7-DOF joint position delta
+    - value range: approximately -1 to 1 (normalizer scale)
 """
 
 import argparse
@@ -38,27 +39,27 @@ from interactive_world_sim.algorithms.latent_dynamics.latent_world_model import 
 
 
 # ============================================================
-# ✏️  여기서 action 시퀀스를 정의하세요
+# Define your action sequence here
 # ============================================================
 def define_actions() -> np.ndarray:
     """Return action sequence of shape (T, 7).
 
-    각 열은 7-DOF joint position.
-    값은 normalizer 적용 전 raw action 기준 (데이터셋과 같은 스케일).
+    Each column is a 7-DOF joint position.
+    Values are in raw action scale before normalizer (same scale as dataset).
     """
     segments = []
 
-    # 예시: joint 0을 0.05씩 30스텝 증가
+    # Example: increase joint 0 by 0.05 for 30 steps
     seg = np.zeros((30, 7))
     seg[:, 0] = 0.05
     segments.append(seg)
 
-    # 예시: joint 1을 -0.05씩 20스텝
+    # Example: decrease joint 1 by 0.05 for 20 steps
     seg = np.zeros((20, 7))
     seg[:, 1] = -0.05
     segments.append(seg)
 
-    # 예시: 정지 (10스텝)
+    # Example: stay still for 10 steps
     segments.append(np.zeros((10, 7)))
 
     actions = np.concatenate(segments, axis=0).astype(np.float32)
@@ -91,7 +92,7 @@ def decode_image(img_dict: dict, h: int, w: int) -> np.ndarray:
 
 
 def load_init_frame(dataset_dir: str, episode_idx: int, obs_key: str, h: int, w: int) -> np.ndarray:
-    """에피소드의 첫 번째 프레임만 로드."""
+    """Load only the first frame of an episode."""
     with open(os.path.join(dataset_dir, "meta", "info.json")) as f:
         info = json.load(f)
     chunk_idx = episode_idx // info["chunks_size"]
@@ -106,7 +107,7 @@ def load_init_frame(dataset_dir: str, episode_idx: int, obs_key: str, h: int, w:
 def load_episode_sequence(
     dataset_dir: str, episode_idx: int, obs_key: str, h: int, w: int, n_frames: int = 32
 ):
-    """에피소드에서 n_frames개의 프레임과 action을 로드."""
+    """Load n_frames frames and actions from an episode."""
     with open(os.path.join(dataset_dir, "meta", "info.json")) as f:
         info = json.load(f)
     chunk_idx = episode_idx // info["chunks_size"]
@@ -130,16 +131,16 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", required=True)
     parser.add_argument("--dataset_dir", default="/scr2/shared/world_model/libero")
-    parser.add_argument("--init_episode", type=int, default=99, help="초기 프레임을 가져올 에피소드")
+    parser.add_argument("--init_episode", type=int, default=99, help="episode to source the initial frame from")
     parser.add_argument("--obs_key", default="image")
     parser.add_argument("--resolution", type=int, default=128)
     parser.add_argument("--hist_context", type=int, default=1)
     parser.add_argument("--stage", type=int, default=2, choices=[1, 2])
     parser.add_argument("--output_dir", default="outputs/inference")
-    parser.add_argument("--dec_infer_steps", type=int, default=3, help="디코딩 step 수 (높을수록 품질↑ 속도↓)")
-    parser.add_argument("--flow_frames", type=int, default=32, help="optical flow 추론에 사용할 프레임 수")
-    parser.add_argument("--flow_dir", default=None, help="GT optical flow 디렉토리 (없으면 GT 생략)")
-    parser.add_argument("--use_gt_action", action="store_true", help="GT action 사용 (없으면 define_actions() 사용)")
+    parser.add_argument("--dec_infer_steps", type=int, default=3, help="number of decoding steps (higher = better quality, slower)")
+    parser.add_argument("--flow_frames", type=int, default=32, help="number of frames to use for optical flow inference")
+    parser.add_argument("--flow_dir", default=None, help="directory containing GT optical flow (skipped if not provided)")
+    parser.add_argument("--use_gt_action", action="store_true", help="use GT actions instead of define_actions()")
     parser.add_argument("--device", default="cuda:0")
     args = parser.parse_args()
 
@@ -154,12 +155,12 @@ def main() -> None:
     dtype = model.dtype
     num_views = len(model.obs_keys)
 
-    # Action 시퀀스 정의
+    # Define action sequence
     actions_np = define_actions()  # (T, 7)
     T = len(actions_np)
     print(f"Action sequence: {T} steps")
 
-    # GT 프레임 로드
+    # Load GT frames
     print(f"Loading GT frames from episode {args.init_episode}...")
     gt_frames, gt_actions_np = load_episode_sequence(
         args.dataset_dir, args.init_episode, args.obs_key, h, w, n_frames=T + 1
@@ -175,7 +176,7 @@ def main() -> None:
     actions = torch.from_numpy(actions_np).to(device=device, dtype=dtype)
     actions_norm = normalizer["action"].normalize(actions)  # (T, 7)
 
-    # 초기 프레임 encode
+    # Encode initial frame
     img0 = torch.from_numpy(init_frame.astype(np.float32) / 255.0)
     img0 = img0.permute(2, 0, 1).unsqueeze(0).to(device=device, dtype=dtype)
     img0_norm = normalizer[args.obs_key].normalize(img0)
@@ -189,15 +190,15 @@ def main() -> None:
     )]
 
     if args.stage == 1:
-        # Stage 1: action 없이 초기 프레임만 반복 decode (reconstruction 확인용)
+        # Stage 1: decode initial frame repeatedly to verify reconstruction
         print("Stage 1: decoding initial frame only...")
         for _ in tqdm(range(T)):
             with torch.no_grad():
                 xs_pred = render_img_cm(model, curr_latent[:, -1], h, normalizer, num_views=num_views)
             pred_frames.append(tensor_to_uint8(xs_pred[0]))
 
-        # Optical flow 비디오 생성 (use_optical_flow 또는 cm_optical_flow가 켜진 경우)
-        if model.use_optical_flow or model.cm_optical_flow:
+        # Optical flow video (only when use_optical_flow is enabled)
+        if model.use_optical_flow:
             print("Stage 1: predicting optical flow...")
             frames_seq, actions_seq = load_episode_sequence(
                 args.dataset_dir, args.init_episode, args.obs_key, h, w,
@@ -205,25 +206,22 @@ def main() -> None:
             )
             n_seq = len(frames_seq)
 
-            # 프레임 인코딩
+            # Encode frame sequence
             imgs_seq = torch.stack([
                 torch.from_numpy(f.astype(np.float32) / 255.0).permute(2, 0, 1)
                 for f in frames_seq
             ], dim=0).to(device=device, dtype=dtype)  # (n_seq, 3, H, W)
             imgs_seq_norm = normalizer[args.obs_key].normalize(imgs_seq)
             with torch.no_grad():
-                if model.cm_optical_flow:
-                    z_seq, _ = model.encoder_forward(imgs_seq_norm, return_raw=True)
-                else:
-                    z_seq, z_raw_seq, feat0_seq, feat1_seq = model.encoder_forward(
-                        imgs_seq_norm, return_feats=True
-                    )
+                z_seq, z_raw_seq, feat0_seq, feat1_seq = model.encoder_forward(
+                    imgs_seq_norm, return_feats=True
+                )
 
-            # even frame 인덱스
+            # Even frame indices
             even_idx = list(range(0, n_seq, 2))
             T_even = len(even_idx)
 
-            # action averaging (even frame마다 자신 + 다음 홀수 frame action 평균)
+            # Action averaging: average even and odd frame actions per even step
             actions_t = torch.from_numpy(actions_seq.astype(np.float32)).to(device=device, dtype=dtype)
             actions_norm_seq = normalizer["action"].normalize(actions_t)  # (n_seq, A)
             a1 = actions_norm_seq[::2][:T_even]
@@ -237,46 +235,28 @@ def main() -> None:
             else:
                 action_even = a1
 
-            z_even = z_seq[::2][:T_even]
+            z_raw_even = z_raw_seq[::2][:T_even]
+            feat0_even = feat0_seq[::2][:T_even]
+            feat1_even = feat1_seq[::2][:T_even]
 
             with torch.no_grad():
-                if model.cm_optical_flow:
-                    # CM diffusion: pure noise → multi-step denoising
-                    noise = torch.randn(T_even, 2, h, w, device=device, dtype=dtype)
-                    noise = torch.clamp(noise, -model.clip_noise, model.clip_noise)
-                    timesteps_vis = torch.linspace(
-                        model.timesteps - 1, 0, args.dec_infer_steps + 1, device=device
-                    )
-                    x = noise
-                    for step_i in range(args.dec_infer_steps):
-                        t_vis = torch.ones(T_even, device=device, dtype=torch.long) * int(timesteps_vis[step_i].item())
-                        s_vis = torch.ones(T_even, device=device, dtype=torch.long) * int(timesteps_vis[step_i + 1].item())
-                        x = model._forward(
-                            model.cm_flow_decoder, x, t_vis, s_vis,
-                            external_cond=(z_even, action_even),
-                        )
-                    flow_preds = x  # (T_even, 2, H, W)
-                else:
-                    z_raw_even = z_raw_seq[::2][:T_even]
-                    feat0_even = feat0_seq[::2][:T_even]
-                    feat1_even = feat1_seq[::2][:T_even]
-                    flow_preds = model.flow_predictor(z_raw_even, feat1_even, feat0_even, action_even)
+                flow_preds = model.flow_predictor(z_raw_even, feat1_even, feat0_even, action_even)
 
-            # GT flow 로드 (flow_dir 제공 시)
+            # Load GT flow (if flow_dir is provided)
             gt_flows = None
             if args.flow_dir is not None:
                 flow_path = os.path.join(args.flow_dir, "train", str(args.init_episode), "0.pt")
                 if os.path.exists(flow_path):
                     episode_flow = torch.load(flow_path, map_location="cpu", weights_only=True)  # (T_flow, 2, H, W)
-                    # flow[i] = frame i→i+2; take ::2 to match training convention (even frames only)  
-                    gt_flows = episode_flow[::2][:T_even].float()
+                    # flow file is pre-computed at stride-2: flow[k] = motion of original frame 2k -> 2k+2
+                    gt_flows = episode_flow[:T_even].float()
                     # resize if needed
                     if gt_flows.shape[-1] != w or gt_flows.shape[-2] != h:
                         gt_flows = torch.nn.functional.interpolate(gt_flows, size=(h, w), mode="bilinear", align_corners=False)
                 else:
                     print(f"GT flow not found at {flow_path}, skipping GT.")
 
-            # 비디오 저장
+            # Save flow video
             has_gt = gt_flows is not None
             video_w = w * 3 if has_gt else w * 2
             flow_out_path = os.path.join(
@@ -321,7 +301,7 @@ def main() -> None:
             out_flow.release()
             print(f"Flow video saved to {flow_out_path}")
     else:
-        # Stage 2: custom action으로 dynamics rollout
+        # Stage 2: dynamics rollout with custom actions
         print("Stage 2: rolling out with custom actions...")
         for t in tqdm(range(T)):
             hist_actions = torch.zeros(
@@ -340,7 +320,7 @@ def main() -> None:
             curr_latent = torch.cat([curr_latent, z_pred[:, -1:]], dim=1)
             curr_latent = curr_latent[:, -args.hist_context:]
 
-    # 비디오 저장 (왼쪽: GT, 오른쪽: 예측)
+    # Save video (left: GT, right: prediction)
     out_path = os.path.join(args.output_dir, f"ep{args.init_episode}_stage{args.stage}.mp4")
     out = cv2.VideoWriter(out_path, cv2.VideoWriter_fourcc(*"mp4v"), 10, (w * 2, h))
     for i, pred_f in enumerate(pred_frames):
