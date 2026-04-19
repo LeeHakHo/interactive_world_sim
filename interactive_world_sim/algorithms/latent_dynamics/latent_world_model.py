@@ -418,7 +418,7 @@ class LatentWorldModel(BasePytorchAlgo):
             z_gt = self.encoder_forward(xs)
         z_gt = rearrange(z_gt, "(b t) c h w -> b t c h w", b=obs.shape[0])
 
-        if self.training_stage in [1]:
+        if self.training_stage in [1, 3]:
             # compute predicted latent
             z_seq = z_gt
         elif self.training_stage in [2]:
@@ -1034,7 +1034,7 @@ class LatentWorldModel(BasePytorchAlgo):
                     z_gt = self.encoder_forward(_xs)
                     z_gt = rearrange(z_gt, "(b t) c h w -> b t c h w", b=obs.shape[0])
 
-                    if self.training_stage in [1]:
+                    if self.training_stage in [1, 3]:
                         z_seq = z_gt
                     else:
                         z_0 = z_gt[:, 0]

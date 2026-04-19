@@ -131,10 +131,16 @@ def get_validation_metrics_for_videos(
         fvd_model = None  # FVD requires at least 9 frames
 
     if fvd_model is not None:
-        output_dict["fvd"] = fvd_model.compute(
-            torch.clamp(observation_hat, -1.0, 1.0),
-            torch.clamp(observation_gt, -1.0, 1.0),
-        )
+        n_views = channel // 3
+        fvd_vals = []
+        for i in range(n_views):
+            fvd_i = fvd_model.compute(
+                torch.clamp(observation_hat[:, :, i*3:(i+1)*3], -1.0, 1.0),
+                torch.clamp(observation_gt[:, :, i*3:(i+1)*3], -1.0, 1.0),
+            )
+            output_dict[f"fvd_cam{i}"] = fvd_i
+            fvd_vals.append(fvd_i)
+        output_dict["fvd"] = sum(fvd_vals) / len(fvd_vals)
 
     # reshape to (frame * batch, channel, height, width) for image losses
     observation_hat = observation_hat.reshape(-1, channel, height, width)

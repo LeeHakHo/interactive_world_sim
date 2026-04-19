@@ -23,6 +23,7 @@ class LatentDynExperiment(BaseLightningExperiment):
         sim_aloha_dataset=SimAlohaDataset,
         real_aloha_dataset=RealAlohaDataset,
         libero_dataset=LiberoDataset,
+        play_custom_dataset=RealAlohaDataset,
     )
 
     def _build_dataset(self, split: str) -> Optional[torch.utils.data.Dataset]:
