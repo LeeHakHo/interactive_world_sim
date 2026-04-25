@@ -22,12 +22,12 @@ obs_keys: [camera_0_color, camera_1_color]
 low_dim_keys: []
 delta_action: false
 goal_sample: intermediate
-action_mode: joint   # ctrl_mode=joint → uses 14-dim joint positions directly
+action_mode: joint   # ctrl_mode=joint → bimanual_rope
 load_mask: false
 shape_meta:
   action:
     shape:
-    - 14   # bimanual joint positions (7 per arm)
+    - 14   # bimanual joint positions (7 per arm) or 8
   obs:
     camera_0_color:   # cam_high
       shape:
