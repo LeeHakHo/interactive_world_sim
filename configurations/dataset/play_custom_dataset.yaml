@@ -22,12 +22,12 @@ obs_keys: [camera_0_color, camera_1_color]
 low_dim_keys: []
 delta_action: false
 goal_sample: intermediate
-action_mode: joint   # ctrl_mode=joint → bimanual_rope
+action_mode: eef
 load_mask: false
 shape_meta:
   action:
     shape:
-    - 14   # bimanual joint positions (7 per arm) or 8
+    - 7   # xyz(3) + euler_xyz(3) + gripper(1)
   obs:
     camera_0_color:   # cam_high
       shape:

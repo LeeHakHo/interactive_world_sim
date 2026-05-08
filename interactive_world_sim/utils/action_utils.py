@@ -595,6 +595,8 @@ def joint_pos_to_action_primitive(
                 MASTER_GRIPPER_JOINT_NORMALIZE_FN(joint_pos[rob_i * 7 + 6])
             )  # Gripper position
         actions = action[None]
+    elif ctrl_mode == "eef":
+        actions = joint_pos[None]
     else:
         raise NotImplementedError(f"Unknown control mode: {ctrl_mode}")
     return actions

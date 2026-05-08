@@ -40,15 +40,19 @@ def load_model(ckpt_path: str, device: str, dec_infer_steps: int = 3) -> LatentW
     cfg = OmegaConf.load(cfg_path)
     cfg.algorithm.load_ae = None
     cfg.algorithm.dec_infer_steps = dec_infer_steps
-    model = LatentWorldModel.load_from_checkpoint(
+    algo = LatentWorldModel.load_from_checkpoint(
         ckpt_path,
         cfg=cfg.algorithm,
         map_location=device,
         strict=False,
         weights_only=False,
     )
-    model.eval()
-    return model.to(device)
+    #algo.dynamics = algo.dynamics.to(algo.dtype)
+    algo = algo.to(torch.bfloat16)
+    algo.dynamics = algo.dynamics.to(torch.bfloat16)
+    algo.eval()
+    algo.dynamics.eval()
+    return algo.to(device)
 
 
 def process_joint_pos(joint_pos: np.ndarray) -> np.ndarray:
@@ -64,13 +68,16 @@ def process_joint_pos(joint_pos: np.ndarray) -> np.ndarray:
 
 def obs_to_frame(obs_img) -> np.ndarray:
     """Convert LeRobot observation image to (H, W, 3) uint8 numpy RGB."""
+    # RealSense returns (color, depth) tuple — take color only
+    if isinstance(obs_img, tuple):
+        obs_img = obs_img[0]
     if isinstance(obs_img, torch.Tensor):
         img = obs_img.cpu().numpy()
     else:
         img = np.array(obs_img)
     if img.dtype != np.uint8:
         img = (img * 255).clip(0, 255).astype(np.uint8)
-    if img.shape[0] == 3:  # (C, H, W) → (H, W, C)
+    if img.ndim == 3 and img.shape[0] == 3:  # (C, H, W) → (H, W, C)
         img = img.transpose(1, 2, 0)
     return img
 
@@ -94,6 +101,7 @@ def encode_frame(model, normalizer, cam0_np, cam1_np, device, dtype):
 
 def decode_latent(model, z, resolution, normalizer, num_views):
     """Decode latent → list of (H, W, 3) uint8 numpy frames."""
+    z = z.to(model.dtype)
     with torch.no_grad():
         xs = render_img_cm(model, z, resolution, normalizer, num_views=num_views)
     frames = []
@@ -103,12 +111,12 @@ def decode_latent(model, z, resolution, normalizer, num_views):
     return frames
 
 
-def make_display_frame(gt0, gt1, pred0, pred1, w, h):
-    """GT cam0 | GT cam1 | Pred cam0 | Pred cam1 → BGR display frame."""
+def make_display_frame(pred0, pred1, w, h):
+    """Pred cam0 | Pred cam1 → BGR display frame."""
     def to_bgr(img):
         return cv2.cvtColor(cv2.resize(img, (w, h)), cv2.COLOR_RGB2BGR)
-    row = np.concatenate([to_bgr(gt0), to_bgr(gt1), to_bgr(pred0), to_bgr(pred1)], axis=1)
-    for i, lbl in enumerate(["GT cam0", "GT cam1", "Pred cam0", "Pred cam1"]):
+    row = np.concatenate([to_bgr(pred0), to_bgr(pred1)], axis=1)
+    for i, lbl in enumerate(["Pred cam0", "Pred cam1"]):
         cv2.putText(row, lbl, (i * w + 4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 255, 0), 1)
     return row
 
@@ -116,6 +124,8 @@ def make_display_frame(gt0, gt1, pred0, pred1, w, h):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--ckpt", required=True)
+    parser.add_argument("--dataset_dir", default="checkpoints/play_custom/")
+    parser.add_argument("--episode", type=int, default=0)
     parser.add_argument("--resolution", type=int, default=128)
     parser.add_argument("--dec_infer_steps", type=int, default=3)
     parser.add_argument("--device", default="cuda:0")
@@ -136,58 +146,69 @@ def main():
     # ── Connect robot ────────────────────────────────────────────────────────
     print("Connecting to robot...")
     robot_cfg = TrossenAIStationaryRobotConfig()
+    robot_cfg.cameras = {}
     robot = make_robot_from_config(robot_cfg)
     robot.connect()
     print("Robot connected.")
 
     try:
-        # ── Initial observation ──────────────────────────────────────────────
-        print("Capturing initial frame...")
-        obs = robot.capture_observation()
+        # ── Load initial frame from dataset ──────────────────────────────────
+        print(f"Loading initial frame from episode {args.episode}...")
+        import h5py, os
+        for subdir in ["train", ""]:
+            path = os.path.join(args.dataset_dir, subdir, f"episode_{args.episode}.hdf5")
+            print(path)
+            if os.path.exists(path):
+                break
+        else:
+            raise FileNotFoundError(f"episode_{args.episode}.hdf5 not found under {args.dataset_dir}")
 
-        cam0_np = crop_resize(obs_to_frame(obs["observation.images.cam_high"]), h)
-        cam1_np = crop_resize(obs_to_frame(obs["observation.images.cam_low"]), h)
-        joint_pos = obs["observation.state"].numpy() if isinstance(obs["observation.state"], torch.Tensor) else np.array(obs["observation.state"])
-        joint_pos = process_joint_pos(joint_pos)
+        with h5py.File(path, "r") as f:
+            cam0_np = crop_resize(f["obs"]["images"]["camera_0_color"][0], h)
+            cam1_np = crop_resize(f["obs"]["images"]["camera_1_color"][0], h)
+            init_joint = process_joint_pos(f["obs"]["joint_pos"][0].flatten())
 
         z0 = encode_frame(model, normalizer, cam0_np, cam1_np, device, dtype)
         curr_latent = z0.unsqueeze(1)  # (1, 1, C, Hl, Wl)
 
-        action_t = torch.from_numpy(joint_pos).to(device=device, dtype=dtype)
-        action_norm = normalizer["action"].normalize(action_t.unsqueeze(0))
-        past_actions = action_norm.unsqueeze(0)  # (1, 1, A)
-
-        # Decode initial frame
-        preds = decode_latent(model, z0, h, normalizer, num_views)
+        action_t = torch.from_numpy(init_joint).to(device=device, dtype=dtype)
+        action_norm = normalizer["action"].normalize(action_t)
+        past_actions = action_norm.unsqueeze(0).unsqueeze(0)  # (1, 1, A)
 
         print("Running. Press 'q' to quit.")
         step = 0
         while True:
             t0 = time.perf_counter()
 
-            # ── Read robot observation ───────────────────────────────────────
-            obs = robot.capture_observation()
-            cam0_gt = crop_resize(obs_to_frame(obs["observation.images.cam_high"]), h)
-            cam1_gt = crop_resize(obs_to_frame(obs["observation.images.cam_low"]), h)
-            joint_pos = obs["observation.state"].numpy() if isinstance(obs["observation.state"], torch.Tensor) else np.array(obs["observation.state"])
+            # ── Read leader arm joint positions directly ─────────────────────
+            parts = []
+            for name in sorted(robot.leader_arms.keys()):
+                pos = robot.leader_arms[name].read("Present_Position")
+                parts.append(np.array(pos, dtype=np.float32).flatten())
+            joint_pos = np.concatenate(parts)
             joint_pos = process_joint_pos(joint_pos)
 
             # ── World model inference ────────────────────────────────────────
             action_t = torch.from_numpy(joint_pos).to(device=device, dtype=dtype)
-            action_norm = normalizer["action"].normalize(action_t.unsqueeze(0))
+            action_norm = normalizer["action"].normalize(action_t)
             future_action = action_norm.unsqueeze(0).unsqueeze(0)  # (1, 1, A)
             action_input = torch.cat([past_actions, future_action], dim=1)
 
-            with torch.no_grad():
-                z_pred = model.dynamics_forward(curr_latent, action_input)
+            if step == 0:
+                print(curr_latent.dtype, action_input.dtype, model.dtype)
+                print("leader arm keys:", list(robot.leader_arms.keys()))
+                print("joint_pos shape:", joint_pos.shape)
 
-            preds = decode_latent(model, z_pred[:, -1], h, normalizer, num_views)
+            with torch.no_grad():
+                with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                    z_pred = model.dynamics_forward(curr_latent, action_input)
+                    preds = decode_latent(model, z_pred[:, -1], h, normalizer, num_views)
 
             curr_latent = torch.cat([curr_latent, z_pred[:, -1:]], dim=1)[:, -n_tokens:]
             past_actions = torch.cat([past_actions, future_action], dim=1)[:, -n_tokens:]
 
             # ── Display ──────────────────────────────────────────────────────
-            frame = make_display_frame(cam0_gt, cam1_gt, preds[0], preds[1], w, h)
+            frame = make_display_frame(preds[0], preds[1], w, h)
             elapsed = time.perf_counter() - t0
             cv2.putText(frame, f"step={step} {1/elapsed:.1f}fps", (4, h - 4),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 0), 1)
