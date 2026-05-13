@@ -53,7 +53,7 @@ OBS_KEYS = ["camera_0_color", "camera_1_color"]
 
 # EEF action indices: [x, y, z, roll, pitch, yaw, gripper]
 STEP = 0.01   # meters or radians per keypress
-GRIPPER_MAX = 0.04
+GRIPPER_MAX = 0.4
 GRIPPER_MIN = 0.0
 
 KEY_MAP = {
@@ -98,6 +98,18 @@ def load_episode(dataset_dir: str, episode_idx: int):
         cam1 = f["obs"]["images"]["camera_1_color"][:]  # (T, H, W, 3)
         actions = f["action"][:]                         # (T, 7) EEF
     return cam0, cam1, actions.astype(np.float32)
+
+
+def compute_action_bounds(dataset_dir: str) -> tuple[np.ndarray, np.ndarray]:
+    """Compute per-dim min/max across all train episodes."""
+    import glob
+    files = sorted(glob.glob(os.path.join(dataset_dir, "train", "episode_*.hdf5")))
+    all_actions = []
+    for f_path in files:
+        with h5py.File(f_path, "r") as f:
+            all_actions.append(f["action"][:])
+    all_actions = np.concatenate(all_actions, axis=0)
+    return all_actions.min(axis=0), all_actions.max(axis=0)
 
 
 def encode_frame(model, normalizer, cam0_np, cam1_np, device, dtype):
@@ -172,6 +184,12 @@ def main():
     h = w = args.resolution
     device = args.device
 
+    print("Computing action bounds from dataset...")
+    action_min, action_max = compute_action_bounds(args.dataset_dir)
+    print(f"  xyz  : [{action_min[:3]}] ~ [{action_max[:3]}]")
+    print(f"  euler: [{action_min[3:6]}] ~ [{action_max[3:6]}]")
+    print(f"  grip : [{action_min[6]:.3f}] ~ [{action_max[6]:.3f}]")
+
     print("Loading model...")
     model = load_model(args.ckpt, device, args.dec_infer_steps)
     model = model.to(device)
@@ -224,8 +242,7 @@ def main():
             elif ord(ch) in key_map:
                 idx, delta = key_map[ord(ch)]
                 eef_state[idx] += delta
-                if idx == 6:
-                    eef_state[6] = np.clip(eef_state[6], GRIPPER_MIN, GRIPPER_MAX)
+                eef_state[idx] = np.clip(eef_state[idx], action_min[idx], action_max[idx])
             elif ch == " ":
                 pass
             else:
