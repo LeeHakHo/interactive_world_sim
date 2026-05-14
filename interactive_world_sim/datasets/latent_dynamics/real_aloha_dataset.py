@@ -104,6 +104,10 @@ def _convert_real_to_dp_replay(
             # save lowdim data to lowedim_data_dict
             if "action" not in lowdim_data_dict:
                 lowdim_data_dict["action"] = list()
+            if "action_mask" not in lowdim_data_dict:
+                lowdim_data_dict["action_mask"] = list()
+            mask_data = file["action_mask"][:] if "action_mask" in file else np.ones(episode_length, dtype=np.float32)
+            lowdim_data_dict["action_mask"].append(mask_data)
             if ctrl_mode == "eef":
                 action_data = file["action"][:]
             else:
@@ -631,6 +635,8 @@ class RealAlohaDataset(BaseImageDataset):
             "is_early_stop": torch.from_numpy(np.array([sample["is_early_stop"]])),
             "rel_stop_idx": torch.from_numpy(np.array([sample["rel_stop_idx"]])),
         }
+        if "action_mask" in sample:
+            data["action_mask"] = torch.from_numpy(sample["action_mask"].astype(np.float32))
         return data
 
     def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:

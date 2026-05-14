@@ -720,9 +720,9 @@ class LatentWorldModel(BasePytorchAlgo):
                 z_raw_flat   = rearrange(z_raw_even,  "b t c h w -> (b t) c h w")
                 feat0_flat   = rearrange(feat0_even,  "b t c h w -> (b t) c h w")
                 feat1_flat   = rearrange(feat1_even,  "b t c h w -> (b t) c h w")
-                flow_pred = self.flow_predictor(z_raw_flat, feat1_flat, feat0_flat, action_flat) #output is from tanh
-                flow_flat_norm = torch.sign(flow_flat) * torch.sqrt(torch.abs(flow_flat) / 20.0 + 1e-7) #match GT_flow to pred_flow
-                weights = (flow_flat_norm.detach() ** 2).sum(dim=1, keepdim=True).sqrt() + 0.01 #weight to magnitude
+                flow_pred = self.flow_predictor(z_raw_flat, feat1_flat, feat0_flat, action_flat)
+                flow_flat_norm = torch.sign(flow_flat) * torch.sqrt(torch.abs(flow_flat) / 20.0 + 1e-7)
+                weights = (flow_flat_norm.detach() ** 2).sum(dim=1, keepdim=True).sqrt() + 0.01
                 weights = weights / (weights.mean() + 1e-8)
                 flow_pred_loss = (F.mse_loss(flow_pred, flow_flat_norm.detach(), reduction='none') * weights).mean()
                 loss = loss + self.flow_rec_loss_weight * flow_pred_loss
@@ -739,6 +739,12 @@ class LatentWorldModel(BasePytorchAlgo):
                 z = self.encoder_forward(xs)  # (B*T, C, H, W)
             z = rearrange(z, "(b t) c h w -> t b c h w", b=obs.shape[0])
             action = rearrange(action, "b t a -> t b a")
+
+            # zero out action for human episodes (action_mask=0)
+            if "action_mask" in batch:
+                act_mask = batch["action_mask"].float()  # (B, T)
+                act_mask = rearrange(act_mask, "b t -> t b 1")
+                action = action * act_mask
 
             action_cond = action
 
