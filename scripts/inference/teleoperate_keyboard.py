@@ -1,7 +1,15 @@
+from __future__ import annotations
 import math
 import time
 from pathlib import Path
 from typing import Optional, Union
+
+
+
+import os
+from typing import TYPE_CHECKING
+
+HEADLESS = "DISPLAY" not in os.environ or os.environ.get("HEADLESS", "0") == "1"
 
 import cv2
 import hydra
@@ -12,9 +20,15 @@ from einops import rearrange
 from omegaconf import DictConfig, OmegaConf
 from yixuan_utilities.draw_utils import center_crop
 from yixuan_utilities.hdf5_utils import load_dict_from_hdf5, save_dict_to_hdf5
-from yixuan_utilities.joystick_utils import Joystick
-from yixuan_utilities.keyboard_utils import KeyReader
-from yixuan_utilities.kinematics_helper import KinHelper
+
+if not HEADLESS:
+    from yixuan_utilities.joystick_utils import Joystick
+    from yixuan_utilities.keyboard_utils import KeyReader
+    from yixuan_utilities.kinematics_helper import KinHelper
+elif TYPE_CHECKING:
+    from yixuan_utilities.joystick_utils import Joystick
+    from yixuan_utilities.keyboard_utils import KeyReader
+    from yixuan_utilities.kinematics_helper import KinHelper
 
 from interactive_world_sim.algorithms.common.diffusion_helper import render_img_cm
 from interactive_world_sim.algorithms.latent_dynamics.latent_world_model import (
@@ -413,8 +427,9 @@ def record_one_episode(
         (0, 255, 0),
         2,
     )
-    cv2.imshow("pred", concat_img)
-    cv2.waitKey(100)
+    if not HEADLESS:
+        cv2.imshow("pred", concat_img)
+        cv2.waitKey(100)
 
     out_vid = cv2.VideoWriter(
         f"{output_dir}/out_vid/{episode_id}.mp4",
@@ -583,8 +598,9 @@ def record_one_episode(
             (0, 255, 0),
             2,
         )
-        cv2.imshow("pred", concat_img)
-        cv2.waitKey(1)
+        if not HEADLESS:
+            cv2.imshow("pred", concat_img)
+            cv2.waitKey(1)
 
         step_i += 1
         print("freq:", 1 / (time.time() - start_time))
@@ -661,6 +677,8 @@ def main(cfg: DictConfig) -> None:
     # set up env
     dt = 1 / 30.0
     device = models[0].device
+    if HEADLESS:
+        assert cfg.use_dataset, "Headless mode requires +use_dataset=true"
     if cfg.use_joystick:
         controller = Joystick()
     elif cfg.use_dataset:

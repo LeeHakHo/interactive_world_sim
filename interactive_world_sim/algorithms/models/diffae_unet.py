@@ -472,12 +472,13 @@ class QKVAttention(nn.Module):
             ek, ev = encoder_kv.reshape(bs * self.n_heads, ch * 2, -1).split(ch, dim=1)
             k = th.cat([ek, k], dim=-1)
             v = th.cat([ev, v], dim=-1)
-        scale = 1 / math.sqrt(math.sqrt(ch))
-        weight = th.einsum(
-            "bct,bcs->bts", q * scale, k * scale
-        )  # More stable with f16 than dividing afterwards
-        weight = th.softmax(weight.float(), dim=-1).type(weight.dtype)
-        a = th.einsum("bts,bcs->bct", weight, v)
+        # Use scaled_dot_product_attention for memory efficiency
+        # Reshape from (B*H, C, T) to (B*H, T, C) for sdpa
+        q = q.transpose(1, 2).contiguous()  # (B*H, T_q, C)
+        k = k.transpose(1, 2).contiguous()  # (B*H, T_kv, C)
+        v = v.transpose(1, 2).contiguous()  # (B*H, T_kv, C)
+        a = th.nn.functional.scaled_dot_product_attention(q, k, v)  # (B*H, T_q, C)
+        a = a.transpose(1, 2)  # (B*H, C, T_q)
         return a.reshape(bs, -1, length)
 
 

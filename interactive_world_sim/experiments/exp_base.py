@@ -14,6 +14,7 @@ from typing import Dict, Optional, Union
 import hydra
 import lightning.pytorch as pl
 import torch
+from lightning.fabric.plugins.io.torch_io import TorchCheckpointIO
 from lightning.pytorch.callbacks import LearningRateMonitor, ModelCheckpoint
 from lightning.pytorch.loggers.wandb import WandbLogger
 from lightning.pytorch.strategies.ddp import DDPStrategy
@@ -24,6 +25,14 @@ from interactive_world_sim.utils.distributed_utils import is_rank_zero
 from interactive_world_sim.utils.print_utils import cyan
 
 torch.set_float32_matmul_precision("high")
+
+
+class _LegacyCheckpointIO(TorchCheckpointIO):
+    """PyTorch 2.6+ 将 weights_only 默认值改为 True，导致包含 omegaconf 类型的
+    旧 checkpoint 无法加载。此子类强制使用 weights_only=False 以保持兼容性。"""
+
+    def load_checkpoint(self, path, map_location=None, weights_only=True):
+        return super().load_checkpoint(path, map_location=map_location, weights_only=False)
 
 
 class BaseExperiment(ABC):
@@ -213,6 +222,7 @@ class BaseLightningExperiment(BaseExperiment):
                 if torch.cuda.device_count() > 1
                 else "auto"
             ),
+            plugins=[_LegacyCheckpointIO()],
             callbacks=callbacks,
             gradient_clip_val=self.cfg.training.optim.gradient_clip_val,
             val_check_interval=self.cfg.validation.val_every_n_step,
@@ -260,6 +270,7 @@ class BaseLightningExperiment(BaseExperiment):
                 if torch.cuda.device_count() > 1
                 else "auto"
             ),
+            plugins=[_LegacyCheckpointIO()],
             callbacks=callbacks,
             limit_val_batches=self.cfg.validation.limit_batch,
             precision=self.cfg.validation.precision,
@@ -293,6 +304,7 @@ class BaseLightningExperiment(BaseExperiment):
                 if torch.cuda.device_count() > 1
                 else "auto"
             ),
+            plugins=[_LegacyCheckpointIO()],
             callbacks=callbacks,
             limit_test_batches=self.cfg.test.limit_batch,
             precision=self.cfg.test.precision,

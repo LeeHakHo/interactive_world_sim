@@ -159,39 +159,60 @@ class FrechetVideoDistance(nn.Module):
             self.detector = torch.jit.load(str(cached_model_path)).eval()
             print(f"Model cached at: {cached_model_path}")
 
+    # I3D 设计用于短视频片段，超过此帧数会导致显存 OOM
+    MAX_FVD_FRAMES = 64
+
+    def _extract_features(
+        self, videos: torch.Tensor, batch_size: int = 1
+    ) -> np.ndarray:
+        """分批提取 I3D 特征，避免长视频序列导致显存 OOM。
+
+        :param videos: tensor of shape (batch, c, frames, h, w)
+        :param batch_size: 每次送入 I3D 的样本数
+        """
+        device = next(self.parameters()).device
+        all_feats = []
+        for i in range(0, videos.shape[0], batch_size):
+            chunk = videos[i : i + batch_size].to(device)
+            feats = self.detector(chunk, **self.detector_kwargs).cpu().numpy()
+            all_feats.append(feats)
+            torch.cuda.empty_cache()
+        return np.concatenate(all_feats, axis=0)
+
     @torch.no_grad()
-    def compute(self, videos_fake: torch.Tensor, videos_real: torch.Tensor) -> float:
+    def compute(
+        self,
+        videos_fake: torch.Tensor,
+        videos_real: torch.Tensor,
+        detector_batch_size: int = 1,
+    ) -> float:
         """Compute FVD between fake and real videos
 
         :param videos_fake: predicted video tensor of shape
             (frame, batch, channel, height, width)
         :param videos_real: ground-truth observation tensor of shape
             (frame, batch, channel, height, width)
+        :param detector_batch_size: 每次送入 I3D 的样本数，减小可降低显存占用
         :return:
         """
         n_frames, batch_size, c, h, w = videos_fake.shape
         if n_frames < 2:
             raise ValueError("Video must have more than 1 frame for FVD")
 
+        # I3D 设计用于短视频片段，帧数过长时均匀采样到 MAX_FVD_FRAMES
+        if n_frames > self.MAX_FVD_FRAMES:
+            indices = torch.linspace(0, n_frames - 1, self.MAX_FVD_FRAMES).long()
+            videos_fake = videos_fake[indices]
+            videos_real = videos_real[indices]
+
+        # [batch, c, frames, h, w]
         videos_fake = videos_fake.permute(1, 2, 0, 3, 4).contiguous()
         videos_real = videos_real.permute(1, 2, 0, 3, 4).contiguous()
 
         # detector takes in tensors of shape [batch_size, c, video_len, h, w]
         # with range -1 to 1
-        feats_fake = (
-            self.detector(
-                videos_fake.to(next(self.parameters()).device), **self.detector_kwargs
-            )
-            .cpu()
-            .numpy()
-        )
-        feats_real = (
-            self.detector(
-                videos_real.to(next(self.parameters()).device), **self.detector_kwargs
-            )
-            .cpu()
-            .numpy()
-        )
+        feats_fake = self._extract_features(videos_fake, batch_size=detector_batch_size)
+        feats_real = self._extract_features(videos_real, batch_size=detector_batch_size)
 
         try:
             fvd = compute_fvd(feats_fake, feats_real)

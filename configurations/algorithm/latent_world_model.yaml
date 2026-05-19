@@ -28,6 +28,7 @@ mask_prev_action: False
 device: cuda
 noise_level: log_normal
 val_render: True
+max_val_render_batches: 16  # 最多累积多少 batch 的渲染结果用于计算 FVD/FID 等指标，避免 CPU 内存 OOM
 
 # diffusion-related
 scheduling_matrix: autoregressive
@@ -104,6 +105,47 @@ diffusion:
   num_components: ${algorithm.num_components}
   image_size: ${dataset.resolution}
   stabilization_level: 15
+
+dynamo_ssl:
+  enabled: false
+  encoder_backbone: resnet   # resnet | vit
+  loss_coef: 1.0
+  pretrained_encoder: false
+  feature_dim: 512
+  projection_dim: 32
+  window_size: ${dataset.horizon}
+  n_layer: 6
+  n_head: 6
+  n_embd: 120
+  dropout: 0.0
+  covariance_reg_coef: 0.04
+  dynamics_loss_coef: 1.0
+  ema_beta: null      # null=SimSiam, float=EMA
+  beta_scheduling: true
+  lr: 1e-4
+  weight_decay: 0.0
+  betas: [0.9, 0.999]
+  separate_single_views: true
+  detach_rec_from_encoder: true   # true: rec_loss不回传到encoder, false: rec_loss也训练encoder
+  spatial_proj_mode: plain        # plain: 纯投影(推荐), adaln: [CLS]调制patches
+  # SIGReg: Sketch Isotropic Gaussian Regularizer，替代VICReg covariance reg防止表征塌缩
+  use_sigreg: false
+  sigreg_weight: 0.09            # SIGReg loss权重
+  sigreg_knots: 17               # Epps-Pulley统计检验的节点数
+  sigreg_num_proj: 1024          # 随机投影方向数
+  # Sparse IDM: 在IDM输入上加learned sparse mask，让dynamics loss只流经部分encoder channel
+  use_sparse_idm: false
+  sparse_lambda: 0.01            # L1 sparsity penalty权重
+  sparse_mask_init: 0.0          # mask logit初始值, sigmoid(0)=0.5
+  # ViT encoder settings (only used when encoder_backbone=vit)
+  vit:
+    img_size: ${dataset.resolution}
+    patch_size: 8       # 128/8 = 16×16 patches
+    embed_dim: 384      # ViT-Small
+    depth: 12
+    num_heads: 6
+    mlp_ratio: 4.0
+    drop_rate: 0.0
 
 metrics:
   - fvd

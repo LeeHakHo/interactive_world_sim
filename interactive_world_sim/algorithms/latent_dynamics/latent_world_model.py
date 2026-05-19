@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from einops import rearrange
 from lightning.pytorch.utilities.types import STEP_OUTPUT
 from omegaconf import DictConfig, OmegaConf
-from torch.optim.lr_scheduler import LinearLR, ReduceLROnPlateau
+from torch.optim.lr_scheduler import LambdaLR, LinearLR, ReduceLROnPlateau
 
 # import matplotlib.pyplot as plt
 from interactive_world_sim.algorithms.common.base_pytorch_algo import BasePytorchAlgo
@@ -19,6 +19,16 @@ from interactive_world_sim.algorithms.common.metrics import (
     FrechetInceptionDistance,
     FrechetVideoDistance,
     LearnedPerceptualImagePatchSimilarity,
+)
+from interactive_world_sim.algorithms.latent_dynamics.dynamo_ssl_module import (
+    AdaLNSpatialProjection,
+    DynaMoSSLModule,
+    PlainSpatialProjection,
+    ResNet18SpatialEncoder,
+    SpatialProjectionHead,
+    SpatialToVectorHead,
+    ViTSpatialEncoder,
+    ViTVectorHead,
 )
 from interactive_world_sim.algorithms.models.cm_decoder import CMDecoder
 from interactive_world_sim.algorithms.models.utils import EinopsWrapper
@@ -41,23 +51,45 @@ class LatentWorldModel(BasePytorchAlgo):
         self.training_stage = cfg.training_stage
         assert self.training_stage in [1, 2, 3], "Invalid training stage"
         self.load_ae = cfg.load_ae if "load_ae" in cfg else None
+        self.obs_keys = cfg.obs_keys
+        self.num_views = len(self.obs_keys)
+        self.latent_resolution = cfg.latent_resolution
+
+        # DynaMo SSL config (must be set before super().__init__ which calls _build_model)
+        # use_resnet_encoder: True when dynamo_ssl is enabled (ResNet OR ViT backbone)
+        self.use_resnet_encoder = (
+            "dynamo_ssl" in cfg
+            and cfg.dynamo_ssl.get("enabled", False)
+        )
+        self.encoder_backbone = (
+            cfg.dynamo_ssl.get("encoder_backbone", "resnet")
+            if self.use_resnet_encoder else "conv2d"
+        )
+        self.use_vit_encoder = (self.encoder_backbone == "vit")
+        self.use_dynamo_ssl = self.use_resnet_encoder and self.training_stage == 1
+        if self.use_dynamo_ssl:
+            self.ssl_loss_coef = cfg.dynamo_ssl.loss_coef
+            self.detach_rec_from_encoder = cfg.dynamo_ssl.get("detach_rec_from_encoder", True)
+
         super().__init__(cfg)
+
+        if self.use_dynamo_ssl:
+            self.automatic_optimization = False
+
         self.normalizer = LinearNormalizer()
         self.validation_step_outputs: list = []
         self.validation_metrics: dict = {}
         self.timesteps: int = cfg.diffusion.timesteps
         self.sampling_timesteps = cfg.diffusion.sampling_timesteps
-        self.obs_keys = cfg.obs_keys
         self.val_render = cfg.val_render
+        self.max_val_render_batches: int = cfg.get("max_val_render_batches", 16)
         self.clip_noise = self.cfg.diffusion.clip_noise
         self.guidance_scale = self.cfg.guidance_scale
         self.n_tokens = self.cfg.n_frames
         self.mask_prev_action = (
             cfg.mask_prev_action if "mask_prev_action" in cfg else False
         )
-        self.num_views = len(self.obs_keys)
 
-        self.latent_resolution = cfg.latent_resolution
         self.noise_scheduler: DDPMScheduler = hydra.utils.instantiate(
             cfg.noise_scheduler
         )
@@ -95,17 +127,96 @@ class LatentWorldModel(BasePytorchAlgo):
 
         # encoder
         latent_ch = self.num_latent_channel
-        encoder_module_ls = [nn.Conv2d(self.cfg.x_shape[0], latent_ch, 3, padding=1)]
-        for _ in range(self.num_latent_downsample):
-            encoder_module_ls.extend(
-                [
-                    nn.SiLU(),
-                    nn.Conv2d(latent_ch, latent_ch, kernel_size=3, padding=1),
-                    nn.SiLU(),
-                    nn.Conv2d(latent_ch, latent_ch, kernel_size=3, padding=1, stride=2),
-                ]
-            )
-        self.encoder = nn.Sequential(*encoder_module_ls)
+        if self.use_resnet_encoder:
+            c_per_view = latent_ch // self.num_views
+
+            if self.use_vit_encoder:
+                # ViT backbone + spatial projection
+                vit_cfg = self.cfg.dynamo_ssl.get("vit", {})
+                self.vit_encoder = ViTSpatialEncoder(
+                    img_size=vit_cfg.get("img_size", self.cfg.x_shape[1]),
+                    patch_size=vit_cfg.get("patch_size", 8),
+                    embed_dim=vit_cfg.get("embed_dim", 384),
+                    depth=vit_cfg.get("depth", 12),
+                    num_heads=vit_cfg.get("num_heads", 6),
+                    mlp_ratio=vit_cfg.get("mlp_ratio", 4.0),
+                    drop_rate=vit_cfg.get("drop_rate", 0.0),
+                )
+                vit_grid = self.vit_encoder.grid_size
+                vit_dim = self.vit_encoder.embed_dim
+                proj_mode = self.cfg.dynamo_ssl.get("spatial_proj_mode", "plain")
+                _proj_cls = AdaLNSpatialProjection if proj_mode == "adaln" else PlainSpatialProjection
+                self.spatial_proj = _proj_cls(
+                    embed_dim=vit_dim,
+                    out_channels=c_per_view,
+                    in_spatial=vit_grid,
+                    out_spatial=self.latent_resolution,
+                )
+            else:
+                # ResNet18 backbone + spatial projection for decoder
+                self.resnet_encoder = ResNet18SpatialEncoder(
+                    pretrained=self.cfg.dynamo_ssl.get("pretrained_encoder", False)
+                )
+                resnet_spatial = self.cfg.x_shape[1] // 32  # e.g., 128//32 = 4
+                self.spatial_proj = SpatialProjectionHead(
+                    in_channels=512,
+                    out_channels=c_per_view,
+                    in_spatial=resnet_spatial,
+                    out_spatial=self.latent_resolution,
+                )
+                self.encoder = nn.Sequential(self.resnet_encoder, self.spatial_proj)
+
+            if self.use_dynamo_ssl:
+                ssl_cfg = self.cfg.dynamo_ssl
+                if self.use_vit_encoder:
+                    self.vector_head = ViTVectorHead(
+                        embed_dim=vit_dim, feature_dim=ssl_cfg.feature_dim,
+                    )
+                    encoder_for_ema = self.vit_encoder
+                else:
+                    self.vector_head = SpatialToVectorHead(
+                        in_channels=512, feature_dim=ssl_cfg.feature_dim,
+                    )
+                    encoder_for_ema = self.resnet_encoder
+                self.dynamo_ssl = DynaMoSSLModule(
+                    encoder_for_ema=encoder_for_ema,
+                    vector_head_for_ema=self.vector_head,
+                    num_views=self.num_views,
+                    window_size=ssl_cfg.window_size,
+                    feature_dim=ssl_cfg.feature_dim,
+                    projection_dim=ssl_cfg.projection_dim,
+                    n_layer=ssl_cfg.n_layer,
+                    n_head=ssl_cfg.n_head,
+                    n_embd=ssl_cfg.n_embd,
+                    dropout=ssl_cfg.dropout,
+                    covariance_reg_coef=ssl_cfg.covariance_reg_coef,
+                    dynamics_loss_coef=ssl_cfg.dynamics_loss_coef,
+                    ema_beta=ssl_cfg.ema_beta,
+                    beta_scheduling=ssl_cfg.beta_scheduling,
+                    lr=ssl_cfg.lr,
+                    weight_decay=ssl_cfg.weight_decay,
+                    betas=tuple(ssl_cfg.betas),
+                    separate_single_views=ssl_cfg.separate_single_views,
+                    use_sparse_idm=ssl_cfg.get("use_sparse_idm", False),
+                    sparse_lambda=ssl_cfg.get("sparse_lambda", 0.01),
+                    sparse_mask_init=ssl_cfg.get("sparse_mask_init", 0.0),
+                    use_sigreg=ssl_cfg.get("use_sigreg", False),
+                    sigreg_weight=ssl_cfg.get("sigreg_weight", 0.09),
+                    sigreg_knots=ssl_cfg.get("sigreg_knots", 17),
+                    sigreg_num_proj=ssl_cfg.get("sigreg_num_proj", 1024),
+                )
+        else:
+            encoder_module_ls = [nn.Conv2d(self.cfg.x_shape[0], latent_ch, 3, padding=1)]
+            for _ in range(self.num_latent_downsample):
+                encoder_module_ls.extend(
+                    [
+                        nn.SiLU(),
+                        nn.Conv2d(latent_ch, latent_ch, kernel_size=3, padding=1),
+                        nn.SiLU(),
+                        nn.Conv2d(latent_ch, latent_ch, kernel_size=3, padding=1, stride=2),
+                    ]
+                )
+            self.encoder = nn.Sequential(*encoder_module_ls)
 
         # load previous trained model
         if self.load_ae is not None:
@@ -120,7 +231,14 @@ class LatentWorldModel(BasePytorchAlgo):
                 map_location=self.device,
                 weights_only=False,
             )
-            self.encoder.load_state_dict(diffae.encoder.state_dict())
+            if self.use_resnet_encoder:
+                if self.use_vit_encoder:
+                    self.vit_encoder.load_state_dict(diffae.vit_encoder.state_dict())
+                else:
+                    self.resnet_encoder.load_state_dict(diffae.resnet_encoder.state_dict())
+                self.spatial_proj.load_state_dict(diffae.spatial_proj.state_dict())
+            else:
+                self.encoder.load_state_dict(diffae.encoder.state_dict())
             if self.training_stage == 3:
                 self.dynamics.load_state_dict(diffae.dynamics.state_dict())
             self.decoder.load_state_dict(diffae.decoder.state_dict())
@@ -139,13 +257,30 @@ class LatentWorldModel(BasePytorchAlgo):
         """Set the normalizer for the model"""
         self.normalizer.load_state_dict(normalizer.state_dict())
 
-    def configure_optimizers(self) -> torch.optim.Optimizer:
+    def configure_optimizers(self):
         """Configure the optimizer for the model"""
         if self.training_stage == 1:
+            if self.use_vit_encoder:
+                encoder_params = list(self.vit_encoder.parameters()) + list(self.spatial_proj.parameters())
+            elif hasattr(self, "encoder"):
+                encoder_params = list(self.encoder.parameters())
+            else:
+                encoder_params = list(self.resnet_encoder.parameters()) + list(self.spatial_proj.parameters())
             param_groups = [
                 {"params": self.decoder.parameters(), "lr": self.cfg.lr},
-                {"params": self.encoder.parameters(), "lr": self.cfg.lr},
+                {"params": encoder_params, "lr": self.cfg.lr},
             ]
+            if self.use_dynamo_ssl:
+                ssl_cfg = self.cfg.dynamo_ssl
+                param_groups.extend([
+                    {"params": self.vector_head.parameters(), "lr": ssl_cfg.lr},
+                    {"params": self.dynamo_ssl.projector.parameters(), "lr": ssl_cfg.lr},
+                    {"params": self.dynamo_ssl.forward_dynamics.parameters(), "lr": ssl_cfg.lr},
+                ])
+                if self.dynamo_ssl.use_sparse_idm:
+                    param_groups.append(
+                        {"params": self.dynamo_ssl.sparse_mask.parameters(), "lr": ssl_cfg.lr},
+                    )
         elif self.training_stage == 2:
             param_groups = [
                 {"params": self.dynamics.parameters(), "lr": self.cfg.lr},
@@ -161,12 +296,34 @@ class LatentWorldModel(BasePytorchAlgo):
             betas=self.cfg.optimizer_beta,
         )
         if self.lr_scheduler == "linear":
-            lr_scheduler = LinearLR(
-                optimizer,
-                start_factor=1e-4,
-                end_factor=1.0,
-                total_iters=self.cfg.warmup_steps,
-            )
+            if self.use_dynamo_ssl:
+                # Warmup only for decoder+encoder (groups 0,1), no warmup for SSL groups (2,3,4)
+                warmup_steps = self.cfg.warmup_steps
+                start_factor = 1e-4
+
+                def lr_lambda_fn(group_idx):
+                    if group_idx < 2:
+                        # decoder, encoder: linear warmup
+                        def fn(step):
+                            if step >= warmup_steps:
+                                return 1.0
+                            return start_factor + (1.0 - start_factor) * step / warmup_steps
+                        return fn
+                    else:
+                        # SSL groups: constant LR, no warmup
+                        return lambda step: 1.0
+
+                lr_scheduler = LambdaLR(
+                    optimizer,
+                    lr_lambda=[lr_lambda_fn(i) for i in range(len(param_groups))],
+                )
+            else:
+                lr_scheduler = LinearLR(
+                    optimizer,
+                    start_factor=1e-4,
+                    end_factor=1.0,
+                    total_iters=self.cfg.warmup_steps,
+                )
         elif self.lr_scheduler == "plateau":
             lr_scheduler = ReduceLROnPlateau(
                 optimizer,
@@ -179,6 +336,7 @@ class LatentWorldModel(BasePytorchAlgo):
             )
         else:
             raise NotImplementedError(f"LR scheduler {self.lr_scheduler} not included")
+
         return {
             "optimizer": optimizer,
             "lr_scheduler": {
@@ -195,7 +353,7 @@ class LatentWorldModel(BasePytorchAlgo):
         """Forward pass of the encoder
 
         Args:
-            obs: (B, C, H, W)
+            obs: (B, C, H, W) where C = 3 * num_views
 
         Returns:
             z: (B, C_latent, H_latent, W_latent)
@@ -203,7 +361,31 @@ class LatentWorldModel(BasePytorchAlgo):
         assert (
             len(obs.shape) == 4
         ), f"Expected obs to have shape (B, C, H, W) but got {obs.shape}"
-        z = self.encoder(obs)
+
+        if self.use_resnet_encoder:
+            num_views = len(self.obs_keys)
+            z_views = []
+            for v in range(num_views):
+                view_obs = obs[:, v * 3 : (v + 1) * 3]  # (B, 3, H, W)
+                if self.use_vit_encoder:
+                    spatial_feat, cls_token = self.vit_encoder(view_obs)
+                    if self.use_dynamo_ssl and self.detach_rec_from_encoder:
+                        spatial = self.spatial_proj(
+                            spatial_feat.detach(), cls_token.detach()
+                        )
+                    else:
+                        spatial = self.spatial_proj(spatial_feat, cls_token)
+                else:
+                    resnet_feat = self.resnet_encoder(view_obs)
+                    if self.use_dynamo_ssl and self.detach_rec_from_encoder:
+                        spatial = self.spatial_proj(resnet_feat.detach())
+                    else:
+                        spatial = self.spatial_proj(resnet_feat)
+                z_views.append(spatial)
+            z = torch.cat(z_views, dim=1)
+        else:
+            z = self.encoder(obs)
+
         num_views = len(self.obs_keys)
         c_per_v = z.shape[1] // num_views
         for i in range(num_views):
@@ -213,6 +395,77 @@ class LatentWorldModel(BasePytorchAlgo):
             )
         return z
 
+    def on_save_checkpoint(self, checkpoint: dict) -> None:
+        """Save EMA beta state for resume support."""
+        if self.use_dynamo_ssl and self.dynamo_ssl.ema_beta is not None:
+            checkpoint["dynamo_ssl_ema_beta_current"] = (
+                self.dynamo_ssl.ema_encoder.beta
+            )
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        """Restore EMA beta state on resume, with backward compatibility."""
+        if self.use_dynamo_ssl:
+            # Restore EMA beta
+            if (
+                self.dynamo_ssl.ema_beta is not None
+                and checkpoint.get("dynamo_ssl_ema_beta_current") is not None
+            ):
+                self.dynamo_ssl.ema_encoder.beta = checkpoint[
+                    "dynamo_ssl_ema_beta_current"
+                ]
+                self.dynamo_ssl.ema_vector_head.beta = checkpoint[
+                    "dynamo_ssl_ema_beta_current"
+                ]
+
+            # Handle optimizer state mismatch from old ckpts (e.g. 3 optimizers → 1)
+            if self.use_dynamo_ssl:
+                expected_groups = 6 if self.dynamo_ssl.use_sparse_idm else 5
+            else:
+                expected_groups = 2
+            if "optimizer_states" in checkpoint and len(checkpoint["optimizer_states"]) > 0:
+                old_opt_states = checkpoint["optimizer_states"]
+
+                if len(old_opt_states) != 1:
+                    # Old ckpt had multiple optimizers → merge into one
+                    # Keep the first optimizer's state (main), discard others
+                    print(
+                        f"[Resume] Migrating from {len(old_opt_states)} optimizer(s) to 1. "
+                        f"Keeping main optimizer state, SSL optimizers reset."
+                    )
+                    merged = old_opt_states[0]
+                    old_n = len(merged["param_groups"])
+                    # Add empty param groups for new SSL groups
+                    for _ in range(expected_groups - old_n):
+                        new_group = dict(merged["param_groups"][0])
+                        new_group["params"] = []
+                        merged["param_groups"].append(new_group)
+                    checkpoint["optimizer_states"] = [merged]
+
+                elif len(old_opt_states[0]["param_groups"]) != expected_groups:
+                    # Same single optimizer but different param group count
+                    old_n = len(old_opt_states[0]["param_groups"])
+                    print(
+                        f"[Resume] Migrating param groups: {old_n} → {expected_groups}. "
+                        f"Existing groups preserved, new groups initialized fresh."
+                    )
+                    merged = old_opt_states[0]
+                    if old_n < expected_groups:
+                        for _ in range(expected_groups - old_n):
+                            new_group = dict(merged["param_groups"][0])
+                            new_group["params"] = []
+                            merged["param_groups"].append(new_group)
+                    else:
+                        merged["param_groups"] = merged["param_groups"][:expected_groups]
+                    checkpoint["optimizer_states"] = [merged]
+
+            # LR scheduler: always reset to avoid mismatch
+            if "lr_schedulers" in checkpoint:
+                checkpoint["lr_schedulers"] = []
+
+    def on_train_epoch_start(self) -> None:
+        """Called at the beginning of each training epoch."""
+        pass
+
     def optimizer_step(
         self,
         epoch: dict,
@@ -221,6 +474,9 @@ class LatentWorldModel(BasePytorchAlgo):
         optimizer_closure: Callable,
     ) -> None:
         """Override the optimizer step to manually warm up the learning rate"""
+        if self.use_dynamo_ssl:
+            # Manual optimization handles its own optimizer steps in training_step
+            return
         # update params
         optimizer.step(closure=optimizer_closure)
         if self.training_stage == 2:
@@ -414,7 +670,8 @@ class LatentWorldModel(BasePytorchAlgo):
             xs = rearrange(xs, "b t c h w -> t b c h w", b=obs.shape[0])
             xs_pred = xs_pred.detach().cpu()
             xs = xs.detach().cpu()
-            self.validation_step_outputs.append((xs_pred, xs))
+            if len(self.validation_step_outputs) < self.max_val_render_batches:
+                self.validation_step_outputs.append((xs_pred, xs))
         return
 
     # ========= training  ============
@@ -514,7 +771,48 @@ class LatentWorldModel(BasePytorchAlgo):
 
         if self.training_stage == 1:
             # stage 1: train encoder and decoder
-            z = self.encoder_forward(xs)  # (B*T, C, H, W)
+            # When using DynaMo SSL, run encoder once and cache features
+            if self.use_dynamo_ssl:
+                batch_size = obs.shape[0]
+                seq_len = obs.shape[1]
+                z_views = []
+                obs_vectors = []
+                obs_per_view_imgs = []
+                for v in range(self.num_views):
+                    view_obs = xs[:, v * 3 : (v + 1) * 3]  # (B*T, 3, H, W)
+                    obs_per_view_imgs.append(view_obs)
+                    if self.use_vit_encoder:
+                        spatial_feat, cls_token = self.vit_encoder(view_obs)
+                        vec = self.vector_head(cls_token)
+                        vec = rearrange(vec, "(b t) d -> b t d", b=batch_size)
+                        obs_vectors.append(vec)
+                        if self.detach_rec_from_encoder:
+                            spatial = self.spatial_proj(
+                                spatial_feat.detach(), cls_token.detach()
+                            )
+                        else:
+                            spatial = self.spatial_proj(spatial_feat, cls_token)
+                    else:
+                        resnet_feat = self.resnet_encoder(view_obs)
+                        vec = self.vector_head(resnet_feat)
+                        vec = rearrange(vec, "(b t) d -> b t d", b=batch_size)
+                        obs_vectors.append(vec)
+                        feat_for_decoder = resnet_feat.detach() if self.detach_rec_from_encoder else resnet_feat
+                        spatial = self.spatial_proj(feat_for_decoder)
+                    z_views.append(spatial)
+                z = torch.cat(z_views, dim=1)  # (B*T, C_latent, H_lat, W_lat)
+                # Per-view normalization
+                num_views = len(self.obs_keys)
+                c_per_v = z.shape[1] // num_views
+                for i in range(num_views):
+                    z_chunk = z[:, i * c_per_v : (i + 1) * c_per_v].clone()
+                    z[:, i * c_per_v : (i + 1) * c_per_v] = z_chunk / (
+                        torch.norm(z_chunk, dim=(1), keepdim=True) + 1e-8
+                    )
+                obs_enc = torch.stack(obs_vectors, dim=2)  # (B, T, V, feature_dim)
+            else:
+                z = self.encoder_forward(xs)  # (B*T, C, H, W)
+
             if self.robust_latent:
                 z += torch.randn_like(z) * 0.02
 
@@ -581,11 +879,62 @@ class LatentWorldModel(BasePytorchAlgo):
                     loss = loss_s
                 loss = loss.mean()
 
-            self.log("training/rec_loss", loss)
-            output_dict = {
-                "loss": loss,
-            }
-            return output_dict
+            rec_loss = loss
+
+            if self.use_dynamo_ssl:
+                online_encoder = self.vit_encoder if self.use_vit_encoder else self.resnet_encoder
+                obs_target = self.dynamo_ssl.get_ema_target(
+                    obs_per_view_imgs,
+                    online_encoder,
+                    self.vector_head,
+                    batch_size,
+                    seq_len,
+                )
+
+                # Compute SSL loss
+                ssl_loss, ssl_components = self.dynamo_ssl.compute_ssl_loss(
+                    obs_enc, obs_target
+                )
+
+                total_loss = rec_loss + self.ssl_loss_coef * ssl_loss
+
+                # Manual optimization with single optimizer
+                opt = self.optimizers()
+                lr_sched = self.lr_schedulers()
+
+                opt.zero_grad()
+                self.manual_backward(total_loss)
+
+                if self.cfg.get("gradient_clip_val", None):
+                    self.clip_gradients(
+                        opt, gradient_clip_val=self.cfg.gradient_clip_val
+                    )
+
+                opt.step()
+
+                if lr_sched is not None:
+                    lr_sched.step()
+
+                # Adjust EMA beta by step-based cosine schedule, then update EMA
+                self.dynamo_ssl.adjust_beta(
+                    self.global_step, self.trainer.max_steps
+                )
+                ema_encoder = self.vit_encoder if self.use_vit_encoder else self.resnet_encoder
+                self.dynamo_ssl.update_ema(ema_encoder, self.vector_head)
+
+                # Logging
+                self.log("training/rec_loss", rec_loss)
+                self.log("training/ssl_loss", ssl_loss)
+                self.log("training/loss", total_loss)
+                for k, v in ssl_components.items():
+                    self.log(f"training/ssl_{k}", v)
+                return None  # manual optimization
+            else:
+                self.log("training/rec_loss", rec_loss)
+                output_dict = {
+                    "loss": rec_loss,
+                }
+                return output_dict
         elif self.training_stage == 2:
             # stage 2: train dynamics
             with torch.no_grad():
