@@ -452,9 +452,10 @@ class RealAlohaDataset(BaseImageDataset):
         else:
             raise ValueError(f"Invalid augmentation mode: {cfg.aug_mode}")
 
+        human_mode = cfg.human_mode if "human_mode" in cfg else "all"
         train_dir = os.path.join(dataset_dir, "train")
         self.replay_buffer = load_replay_buffer(
-            train_dir, use_cache, shape_meta, ctrl_mode=cfg.action_mode
+            train_dir, use_cache, shape_meta, ctrl_mode=cfg.action_mode, human_mode=human_mode
         )
 
         rgb_keys = list()
