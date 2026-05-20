@@ -24,6 +24,7 @@ delta_action: false
 goal_sample: intermediate
 action_mode: eef
 load_mask: false
+human_mode: all   # all | robot_only | masked
 shape_meta:
   action:
     shape:

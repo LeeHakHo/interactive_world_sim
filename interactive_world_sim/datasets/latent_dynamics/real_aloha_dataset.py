@@ -48,6 +48,7 @@ def _convert_real_to_dp_replay(
     ctrl_mode: str,
     n_workers: Optional[int] = None,
     max_inflight_tasks: Optional[int] = None,
+    human_mode: str = "all",
 ) -> ReplayBuffer:
     if n_workers is None:
         n_workers = multiprocessing.cpu_count()
@@ -95,6 +96,12 @@ def _convert_real_to_dp_replay(
     for epi_idx in tqdm(episodes_idx, desc="Loading episodes"):
         dataset_path = os.path.join(dataset_dir, f"episode_{epi_idx}.hdf5")
         with h5py.File(dataset_path) as file:
+            is_human = bool(file.attrs.get("is_human", 0))
+
+            # human_mode filtering
+            if human_mode == "robot_only" and is_human:
+                continue
+
             # count total steps
             episode_length = file["action"].shape[0]
             episode_end = prev_end + episode_length
@@ -107,6 +114,8 @@ def _convert_real_to_dp_replay(
             if "action_mask" not in lowdim_data_dict:
                 lowdim_data_dict["action_mask"] = list()
             mask_data = file["action_mask"][:] if "action_mask" in file else np.ones(episode_length, dtype=np.float32)
+            if human_mode == "masked" and is_human:
+                mask_data = np.zeros(episode_length, dtype=np.float32)
             lowdim_data_dict["action_mask"].append(mask_data)
             if ctrl_mode == "eef":
                 action_data = file["action"][:]
@@ -355,6 +364,7 @@ def load_replay_buffer(
     use_cache: bool,
     shape_meta: dict,
     ctrl_mode: str,
+    human_mode: str = "all",
 ) -> ReplayBuffer:
     replay_buffer = None
     if use_cache:
@@ -370,12 +380,12 @@ def load_replay_buffer(
             if not os.path.exists(cache_zarr_path):
                 try:
                     print("Cache does not exist. Creating!")
-                    # store = zarr.DirectoryStore(cache_zarr_path)
                     replay_buffer = _convert_real_to_dp_replay(
                         store=zarr.MemoryStore(),
                         shape_meta=shape_meta,
                         dataset_dir=dataset_dir,
                         ctrl_mode=ctrl_mode,
+                        human_mode=human_mode,
                     )
                     print("Saving cache to disk.")
                     with zarr.ZipStore(cache_zarr_path) as zip_store:
@@ -396,6 +406,7 @@ def load_replay_buffer(
             shape_meta=shape_meta,
             dataset_dir=dataset_dir,
             ctrl_mode=ctrl_mode,
+            human_mode=human_mode,
         )
     return replay_buffer
 

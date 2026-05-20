@@ -49,6 +49,7 @@ class LatentWorldModel(BasePytorchAlgo):
         super().__init__(cfg)
         self.normalizer = LinearNormalizer()
         self.validation_step_outputs: list = []
+        self.probe_step_outputs: list = []
         self.validation_metrics: dict = {}
         self.timesteps: int = cfg.diffusion.timesteps
         self.sampling_timesteps = cfg.diffusion.sampling_timesteps
@@ -396,6 +397,43 @@ class LatentWorldModel(BasePytorchAlgo):
         xs_pred = rearrange(xs_pred[T_hist:], "t b c h w -> b t c h w")
         return xs_pred
 
+    # Probe actions in normalized action space: [x, y, z, rx, ry, rz, gripper]
+    _PROBE_ACTIONS = {
+        "left":          [-1.0,  0.0,  0.0, 0.0, 0.0, 0.0,  0.0],
+        "right":         [ 1.0,  0.0,  0.0, 0.0, 0.0, 0.0,  0.0],
+        "up":            [ 0.0,  0.0,  1.0, 0.0, 0.0, 0.0,  0.0],
+        "down":          [ 0.0,  0.0, -1.0, 0.0, 0.0, 0.0,  0.0],
+        "gripper_open":  [ 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, -1.0],
+        "gripper_close": [ 0.0,  0.0,  0.0, 0.0, 0.0, 0.0,  1.0],
+    }
+    _PROBE_HORIZON = 100
+
+    @torch.no_grad()
+    def _probe_rollout_sequential(self, z_0: torch.Tensor, horizon: int = 10) -> torch.Tensor:
+        """Roll out dynamics with all probe actions sequentially in one continuous video.
+
+        Order: left → right → up → down → gripper_open → gripper_close,
+        each held for _PROBE_HORIZON steps.
+        Returns z_seq: (B, N_actions * _PROBE_HORIZON + 1, C, H, W) including z_0.
+        """
+        B = z_0.shape[0]
+        z_seq_ls = []
+        z_last = z_0.clone()
+        for action_norm in self._PROBE_ACTIONS.values():
+            a = torch.tensor(action_norm, dtype=torch.float32, device=self.device)
+            action_seq = a.unsqueeze(0).unsqueeze(0).expand(B, self._PROBE_HORIZON, -1)
+            for i in range(0, self._PROBE_HORIZON, horizon):
+                chunk = action_seq[:, i : i + horizon]
+                chunk_size = chunk.shape[1]
+                if chunk_size < horizon:
+                    chunk = F.pad(chunk, (0, 0, 0, horizon - chunk_size), mode="replicate")
+                z_pred = self.dynamics_forward(z_last[:, None], chunk)
+                z_pred = z_pred[:, :chunk_size]
+                z_seq_ls.append(z_pred)
+                z_last = z_pred[:, -1].clone()
+        z_seq = torch.cat(z_seq_ls, 1)
+        return torch.cat([z_0.unsqueeze(1), z_seq], 1)  # (B, T+1, C, H, W)
+
     def validation_step(
         self, batch: dict, batch_idx: int, namespace: str = "validation"
     ) -> STEP_OUTPUT:
@@ -493,6 +531,23 @@ class LatentWorldModel(BasePytorchAlgo):
             xs_pred = xs_pred.detach().cpu()
             xs = xs.detach().cpu()
             self.validation_step_outputs.append((xs_pred, xs))
+
+        # probe action rollout visualization (Stage 2 only, first batch)
+        if (
+            self.val_render
+            and self.training_stage == 2
+            and batch_idx == 0
+        ):
+            z_0 = z_gt[:, 0]
+            probe_horizon = z_gt.shape[1]
+            z_probe = self._probe_rollout_sequential(z_0, horizon=probe_horizon)  # (B, T+1, C, H, W)
+            z_probe_flat = rearrange(z_probe, "b t c h w -> (b t) c h w")
+            xs_probe = render_img_cm(
+                self, z_probe_flat, obs.shape[-1],
+                self.normalizer, num_views=self.num_views, batch_size=10
+            )
+            xs_probe = rearrange(xs_probe, "(b t) c h w -> t b c h w", b=z_0.shape[0])
+            self.probe_step_outputs.append(xs_probe.detach().cpu())
 
         # optical flow visualization (Stage 1 only)
         if (
@@ -1015,6 +1070,20 @@ class LatentWorldModel(BasePytorchAlgo):
         )
 
         self.validation_step_outputs.clear()
+
+        # Log probe action rollouts (Stage 2 only)
+        if self.probe_step_outputs and self.logger:
+            xs_probe = self.probe_step_outputs[0]
+            log_video(
+                xs_probe,
+                step=None if namespace == "test" else self.global_step,
+                namespace=f"{namespace}_probe",
+                prefix="sequential",
+                context_frames=0,
+                captions=list(self._PROBE_ACTIONS.keys()),
+                logger=self.logger.experiment,
+            )
+        self.probe_step_outputs.clear()
 
         # Log training set visualization at the same frequency as validation
         if namespace == "validation" and self.val_render and self.logger:
