@@ -1,15 +1,20 @@
-# @package _global_
-#
 # Phase 0 v3 Step 1: Stage 1 training with SplitEncoder + L_dom + L_adv.
 # See docs/superpowers/specs/2026-05-24-phase0-latent-decompose-design.md.
 #
-# Launch with full overrides:
-# python main.py experiment=phase0_step1 \
-#   dataset=play_mixed_eef \
-#   algorithm.training_stage=1 \
-#   algorithm.latent_decompose.enabled=true \
-#   dataset.sample_ratio=0.5 \
-#   +name=[run_name]
+# This file controls only trainer/checkpoint/validation config (mirrors
+# exp_latent_dyn.yaml style). The project's Hydra composition order requires
+# algorithm/dataset selections AND Phase-0 specific overrides to be passed
+# via CLI:
+#
+#   python main.py experiment=phase0_step1 \
+#       algorithm=latent_world_model dataset=play_mixed_eef \
+#       algorithm.training_stage=1 \
+#       algorithm.latent_decompose.enabled=true \
+#       dataset.sample_ratio=0.5 \
+#       +name=<run_name>
+#
+# All `algorithm.*` and `dataset.*` overrides are dotted-key overrides (no `+`
+# prefix needed) because the keys exist in the underlying yaml defaults.
 
 defaults:
   - base_pytorch
