@@ -33,7 +33,7 @@ python main.py \
   dataset.horizon=4 dataset.val_horizon=16 \
   dataset.obs_keys=[camera_0_color] \
   dataset.sample_ratio=0.5 \
-  experiment.training.batch_size=4 \
+  experiment.training.batch_size=2 \
   experiment.training.optim.accumulate_grad_batches=1 \
   experiment.training.optim.gradient_clip_val=0 \
   +algorithm.gradient_clip_val=1.0 \
