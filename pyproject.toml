@@ -56,3 +56,13 @@ ignore = [
     "B035",    # Removed in later versions of ruff
     "RUF012",  # This enforces using type.ClassVar for mutable defaults on classes
 ]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+markers = [
+    "integration: tests that instantiate the full LatentWorldModel (slow)",
+]
+filterwarnings = [
+    "ignore::DeprecationWarning",
+]
