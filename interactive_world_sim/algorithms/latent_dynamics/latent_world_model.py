@@ -100,15 +100,27 @@ class LatentWorldModel(BasePytorchAlgo):
             and self.training_stage == 1
             and self.use_vit_encoder
         )
-        if self.use_latent_decompose:
+        # method: "channel_split" (v3, GRL adversary) | "dual_head" (v4, two
+        # independent projection heads + CLUB MI penalty, decoder untouched).
+        self.decompose_method = (
+            ld_cfg.get("method", "channel_split")
+            if ld_cfg is not None else "channel_split"
+        )
+        if self.use_latent_decompose and self.decompose_method == "channel_split":
             assert (
                 int(ld_cfg.d_task) + int(ld_cfg.d_emb)
                 == int(cfg.dynamo_ssl.vit.embed_dim)
-            ), "d_task + d_emb must equal ViT embed_dim"
+            ), "channel_split requires d_task + d_emb == ViT embed_dim"
+        self.use_dual_head = (
+            self.use_latent_decompose and self.decompose_method == "dual_head"
+        )
 
         super().__init__(cfg)
 
-        if self.use_dynamo_ssl:
+        # dual_head + CLUB is a two-player game (encoder vs variational q-net),
+        # so it needs manual optimisation with two optimisers — same machinery
+        # the SSL path already uses.
+        if self.use_dynamo_ssl or self.use_dual_head:
             self.automatic_optimization = False
 
         self.normalizer = LinearNormalizer()
@@ -187,7 +199,7 @@ class LatentWorldModel(BasePytorchAlgo):
                     in_spatial=vit_grid,
                     out_spatial=self.latent_resolution,
                 )
-                if self.use_latent_decompose:
+                if self.use_latent_decompose and self.decompose_method == "channel_split":
                     from interactive_world_sim.algorithms.latent_decompose.split_encoder import (
                         SplitEncoder,
                     )
@@ -200,6 +212,32 @@ class LatentWorldModel(BasePytorchAlgo):
                     )
                     self.clf_emb = PooledClassifier(int(ld.d_emb))
                     self.clf_adv = PooledClassifier(int(ld.d_task))
+                elif self.use_dual_head:
+                    from interactive_world_sim.algorithms.latent_decompose.dual_head import (
+                        DualHead,
+                    )
+                    from interactive_world_sim.algorithms.latent_decompose.club import (
+                        CLUB,
+                    )
+                    from interactive_world_sim.algorithms.latent_decompose.domain_heads import (
+                        PooledClassifier,
+                    )
+                    ld = self.cfg.latent_decompose
+                    d_task, d_emb = int(ld.d_task), int(ld.d_emb)
+                    self.dual_head = DualHead(
+                        in_dim=vit_dim, d_task=d_task, d_emb=d_emb,
+                    )
+                    # z_emb must carry embodiment info -> domain classifier.
+                    # PooledClassifier expects (B, D, H, W); here z_emb is
+                    # already pooled (B, d_emb), so we use a plain MLP instead.
+                    self.clf_emb = nn.Sequential(
+                        nn.Linear(d_emb, 128), nn.GELU(), nn.Linear(128, 2),
+                    )
+                    # CLUB variational q(z_emb | z_task) for the MI penalty.
+                    self.club = CLUB(
+                        x_dim=d_task, y_dim=d_emb,
+                        hidden=int(ld.get("club_hidden", 256)),
+                    )
             else:
                 # ResNet18 backbone + spatial projection for decoder
                 self.resnet_encoder = ResNet18SpatialEncoder(
@@ -318,10 +356,16 @@ class LatentWorldModel(BasePytorchAlgo):
                 {"params": self.decoder.parameters(), "lr": self.cfg.lr},
                 {"params": encoder_params, "lr": self.cfg.lr},
             ]
-            if self.use_latent_decompose:
+            if self.use_latent_decompose and self.decompose_method == "channel_split":
                 param_groups.append({
                     "params": list(self.clf_emb.parameters())
                               + list(self.clf_adv.parameters()),
+                    "lr": float(self.cfg.latent_decompose.lr_classifiers),
+                })
+            elif self.use_dual_head:
+                param_groups.append({
+                    "params": list(self.dual_head.parameters())
+                              + list(self.clf_emb.parameters()),
                     "lr": float(self.cfg.latent_decompose.lr_classifiers),
                 })
             if self.use_dynamo_ssl:
@@ -395,6 +439,29 @@ class LatentWorldModel(BasePytorchAlgo):
             )
         else:
             raise NotImplementedError(f"LR scheduler {self.lr_scheduler} not included")
+
+        # dual_head + CLUB is a two-player game: a SECOND optimiser owns the
+        # variational q-network, stepped every batch in the manual training
+        # loop. Lightning sees both optimisers; the scheduler tracks the main.
+        if self.use_dual_head:
+            club_lr = float(self.cfg.latent_decompose.get("club_lr", 1e-4))
+            opt_club = torch.optim.AdamW(
+                self.club.parameters(), lr=club_lr,
+                weight_decay=self.cfg.weight_decay,
+                betas=self.cfg.optimizer_beta,
+            )
+            return (
+                {
+                    "optimizer": optimizer,
+                    "lr_scheduler": {
+                        "scheduler": lr_scheduler,
+                        "interval": "step",
+                        "frequency": 1,
+                        "name": "lr_scheduler",
+                    },
+                },
+                {"optimizer": opt_club},
+            )
 
         return {
             "optimizer": optimizer,
@@ -485,6 +552,70 @@ class LatentWorldModel(BasePytorchAlgo):
         self.log("training/lambda_adv", lam)
         return total
 
+    def _dual_head_manual_step(
+        self,
+        batch: dict,
+        rec_loss: torch.Tensor,
+        z_task_list: list[torch.Tensor],
+        z_emb_list: list[torch.Tensor],
+    ) -> torch.Tensor:
+        """Manual two-optimiser CLUB update for the dual_head decompose path.
+
+        Player 1 (q-network): minimise NLL of q(z_emb|z_task) every step.
+        Player 2 (encoder + decoder + clf_emb): minimise
+            rec_loss + lambda_dom * L_dom [+ lambda_club * CLUB_MI every N steps].
+        The decoder path is untouched by the decompose machinery — z_task/z_emb
+        are pooled SIDE outputs from dual_head, so reconstruction quality is not
+        traded away. Returns total_loss for logging only."""
+        import torch.nn.functional as F
+
+        T = self.cfg.n_frames
+        V = len(self.obs_keys)
+        dl = batch["domain_label"]
+        z_task = torch.cat(z_task_list, dim=0)      # (V*B*T, d_task)
+        z_emb = torch.cat(z_emb_list, dim=0)        # (V*B*T, d_emb)
+        dl_rep = dl.repeat_interleave(T).repeat(V).to(z_task.device)
+
+        opt_main, opt_club = self.optimizers()
+        lr_sched = self.lr_schedulers()
+
+        # --- Player 1: q-network NLL (every step), detached from encoder ---
+        opt_club.zero_grad()
+        club_ll = self.club.learning_loss(z_task.detach(), z_emb.detach())
+        self.manual_backward(club_ll)
+        opt_club.step()
+
+        # --- Player 2: encoder/decoder/clf_emb update ---
+        ld = self.cfg.latent_decompose
+        lambda_dom = float(ld.lambda_dom)
+        lambda_club = float(ld.get("lambda_club", 1.0))
+        club_every = int(ld.get("club_every_n_steps", 10))
+
+        L_dom = F.cross_entropy(self.clf_emb(z_emb), dl_rep)
+        total_loss = rec_loss + lambda_dom * L_dom
+        apply_club = (self.global_step % club_every == 0)
+        if apply_club:
+            mi = self.club.mi_est(z_task, z_emb)
+            total_loss = total_loss + lambda_club * mi
+
+        opt_main.zero_grad()
+        opt_club.zero_grad()  # discard q-grads so the MI term cannot leak into q
+        self.manual_backward(total_loss)
+        if self.cfg.get("gradient_clip_val", None):
+            self.clip_gradients(opt_main, gradient_clip_val=self.cfg.gradient_clip_val)
+        opt_main.step()
+        if lr_sched is not None:
+            sched = lr_sched[0] if isinstance(lr_sched, (list, tuple)) else lr_sched
+            sched.step()
+
+        self.log("training/rec_loss", rec_loss)
+        self.log("training/L_dom", L_dom)
+        self.log("training/club_learning_loss", club_ll)
+        if apply_club:
+            self.log("training/club_mi_est", mi)
+        self.log("training/loss", total_loss)
+        return total_loss
+
     def encoder_forward(
         self,
         obs: torch.Tensor,
@@ -519,12 +650,21 @@ class LatentWorldModel(BasePytorchAlgo):
             for v in range(num_views):
                 view_obs = obs[:, v * 3 : (v + 1) * 3]  # (B, 3, H, W)
                 if self.use_vit_encoder:
-                    if self.use_latent_decompose:
+                    if self.use_latent_decompose and self.decompose_method == "channel_split":
                         z_task, z_emb, cls_token = self.split_encoder(view_obs)
                         spatial_feat = (
                             self.split_encoder.concat(z_task, z_emb)
                         )
                         if emit_split:
+                            z_task_list.append(z_task)
+                            z_emb_list.append(z_emb)
+                    elif self.use_dual_head:
+                        # Decoder path is unchanged (uses the raw ViT feature);
+                        # dual_head produces pooled z_task/z_emb as SIDE outputs
+                        # consumed only by the alignment losses.
+                        spatial_feat, cls_token = self.vit_encoder(view_obs)
+                        if emit_split:
+                            z_task, z_emb = self.dual_head(spatial_feat)
                             z_task_list.append(z_task)
                             z_emb_list.append(z_emb)
                     else:
@@ -637,7 +777,7 @@ class LatentWorldModel(BasePytorchAlgo):
         optimizer_closure: Callable,
     ) -> None:
         """Override the optimizer step to manually warm up the learning rate"""
-        if self.use_dynamo_ssl:
+        if self.use_dynamo_ssl or self.use_dual_head:
             # Manual optimization handles its own optimizer steps in training_step
             return
         # update params
@@ -1102,6 +1242,11 @@ class LatentWorldModel(BasePytorchAlgo):
                 self.log("training/loss", total_loss)
                 for k, v in ssl_components.items():
                     self.log(f"training/ssl_{k}", v)
+                return None  # manual optimization
+            elif self.use_dual_head:
+                total_loss = self._dual_head_manual_step(
+                    batch, rec_loss, z_task_list, z_emb_list,
+                )
                 return None  # manual optimization
             else:
                 if self.use_latent_decompose:

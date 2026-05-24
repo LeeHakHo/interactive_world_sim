@@ -155,9 +155,14 @@ metrics:
 # See docs/superpowers/specs/2026-05-24-phase0-latent-decompose-design.md.
 latent_decompose:
   enabled: false
+  # method: channel_split (v3, GRL adversary on a sliced ViT feature) |
+  #         dual_head    (v4, two independent projection heads + CLUB MI penalty,
+  #                       decoder untouched so reconstruction is not sacrificed)
+  method: channel_split
   d_task: 288
   d_emb: 96
   lambda_dom: 0.1
+  # --- channel_split (v3) only ---
   lambda_adv_schedule:
     type: linear_ramp
     start_step: 2000
@@ -165,3 +170,8 @@ latent_decompose:
     start_value: 0.0
     end_value: 0.3
   lr_classifiers: 3.0e-4
+  # --- dual_head (v4) only ---
+  lambda_club: 1.0          # weight on the CLUB MI upper bound (encoder side)
+  club_lr: 1.0e-4           # lr for the variational q-network
+  club_every_n_steps: 10    # apply CLUB MI penalty to encoder every N steps (paper: 10)
+  club_hidden: 256          # hidden width of the q-network MLPs
