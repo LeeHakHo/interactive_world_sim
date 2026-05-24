@@ -318,6 +318,12 @@ class LatentWorldModel(BasePytorchAlgo):
                 {"params": self.decoder.parameters(), "lr": self.cfg.lr},
                 {"params": encoder_params, "lr": self.cfg.lr},
             ]
+            if self.use_latent_decompose:
+                param_groups.append({
+                    "params": list(self.clf_emb.parameters())
+                              + list(self.clf_adv.parameters()),
+                    "lr": float(self.cfg.latent_decompose.lr_classifiers),
+                })
             if self.use_dynamo_ssl:
                 ssl_cfg = self.cfg.dynamo_ssl
                 param_groups.extend([

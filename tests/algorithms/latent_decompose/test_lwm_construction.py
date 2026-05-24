@@ -205,3 +205,22 @@ def test_construct_enabled():
     assert hasattr(m, "split_encoder")
     assert hasattr(m, "clf_emb")
     assert hasattr(m, "clf_adv")
+
+
+def test_optimizer_has_classifier_group():
+    LatentWorldModel = _import_lwm()
+    cfg = _make_cfg(enabled=True)
+    m = LatentWorldModel(cfg)
+    opt_dict = m.configure_optimizers()
+    opt = opt_dict["optimizer"]
+    # First two groups are decoder + encoder (existing); third is classifiers.
+    assert len(opt.param_groups) >= 3
+    # Check that group 2 has a higher lr than groups 0,1
+    # (classifiers should have 3x the base lr)
+    base_lr = float(cfg.lr)
+    clf_lr_config = float(cfg.latent_decompose.lr_classifiers)
+    expected_ratio = clf_lr_config / base_lr
+    actual_ratio = opt.param_groups[2]["lr"] / opt.param_groups[0]["lr"]
+    assert abs(actual_ratio - expected_ratio) < 1e-3, (
+        f"Classifier group lr ratio {actual_ratio} != expected {expected_ratio}"
+    )
