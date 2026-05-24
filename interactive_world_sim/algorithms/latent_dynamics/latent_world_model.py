@@ -55,21 +55,41 @@ class LatentWorldModel(BasePytorchAlgo):
         self.num_views = len(self.obs_keys)
         self.latent_resolution = cfg.latent_resolution
 
-        # DynaMo SSL config (must be set before super().__init__ which calls _build_model)
-        # use_resnet_encoder: True when dynamo_ssl is enabled (ResNet OR ViT backbone)
-        self.use_resnet_encoder = (
-            "dynamo_ssl" in cfg
-            and cfg.dynamo_ssl.get("enabled", False)
-        )
+        # Encoder backbone + SSL config (must be set before super().__init__ which
+        # calls _build_model). The two axes are decoupled:
+        #   - encoder_backbone in {vit, resnet, conv2d}: which encoder architecture
+        #     to use. Default is `vit` (Plan-2 §3 Phase 0 task 1).
+        #   - dynamo_ssl.enabled: whether to attach the DynaMo IDM/FDM SSL heads on
+        #     top of the encoder during Stage 1 training. Disabled by default in
+        #     HUMAN_ROBOT_ALIGN_PLAN-2 (the align module replaces SSL).
+        # The legacy name `use_resnet_encoder` is kept but now means "use a real
+        # backbone (ResNet18 OR ViT-S)" rather than "ResNet18 specifically".
+        ssl_cfg_in = cfg.get("dynamo_ssl", None)
         self.encoder_backbone = (
-            cfg.dynamo_ssl.get("encoder_backbone", "resnet")
-            if self.use_resnet_encoder else "conv2d"
+            ssl_cfg_in.get("encoder_backbone", "vit") if ssl_cfg_in is not None else "vit"
         )
+        assert self.encoder_backbone in ("vit", "resnet", "conv2d"), (
+            f"encoder_backbone must be one of vit|resnet|conv2d, got {self.encoder_backbone}"
+        )
+        self.use_resnet_encoder = self.encoder_backbone in ("vit", "resnet")
         self.use_vit_encoder = (self.encoder_backbone == "vit")
-        self.use_dynamo_ssl = self.use_resnet_encoder and self.training_stage == 1
+        self.use_dynamo_ssl = (
+            ssl_cfg_in is not None
+            and ssl_cfg_in.get("enabled", False)
+            and self.use_resnet_encoder
+            and self.training_stage == 1
+        )
         if self.use_dynamo_ssl:
             self.ssl_loss_coef = cfg.dynamo_ssl.loss_coef
             self.detach_rec_from_encoder = cfg.dynamo_ssl.get("detach_rec_from_encoder", True)
+            import warnings
+            warnings.warn(
+                "[LatentWorldModel] dynamo_ssl.enabled=true: DynaMo SSL is being used. "
+                "Per HUMAN_ROBOT_ALIGN_PLAN-2 Phase 0, SSL is supposed to be off in this "
+                "plan iteration; the align module replaces it. Override only if you know "
+                "what you're doing.",
+                stacklevel=2,
+            )
 
         # Phase 0 latent decomposition flag. Mirrors dynamo_ssl pattern.
         # Active only in Stage 1; Stages 2/3 ignore it.
@@ -376,6 +396,64 @@ class LatentWorldModel(BasePytorchAlgo):
                 "name": "lr_scheduler",
             },
         }
+
+    # ------------------------------------------------------------------
+    # Latent-decompose helpers (Phase 0 align module)
+    # ------------------------------------------------------------------
+
+    def _lambda_adv_now(self) -> float:
+        """Current value of the gradient-reversal scale, per cfg schedule."""
+        from interactive_world_sim.algorithms.latent_decompose.align_losses import (
+            linear_ramp,
+        )
+        sched = self.cfg.latent_decompose.lambda_adv_schedule
+        return linear_ramp(
+            self.global_step,
+            int(sched.start_step), int(sched.end_step),
+            float(sched.start_value), float(sched.end_value),
+        )
+
+    def _apply_decompose_losses(
+        self,
+        batch: dict,
+        rec_loss: torch.Tensor,
+        xs: torch.Tensor,
+    ) -> torch.Tensor:
+        """Compute and log L_dom + L_adv on a fresh encoder pass that
+        also returns the per-view (z_task, z_emb). Adds them to rec_loss
+        and returns the total. The encoder pass is identical to the one
+        already done by encoder_forward inside the rec_loss path — we
+        deliberately do not cache it across the rec_loss/decompose
+        boundary to keep this hook decoupled and avoid stale state."""
+        from interactive_world_sim.algorithms.latent_decompose.align_losses import (
+            compute_L_adv,
+            compute_L_dom,
+        )
+
+        T = self.cfg.n_frames
+        V = len(self.obs_keys)
+        dl = batch["domain_label"]                        # (B,) long
+
+        _z, z_task_list, z_emb_list = self.encoder_forward(
+            xs, return_split=True,
+        )
+        z_task = torch.cat(z_task_list, dim=0)            # (V*B*T, d_task, gh, gw)
+        z_emb  = torch.cat(z_emb_list,  dim=0)            # (V*B*T, d_emb,  gh, gw)
+        # Order: v slowest, b middle, t fastest — matches the cat above
+        # because z_task_list[v] has shape (B*T, ...) in (b slow, t fast).
+        dl_rep = dl.repeat_interleave(T).repeat(V).to(z_task.device)
+
+        L_dom = compute_L_dom(z_emb, dl_rep, self.clf_emb)
+        lam = self._lambda_adv_now()
+        L_adv = compute_L_adv(z_task, dl_rep, self.clf_adv, lam)
+
+        lambda_dom = float(self.cfg.latent_decompose.lambda_dom)
+        total = rec_loss + lambda_dom * L_dom + L_adv
+
+        self.log("training/L_dom", L_dom)
+        self.log("training/L_adv", L_adv)
+        self.log("training/lambda_adv", lam)
+        return total
 
     def encoder_forward(
         self,
@@ -985,11 +1063,13 @@ class LatentWorldModel(BasePytorchAlgo):
                     self.log(f"training/ssl_{k}", v)
                 return None  # manual optimization
             else:
+                if self.use_latent_decompose:
+                    total_loss = self._apply_decompose_losses(batch, rec_loss, xs)
+                else:
+                    total_loss = rec_loss
                 self.log("training/rec_loss", rec_loss)
-                output_dict = {
-                    "loss": rec_loss,
-                }
-                return output_dict
+                self.log("training/loss", total_loss)
+                return {"loss": total_loss}
         elif self.training_stage == 2:
             # stage 2: train dynamics
             with torch.no_grad():
