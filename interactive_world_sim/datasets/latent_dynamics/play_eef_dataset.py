@@ -230,6 +230,14 @@ class PlayEEFDataset(BaseImageDataset):
 
         # Per-episode metadata
         self._episodes: list[dict] = []
+        # Optional per-dataset episode filter for Step 3 sweep.
+        # None → use all episodes; [] → load nothing; list[int] → keep only those.
+        subset = cfg.get("episode_subset", None)
+        if subset is not None:
+            subset = list(int(i) for i in subset)
+            self._episode_subset: Optional[set[int]] = set(subset)
+        else:
+            self._episode_subset = None
         for ds_dir in self.dataset_dirs:
             ds_path = Path(ds_dir)
             info_path = ds_path / "meta" / "info.json"
@@ -245,6 +253,11 @@ class PlayEEFDataset(BaseImageDataset):
                 for line in f:
                     rec = json.loads(line)
                     ep_idx = rec["episode_index"]
+                    if (
+                        self._episode_subset is not None
+                        and ep_idx not in self._episode_subset
+                    ):
+                        continue
                     n_frames = rec["length"]
                     chunk_idx = ep_idx // chunks_size
                     pq_path = (
