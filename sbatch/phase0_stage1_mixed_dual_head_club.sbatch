@@ -23,6 +23,7 @@ cd /scr2/yusenluo/interactive_world_sim
 JOBTAG="${SLURM_JOB_ID:-$(date +%s)}"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export HYDRA_FULL_ERROR=1
 
 python main.py \
   hydra.run.dir="outputs/\${now:%Y-%m-%d}/\${now:%H-%M-%S}_job${JOBTAG}_phase0_dualhead_club" \
@@ -39,7 +40,8 @@ python main.py \
   +algorithm.gradient_clip_val=1.0 \
   experiment.training.max_steps=300005 \
   experiment.training.log_every_n_steps=100 \
-  experiment.training.checkpointing.every_n_train_steps=20000 \
+  experiment.training.checkpointing.every_n_train_steps=2000 \
+  +experiment.training.checkpointing.save_last=true \
   experiment.training.data.num_workers=4 \
   experiment.validation.batch_size=2 \
   experiment.validation.val_every_n_step=10000 \
