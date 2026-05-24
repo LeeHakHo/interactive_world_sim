@@ -227,3 +227,47 @@ def test_smoke_one_training_step(alg_cfg):
         p.grad is not None and p.grad.abs().sum() > 0
         for p in m.clf_adv.parameters()
     ), "clf_adv got no grad"
+
+
+@pytest.mark.integration
+def test_identity_under_zero_loss(alg_cfg):
+    """G1: enabled=true with lambda_dom=0 and lambda_adv.end=0 must produce
+    a rec_loss trace bit-identical (rtol=1e-5) to enabled=false."""
+    torch.manual_seed(0)
+    cfg_off = OmegaConf.create(OmegaConf.to_container(alg_cfg, resolve=True))
+    cfg_off.latent_decompose.enabled = False
+    m_off = _make_lwm(cfg_off, enabled=False)
+    m_off.train()
+
+    torch.manual_seed(0)
+    cfg_on = OmegaConf.create(OmegaConf.to_container(alg_cfg, resolve=True))
+    cfg_on.latent_decompose.enabled = True
+    cfg_on.latent_decompose.lambda_dom = 0.0
+    cfg_on.latent_decompose.lambda_adv_schedule.start_value = 0.0
+    cfg_on.latent_decompose.lambda_adv_schedule.end_value = 0.0
+    m_on = _make_lwm(cfg_on, enabled=True)
+    m_on.train()
+
+    # Copy encoder/decoder weights from m_off to m_on so the only delta is
+    # the (unused, zero-weighted) classifier heads.
+    m_on.vit_encoder.load_state_dict(m_off.vit_encoder.state_dict())
+    m_on.spatial_proj.load_state_dict(m_off.spatial_proj.state_dict())
+    m_on.decoder.load_state_dict(m_off.decoder.state_dict())
+
+    # training_step at batch_idx=0 calls tracemalloc.take_snapshot(); start it.
+    m_off.on_train_start()
+    m_on.on_train_start()
+
+    torch.manual_seed(0)
+    batch = _fake_batch(B=2, T=alg_cfg.n_frames, H=64, W=64)
+    torch.manual_seed(0)
+    out_off = m_off.training_step(batch, batch_idx=0)
+    torch.manual_seed(0)
+    out_on  = m_on.training_step(batch, batch_idx=0)
+
+    # rec_loss is logged but not returned; the returned "loss" equals rec_loss
+    # for m_off and equals rec_loss + 0 * L_dom + 0 * L_adv = rec_loss for m_on.
+    torch.testing.assert_close(
+        out_off["loss"], out_on["loss"], rtol=1e-5, atol=1e-6,
+        msg="G1: zero-weighted decompose loss broke bit-identical baseline",
+    )

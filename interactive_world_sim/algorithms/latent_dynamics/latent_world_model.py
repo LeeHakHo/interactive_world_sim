@@ -430,7 +430,21 @@ class LatentWorldModel(BasePytorchAlgo):
         and returns the total. The encoder pass is identical to the one
         already done by encoder_forward inside the rec_loss path — we
         deliberately do not cache it across the rec_loss/decompose
-        boundary to keep this hook decoupled and avoid stale state."""
+        boundary to keep this hook decoupled and avoid stale state.
+
+        G1 short-circuit: when all loss weights are zero the extra encoder
+        pass is skipped entirely so the RNG state (and therefore rec_loss)
+        is bit-identical to the enabled=False baseline.  Trade-off: the
+        classifier heads receive no gradient on such steps, which is fine
+        because the loss contribution is zero anyway."""
+        sched = self.cfg.latent_decompose.lambda_adv_schedule
+        if (
+            float(self.cfg.latent_decompose.lambda_dom) == 0.0
+            and float(sched.start_value) == 0.0
+            and float(sched.end_value) == 0.0
+        ):
+            return rec_loss
+
         from interactive_world_sim.algorithms.latent_decompose.align_losses import (
             compute_L_adv,
             compute_L_dom,
