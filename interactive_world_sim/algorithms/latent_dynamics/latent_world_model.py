@@ -350,8 +350,13 @@ class LatentWorldModel(BasePytorchAlgo):
             betas=self.cfg.optimizer_beta,
         )
         if self.lr_scheduler == "linear":
-            if self.use_dynamo_ssl:
-                # Warmup only for decoder+encoder (groups 0,1), no warmup for SSL groups (2,3,4)
+            # Per-group warmup is needed whenever there are auxiliary param
+            # groups (SSL heads or latent_decompose classifiers) that must
+            # NOT warm up alongside the main encoder/decoder. Without this
+            # the auxiliary classifier lr ramps from start_factor·lr up over
+            # warmup_steps, under-driving the discriminator early in training
+            # (Phase 0 spec requires lr_classifiers to be constant).
+            if self.use_dynamo_ssl or self.use_latent_decompose:
                 warmup_steps = self.cfg.warmup_steps
                 start_factor = 1e-4
 
@@ -364,7 +369,7 @@ class LatentWorldModel(BasePytorchAlgo):
                             return start_factor + (1.0 - start_factor) * step / warmup_steps
                         return fn
                     else:
-                        # SSL groups: constant LR, no warmup
+                        # auxiliary groups (classifiers, SSL heads): constant LR
                         return lambda step: 1.0
 
                 lr_scheduler = LambdaLR(
@@ -423,20 +428,23 @@ class LatentWorldModel(BasePytorchAlgo):
         self,
         batch: dict,
         rec_loss: torch.Tensor,
-        xs: torch.Tensor,
+        z_task_list: list[torch.Tensor] | None,
+        z_emb_list:  list[torch.Tensor] | None,
     ) -> torch.Tensor:
-        """Compute and log L_dom + L_adv on a fresh encoder pass that
-        also returns the per-view (z_task, z_emb). Adds them to rec_loss
-        and returns the total. The encoder pass is identical to the one
-        already done by encoder_forward inside the rec_loss path — we
-        deliberately do not cache it across the rec_loss/decompose
-        boundary to keep this hook decoupled and avoid stale state.
+        """Compute and log L_dom + L_adv from the per-view split tensors
+        produced by the (single) encoder pass in training_step. Adds them
+        to rec_loss and returns the total.
 
-        G1 short-circuit: when all loss weights are zero the extra encoder
-        pass is skipped entirely so the RNG state (and therefore rec_loss)
-        is bit-identical to the enabled=False baseline.  Trade-off: the
-        classifier heads receive no gradient on such steps, which is fine
-        because the loss contribution is zero anyway."""
+        G1 short-circuit: when all loss weights are zero we return rec_loss
+        directly and ignore the split lists, so the RNG state (and therefore
+        rec_loss) matches the enabled=False baseline. Trade-off: classifier
+        heads receive no gradient on zero-weight steps, which is fine since
+        the loss contribution is zero anyway.
+
+        Caller contract: when latent_decompose.enabled is true, the caller
+        must obtain (z_task_list, z_emb_list) from encoder_forward(...,
+        return_split=True) on the same `xs` that produced rec_loss — this
+        guarantees one ViT pass per step (no duplicate work)."""
         sched = self.cfg.latent_decompose.lambda_adv_schedule
         if (
             float(self.cfg.latent_decompose.lambda_dom) == 0.0
@@ -450,13 +458,15 @@ class LatentWorldModel(BasePytorchAlgo):
             compute_L_dom,
         )
 
+        assert z_task_list is not None and z_emb_list is not None, (
+            "latent_decompose.enabled but split tensors were not threaded "
+            "from encoder_forward — caller bug."
+        )
+
         T = self.cfg.n_frames
         V = len(self.obs_keys)
         dl = batch["domain_label"]                        # (B,) long
 
-        _z, z_task_list, z_emb_list = self.encoder_forward(
-            xs, return_split=True,
-        )
         z_task = torch.cat(z_task_list, dim=0)            # (V*B*T, d_task, gh, gw)
         z_emb  = torch.cat(z_emb_list,  dim=0)            # (V*B*T, d_emb,  gh, gw)
         # Order: v slowest, b middle, t fastest — matches the cat above
@@ -964,7 +974,18 @@ class LatentWorldModel(BasePytorchAlgo):
                     )
                 obs_enc = torch.stack(obs_vectors, dim=2)  # (B, T, V, feature_dim)
             else:
-                z = self.encoder_forward(xs)  # (B*T, C, H, W)
+                # Single ViT pass: when latent_decompose is on, ask for the
+                # per-view split tensors here so we don't run the encoder
+                # twice per step (the rec_loss path AND the L_dom/L_adv path
+                # used to do their own encoder forwards — that's a ~25%
+                # throughput hit on a 200k-step Stage 1 run).
+                if self.use_latent_decompose:
+                    z, z_task_list, z_emb_list = self.encoder_forward(
+                        xs, return_split=True,
+                    )
+                else:
+                    z = self.encoder_forward(xs)  # (B*T, C, H, W)
+                    z_task_list = z_emb_list = None
 
             if self.robust_latent:
                 z += torch.randn_like(z) * 0.02
@@ -1084,7 +1105,9 @@ class LatentWorldModel(BasePytorchAlgo):
                 return None  # manual optimization
             else:
                 if self.use_latent_decompose:
-                    total_loss = self._apply_decompose_losses(batch, rec_loss, xs)
+                    total_loss = self._apply_decompose_losses(
+                        batch, rec_loss, z_task_list, z_emb_list,
+                    )
                 else:
                     total_loss = rec_loss
                 self.log("training/rec_loss", rec_loss)

@@ -208,19 +208,41 @@ def test_construct_enabled():
 
 
 def test_optimizer_has_classifier_group():
+    """Group 2 is the classifier head; it must be sized at lr_classifiers
+    (NOT lr) and must NOT receive the warmup that applies to encoder/decoder
+    (groups 0/1). The lr scheduler builds per-group lambdas when
+    use_latent_decompose=True so the classifier stays at constant lr.
+
+    Bug 1 guard: at step 0 the encoder/decoder lrs are scaled down by the
+    warmup start_factor (1e-4) while the classifier lr stays exactly at
+    cfg.lr_classifiers. We assert the ratio, not absolute values, because
+    PyTorch's LambdaLR applies its factor on construction."""
     LatentWorldModel = _import_lwm()
     cfg = _make_cfg(enabled=True)
     m = LatentWorldModel(cfg)
     opt_dict = m.configure_optimizers()
     opt = opt_dict["optimizer"]
-    # First two groups are decoder + encoder (existing); third is classifiers.
+    sched = opt_dict["lr_scheduler"]["scheduler"]
     assert len(opt.param_groups) >= 3
-    # Check that group 2 has a higher lr than groups 0,1
-    # (classifiers should have 3x the base lr)
+
+    clf_lr = float(cfg.latent_decompose.lr_classifiers)
     base_lr = float(cfg.lr)
-    clf_lr_config = float(cfg.latent_decompose.lr_classifiers)
-    expected_ratio = clf_lr_config / base_lr
-    actual_ratio = opt.param_groups[2]["lr"] / opt.param_groups[0]["lr"]
-    assert abs(actual_ratio - expected_ratio) < 1e-3, (
-        f"Classifier group lr ratio {actual_ratio} != expected {expected_ratio}"
+    warmup_start_factor = 1e-4
+
+    # Classifier stays at exact lr_classifiers (no warmup applied to group 2).
+    assert abs(opt.param_groups[2]["lr"] - clf_lr) < 1e-9, (
+        f"classifier group lr={opt.param_groups[2]['lr']} != "
+        f"cfg lr_classifiers={clf_lr}; warmup should NOT apply to group 2"
+    )
+    # Encoder/decoder are in warmup, so lr ≈ base_lr * start_factor.
+    expected_warmed = base_lr * warmup_start_factor
+    assert abs(opt.param_groups[0]["lr"] - expected_warmed) < 1e-9
+    assert abs(opt.param_groups[1]["lr"] - expected_warmed) < 1e-9
+
+    # Step the scheduler 5 more times. classifier lr must remain constant.
+    for _ in range(5):
+        sched.step()
+    assert abs(opt.param_groups[2]["lr"] - clf_lr) < 1e-9, (
+        f"classifier lr drifted after scheduler steps: "
+        f"{opt.param_groups[2]['lr']} != {clf_lr}"
     )

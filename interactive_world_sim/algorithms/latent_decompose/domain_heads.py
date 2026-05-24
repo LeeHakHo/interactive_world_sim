@@ -25,14 +25,17 @@ def grad_reverse(x: torch.Tensor, lambda_: float = 1.0) -> torch.Tensor:
 
 
 class PooledClassifier(nn.Module):
-    """Spatial mean-pool → 2-layer MLP → 2 logits."""
+    """Spatial mean-pool → 2-layer MLP → 2 logits.
+
+    "2-layer MLP" follows the spec convention: one hidden Linear + one
+    output Linear with GELU between. Matches the linear_probe.py MLP
+    depth so the Stage-1 head and the diagnostic probe are comparable.
+    """
 
     def __init__(self, d_in: int, hidden: int = 128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(d_in, hidden),
-            nn.GELU(),
-            nn.Linear(hidden, hidden),
             nn.GELU(),
             nn.Linear(hidden, 2),
         )
