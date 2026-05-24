@@ -377,18 +377,33 @@ class LatentWorldModel(BasePytorchAlgo):
             },
         }
 
-    def encoder_forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """Forward pass of the encoder
+    def encoder_forward(
+        self,
+        obs: torch.Tensor,
+        return_split: bool = False,
+    ):
+        """Forward pass of the encoder.
 
         Args:
-            obs: (B, C, H, W) where C = 3 * num_views
+            obs: (B, C, H, W) where C = 3 * num_views.
+            return_split: when True AND latent_decompose is active, also
+                returns (z_task_list, z_emb_list) — lists of V tensors of
+                shape (B, d_task, gh, gw) / (B, d_emb, gh, gw) in
+                view-outer order. When False (default) the signature is
+                unchanged: returns the normalised spatial latent z only.
 
         Returns:
             z: (B, C_latent, H_latent, W_latent)
+            (z_task_list, z_emb_list): only if `return_split=True` and
+                                       `self.use_latent_decompose` is True.
         """
         assert (
             len(obs.shape) == 4
         ), f"Expected obs to have shape (B, C, H, W) but got {obs.shape}"
+
+        z_task_list: list[torch.Tensor] = []
+        z_emb_list:  list[torch.Tensor] = []
+        emit_split = bool(return_split and self.use_latent_decompose)
 
         if self.use_resnet_encoder:
             num_views = len(self.obs_keys)
@@ -396,7 +411,16 @@ class LatentWorldModel(BasePytorchAlgo):
             for v in range(num_views):
                 view_obs = obs[:, v * 3 : (v + 1) * 3]  # (B, 3, H, W)
                 if self.use_vit_encoder:
-                    spatial_feat, cls_token = self.vit_encoder(view_obs)
+                    if self.use_latent_decompose:
+                        z_task, z_emb, cls_token = self.split_encoder(view_obs)
+                        spatial_feat = (
+                            self.split_encoder.concat(z_task, z_emb)
+                        )
+                        if emit_split:
+                            z_task_list.append(z_task)
+                            z_emb_list.append(z_emb)
+                    else:
+                        spatial_feat, cls_token = self.vit_encoder(view_obs)
                     if self.use_dynamo_ssl and self.detach_rec_from_encoder:
                         spatial = self.spatial_proj(
                             spatial_feat.detach(), cls_token.detach()
@@ -421,6 +445,9 @@ class LatentWorldModel(BasePytorchAlgo):
             z[:, i * c_per_v : (i + 1) * c_per_v] = z_chunk / (
                 torch.norm(z_chunk, dim=(1), keepdim=True) + 1e-8
             )
+
+        if emit_split:
+            return z, z_task_list, z_emb_list
         return z
 
     def on_save_checkpoint(self, checkpoint: dict) -> None:
