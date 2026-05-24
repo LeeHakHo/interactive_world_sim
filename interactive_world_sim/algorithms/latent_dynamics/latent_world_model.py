@@ -71,6 +71,21 @@ class LatentWorldModel(BasePytorchAlgo):
             self.ssl_loss_coef = cfg.dynamo_ssl.loss_coef
             self.detach_rec_from_encoder = cfg.dynamo_ssl.get("detach_rec_from_encoder", True)
 
+        # Phase 0 latent decomposition flag. Mirrors dynamo_ssl pattern.
+        # Active only in Stage 1; Stages 2/3 ignore it.
+        ld_cfg = cfg.get("latent_decompose", None)
+        self.use_latent_decompose = bool(
+            ld_cfg is not None
+            and ld_cfg.get("enabled", False)
+            and self.training_stage == 1
+            and self.use_vit_encoder
+        )
+        if self.use_latent_decompose:
+            assert (
+                int(ld_cfg.d_task) + int(ld_cfg.d_emb)
+                == int(cfg.dynamo_ssl.vit.embed_dim)
+            ), "d_task + d_emb must equal ViT embed_dim"
+
         super().__init__(cfg)
 
         if self.use_dynamo_ssl:
@@ -152,6 +167,19 @@ class LatentWorldModel(BasePytorchAlgo):
                     in_spatial=vit_grid,
                     out_spatial=self.latent_resolution,
                 )
+                if self.use_latent_decompose:
+                    from interactive_world_sim.algorithms.latent_decompose.split_encoder import (
+                        SplitEncoder,
+                    )
+                    from interactive_world_sim.algorithms.latent_decompose.domain_heads import (
+                        PooledClassifier,
+                    )
+                    ld = self.cfg.latent_decompose
+                    self.split_encoder = SplitEncoder(
+                        self.vit_encoder, int(ld.d_task), int(ld.d_emb),
+                    )
+                    self.clf_emb = PooledClassifier(int(ld.d_emb))
+                    self.clf_adv = PooledClassifier(int(ld.d_task))
             else:
                 # ResNet18 backbone + spatial projection for decoder
                 self.resnet_encoder = ResNet18SpatialEncoder(
