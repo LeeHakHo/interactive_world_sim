@@ -601,8 +601,13 @@ class LatentWorldModel(BasePytorchAlgo):
         opt_main.zero_grad()
         opt_club.zero_grad()  # discard q-grads so the MI term cannot leak into q
         self.manual_backward(total_loss)
-        if self.cfg.get("gradient_clip_val", None):
-            self.clip_gradients(opt_main, gradient_clip_val=self.cfg.gradient_clip_val)
+        # Use torch's clip directly: self.clip_gradients() validates against the
+        # Trainer's gradient_clip_val (which must be 0 under manual optimisation),
+        # so it would raise on a non-zero value here.
+        clip_val = self.cfg.get("gradient_clip_val", None)
+        if clip_val:
+            params = [p for g in opt_main.param_groups for p in g["params"]]
+            torch.nn.utils.clip_grad_norm_(params, float(clip_val))
         opt_main.step()
         if lr_sched is not None:
             sched = lr_sched[0] if isinstance(lr_sched, (list, tuple)) else lr_sched
