@@ -149,3 +149,19 @@ dynamo_ssl:
 
 metrics:
   - fvd
+
+# Phase 0 latent decomposition (HUMAN_ROBOT_ALIGN_PLAN-2 / PHASE0_IWS_PLAN_v3).
+# When enabled=false the model is bit-identical to the existing baseline.
+# See docs/superpowers/specs/2026-05-24-phase0-latent-decompose-design.md.
+latent_decompose:
+  enabled: false
+  d_task: 288
+  d_emb: 96
+  lambda_dom: 0.1
+  lambda_adv_schedule:
+    type: linear_ramp
+    start_step: 2000
+    end_step: 10000
+    start_value: 0.0
+    end_value: 0.3
+  lr_classifiers: 3.0e-4

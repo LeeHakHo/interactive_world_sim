@@ -1,0 +1,96 @@
+defaults:
+  - base_dataset
+
+# Phase 0 mixed baseline (HUMAN_ROBOT_ALIGN_PLAN-2 §3): IWS Stage 1 trained
+# on robot + human EEF play data with naive co-training. Expected outcome is
+# the disjoint-routing failure documented in Plan-2 §1.4 (PCA shows the two
+# embodiments land in non-overlapping latent subspaces). The latent
+# interpolation diagnostic (scripts/diagnose_latent_interpolation.py) should
+# reveal the hand↔gripper hallucination at α ∈ (0, 1).
+#
+# Wraps two PlayEEFDataset instances via MixedPlayEEFDataset.
+
+_target_: interactive_world_sim.datasets.latent_dynamics.play_eef_dataset.MixedPlayEEFDataset
+
+# sample_ratio: "auto" → P(robot) = |robot|/(|robot|+|human|), time-proportional
+# (each individual frame seen with equal probability). With 12 robot + 3
+# human episodes that gives roughly P(robot)=0.665. Override to 0.5 for
+# embodiment-balanced 1:1 mix (oversamples human).
+sample_ratio: auto
+seed: 42
+
+resolution: 128
+horizon: 4
+val_horizon: 4
+obs_keys: [camera_0_color]
+shape_meta:
+  action:
+    shape:
+      - 8
+  obs:
+    camera_0_color:
+      shape:
+        - 3
+        - 128
+        - 128
+      type: rgb
+n_frames: ${dataset.horizon}
+observation_shape: [3, "${dataset.resolution}", "${dataset.resolution}"]
+context_length: 2
+frame_skip: 1
+
+robot:
+  debug: false
+  domain: robot
+  frame_convention: world
+  dataset_dirs:
+    - /scr2/yusenluo/interactive_world_sim/play_robot_eef/play_robot_1_eef
+    - /scr2/yusenluo/interactive_world_sim/play_robot_eef/play_robot_2_eef
+    - /scr2/yusenluo/interactive_world_sim/play_robot_eef/play_robot_3_eef
+    - /scr2/yusenluo/interactive_world_sim/play_robot_eef/play_robot_4_eef
+    - /scr2/yusenluo/interactive_world_sim/play_robot_eef/play_robot_5_eef
+    - /scr2/yusenluo/interactive_world_sim/play_robot_eef/play_robot_6_eef
+    - /scr2/yusenluo/interactive_world_sim/play_robot_eef/play_robot_7_eef
+    - /scr2/yusenluo/interactive_world_sim/play_robot_eef/play_robot_8_eef
+    - /scr2/yusenluo/interactive_world_sim/play_robot_eef/play_robot_9_eef
+    - /scr2/yusenluo/interactive_world_sim/play_robot_eef/play_robot_10_eef
+    - /scr2/yusenluo/interactive_world_sim/play_robot_eef/play_robot_11_eef
+    - /scr2/yusenluo/interactive_world_sim/play_robot_eef/play_robot_12_eef
+  video_keys: [observation.images.cam_high]
+  obs_keys: [camera_0_color]
+  crops: [[195, 195, 256, 256]]
+  resolution: 128
+  horizon: 4
+  val_horizon: 4
+  skip_frame: 1
+  pad_before: 0
+  pad_after: 0
+  val_ratio: 0.083
+  seed: 42
+  goal_sample: intermediate
+  skip_idx: 1
+  cache_root: /scr2/yusenluo/interactive_world_sim/play_robot_eef/_video_cache
+  episode_subset: null
+human:
+  debug: false
+  domain: human
+  frame_convention: camera
+  dataset_dirs:
+    - /scr2/yusenluo/interactive_world_sim/human_play_eef_data/play_human_eef_1
+    - /scr2/yusenluo/interactive_world_sim/human_play_eef_data/play_human_eef_2
+    - /scr2/yusenluo/interactive_world_sim/human_play_eef_data/play_human_eef_3
+  video_keys: [observation.images.cam_high]
+  obs_keys: [camera_0_color]
+  crops: [[195, 195, 256, 256]]
+  resolution: 128
+  horizon: 4
+  val_horizon: 4
+  skip_frame: 1
+  pad_before: 0
+  pad_after: 0
+  val_ratio: 0.333
+  seed: 42
+  goal_sample: intermediate
+  skip_idx: 1
+  cache_root: /scr2/yusenluo/interactive_world_sim/human_play_eef_data/_video_cache
+  episode_subset: null
