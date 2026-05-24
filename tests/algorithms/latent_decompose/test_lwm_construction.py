@@ -1,10 +1,24 @@
 """LatentWorldModel constructs cleanly when latent_decompose.enabled is true
-or false. Does not run a training step."""
+or false. Does not run a training step.
+
+Skipped if the LWM module cannot be imported (e.g. hydra/numba missing on
+this host's default python). Run in the `iws` conda env for full coverage.
+"""
 from __future__ import annotations
 
 import pytest
 import torch
 from omegaconf import OmegaConf, DictConfig
+
+
+def _import_lwm():
+    try:
+        from interactive_world_sim.algorithms.latent_dynamics.latent_world_model import (
+            LatentWorldModel,
+        )
+    except ImportError as e:
+        pytest.skip(f"LatentWorldModel import failed: {e}")
+    return LatentWorldModel
 
 
 def _make_cfg(enabled: bool) -> DictConfig:
@@ -176,9 +190,7 @@ def _make_cfg(enabled: bool) -> DictConfig:
 
 
 def test_construct_disabled():
-    from interactive_world_sim.algorithms.latent_dynamics.latent_world_model import (
-        LatentWorldModel,
-    )
+    LatentWorldModel = _import_lwm()
     cfg = _make_cfg(enabled=False)
     m = LatentWorldModel(cfg)
     assert m.use_latent_decompose is False
@@ -186,9 +198,7 @@ def test_construct_disabled():
 
 
 def test_construct_enabled():
-    from interactive_world_sim.algorithms.latent_dynamics.latent_world_model import (
-        LatentWorldModel,
-    )
+    LatentWorldModel = _import_lwm()
     cfg = _make_cfg(enabled=True)
     m = LatentWorldModel(cfg)
     assert m.use_latent_decompose is True
