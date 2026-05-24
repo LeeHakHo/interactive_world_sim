@@ -30,7 +30,7 @@ Phase 0 verifies two things in sequence:
 | # | Decision | Why |
 |---|---|---|
 | D1 | Phase 0 v3 SplitEncoder approach **replaces** the existing UniT `align_module` direction; UniT module is kept on disk but no longer developed | Brainstorm Q1 — single direction, focused compute |
-| D2 | SplitEncoder channel-splits the **ViT-S patch tokens** `(B, P, 384)` into `z_task (..., 288)` and `z_emb (..., 96)`. `spatial_proj` consumes `cat([z_task, z_emb], -1)` (bit-identical to current pipeline). `cls_token` is untouched | Brainstorm Q2 — closest to v3 plan §1.1 and preserves baseline |
+| D2 | SplitEncoder channel-splits the **ViT-S spatial feature map** `(B, 384, 16, 16)` along the embed-dim axis into `z_task (B, 288, 16, 16)` and `z_emb (B, 96, 16, 16)`. `spatial_proj` consumes `cat([z_task, z_emb], dim=1)` (bit-identical to current pipeline). `cls_token` is untouched. Note: `(B, D, H, W)` ↔ `(B, P=H·W, D)` are equivalent via rearrange — we use the spatial form since that is what `ViTSpatialEncoder.forward` actually returns | Brainstorm Q2 — closest to v3 plan §1.1 and preserves baseline |
 | D3 | Stage 1 trained **from scratch** with the new heads — not warm-started from Hyeonhoo's H+R ckpt | Brainstorm Q3 — clean comparison; existing ckpt was the failure-mode baseline |
 | D4 | One spec covers Step 1+2+3; implementation will be committed in phases (Step 1 first) | Brainstorm Q4 |
 | D5 | "Current baseline" reference for the 5%-tolerance sanity gate = **the baseline run the user is currently re-training** (path to be filled in by the user once that run finishes); we do not re-train another | Brainstorm Q5 |
@@ -119,22 +119,22 @@ All other Stage 1 hyperparameters identical to current baseline.
 ```python
 class SplitEncoder(nn.Module):
     """
-    Channel-split wrapper around the existing ViT-S spatial encoder.
+    Channel-split wrapper around the existing ViTSpatialEncoder.
 
     Args:
         base_vit: ViTSpatialEncoder instance (already constructed by
                   LatentWorldModel._build_model).
-        d_task:   first slice width of the patch-token feature dim.
+        d_task:   first slice width along the channel (embed_dim) axis.
         d_emb:    second slice width. d_task + d_emb MUST == base_vit.embed_dim.
 
     forward(view_obs) → (z_task, z_emb, cls_token)
         view_obs:  (B, 3, H, W)
-        z_task:    (B, P, d_task)
-        z_emb:     (B, P, d_emb)
-        cls_token: (B, embed_dim)   — passed through unchanged
+        z_task:    (B, d_task, grid_h, grid_w)
+        z_emb:     (B, d_emb,  grid_h, grid_w)
+        cls_token: (B, embed_dim)               — passed through unchanged
 
     @staticmethod
-    concat(z_task, z_emb) → (B, P, embed_dim) torch.cat on last dim.
+    concat(z_task, z_emb) → (B, embed_dim, grid_h, grid_w) torch.cat on dim=1.
     """
 ```
 
@@ -149,9 +149,9 @@ def grad_reverse(x, lambda_: float = 1.0): ...
     # autograd Function: forward identity, backward returns -lambda * grad.
 
 class PooledClassifier(nn.Module):
-    """mean-pool over patches → 2-layer MLP (hidden=128, GELU) → 2 logits.
+    """spatial mean-pool → 2-layer MLP (hidden=128, GELU) → 2 logits.
        Label convention: human=0, robot=1.
-       forward(z: (B, P, D)) → logits (B, 2)
+       forward(z: (B, D, H, W)) → logits (B, 2). Pool reduces dims (2, 3).
     """
 ```
 
@@ -185,8 +185,8 @@ if self.use_latent_decompose and self.training_stage == 1:
 
 In `encoder_forward` (avoid hidden state — return extras through the call):
 - Add a `return_split: bool = False` kwarg. When `False`, signature/behaviour are unchanged (Stage 2/3 callers untouched).
-- When `True` (Stage 1 with `use_latent_decompose`), the function additionally returns `(z_task_list, z_emb_list)`, each a list of `V` tensors of shape `(B*T, P, d_task / d_emb)` in **view-outer order** (view 0 first, view 1 second, …). Per-view tensors retain the `(b·T + t)` flattening already used by IWS (b slow, t fast).
-- `spatial_feat` is always `cat([z_task, z_emb], -1)` when split is on, i.e. bit-identical to ViT output.
+- When `True` (Stage 1 with `use_latent_decompose`), the function additionally returns `(z_task_list, z_emb_list)`, each a list of `V` tensors of shape `(B*T, d_task / d_emb, grid_h, grid_w)` in **view-outer order** (view 0 first, view 1 second, …). Per-view tensors retain the `(b·T + t)` flattening already used by IWS (b slow, t fast).
+- The `spatial_feat` fed into `spatial_proj` is always `cat([z_task, z_emb], dim=1)` when split is on, i.e. bit-identical to ViT output.
 
 In `training_step` Stage 1 branch (after `rec_loss` computed):
 ```python
@@ -196,8 +196,8 @@ if self.use_latent_decompose:
     V = num_views
 
     # cat order: view-outer, then per-view (b slow, t fast)
-    z_task = torch.cat(z_task_list, dim=0)              # (V*B*T, P, d_task)
-    z_emb  = torch.cat(z_emb_list,  dim=0)              # (V*B*T, P, d_emb)
+    z_task = torch.cat(z_task_list, dim=0)              # (V*B*T, d_task, gh, gw)
+    z_emb  = torch.cat(z_emb_list,  dim=0)              # (V*B*T, d_emb,  gh, gw)
 
     # match the cat order: (v0:b0t0,b0t1,...,bNtN | v1:b0t0,...,bNtN | ...)
     # i.e. v slowest, b middle, t fastest
@@ -245,12 +245,12 @@ batch  ─ obs.camera_0_color: (B, T, 3, H, W)
 
 per-view per-frame view_obs (B*T, 3, H, W)
        ↓ split_encoder
-       ├── z_task (B*T, P, 288) ───┐
-       ├── z_emb  (B*T, P,  96) ───┤
-       └── cls_token (B*T, 384)    │
-                                    │
-       cat z_task,z_emb → spatial_feat (B*T, P, 384)
-                                    │
+       ├── z_task (B*T, 288, 16, 16) ─┐
+       ├── z_emb  (B*T,  96, 16, 16) ─┤
+       └── cls_token (B*T, 384)       │
+                                       │
+       cat([z_task,z_emb], dim=1) → spatial_feat (B*T, 384, 16, 16)
+                                       │
        spatial_proj(spatial_feat, cls_token) → (B*T, c_per_v, 32, 32)
                                     │
        per-view norm → decoder(diffusion) → rec_loss
@@ -377,7 +377,7 @@ decision.
 |---|---|
 | `test_split_encoder_identity.py` | G2 + `d_task+d_emb==embed_dim` assert + dtype/shape contract |
 | `test_grad_reverse.py` | forward identity; backward grad = -λ · upstream |
-| `test_pooled_classifier.py` | input (B,P,D) → (B,2); gradient flows; mean-pool over dim=1 |
+| `test_pooled_classifier.py` | input (B,D,H,W) → (B,2); gradient flows; mean-pool over (2,3) |
 | `test_lambda_schedule.py` | ramp values at `step ≤ start`, `step ≥ end`, midpoint |
 | `test_dataset_domain_label.py` | `MixedPlayEEFDataset[i]` has `domain_label` int tensor matching `embodiment` |
 
