@@ -76,14 +76,16 @@ def human_frames():
             crop = crop_resize(fr)
             hm = np.asarray(masks[i])
             ys, xs = np.where(hm)
+            mvis = np.zeros(crop.shape[:2], np.uint8)
             if len(ys) == 0:
                 painted = crop
             else:
                 seed = to_crop_coords(int(xs.mean()), int(ys.mean()))  # hand centroid -> crop
                 m = sam_seed_mask(crop, seed)
+                mvis = m
                 painted = inpaint((crop * 255).astype(np.uint8), m).astype(np.float32) / 255.0
             out.append(painted)
-            if len(ex) < 3: ex.append((crop, painted))
+            if len(ex) < 3: ex.append((crop, mvis, painted))
         cap.release()
     return np.stack(out[:K]), ex
 
@@ -106,7 +108,7 @@ def robot_frames():
             m = sam_seed_mask(crop, (int(yx[1]), int(yx[0])))   # seed darkest (gripper)
             painted = inpaint((crop * 255).astype(np.uint8), m).astype(np.float32) / 255.0
             out.append(painted)
-            if len(ex) < 3: ex.append((crop, painted))
+            if len(ex) < 3: ex.append((crop, m, painted))
             kept += 1
             if kept >= per:
                 break
@@ -170,13 +172,19 @@ def main():
     mmdg = float(((((Hg - mug) / sdg).mean(0) - ((Rg - mug) / sdg).mean(0)) ** 2).sum())
     print(f"  + GRAYSCALE (all colour removed): probe acc = {accg:.3f}  MMD={mmdg:.3f}  ratio={mmdg/(0.5*(wh+wr)+1e-9):.1f}")
 
-    fig, axes = plt.subplots(2, 6, figsize=(18, 6))
+    # QC: per example show raw | mask (whole arm/gripper, red) | inpainted
+    fig, axes = plt.subplots(2, 9, figsize=(27, 6))
     for c in range(3):
-        for r,(ex,nm) in enumerate([(hex_,"human"),(rex,"robot")]):
-            axes[r,2*c].imshow(ex[c][0].clip(0,1)); axes[r,2*c].set_title(f"{nm} raw",fontsize=8)
-            axes[r,2*c+1].imshow(ex[c][1].clip(0,1)); axes[r,2*c+1].set_title(f"{nm} inpainted",fontsize=8)
+        for r, (exs, nm) in enumerate([(hex_, "human"), (rex, "robot")]):
+            raw, m, painted = exs[c]
+            ov = raw.copy()
+            mb = np.asarray(m) > 0
+            ov[mb] = ov[mb] * 0.3 + np.array([1.0, 0, 0]) * 0.7
+            axes[r, 3*c].imshow(raw.clip(0, 1)); axes[r, 3*c].set_title(f"{nm} raw", fontsize=8)
+            axes[r, 3*c+1].imshow(ov.clip(0, 1)); axes[r, 3*c+1].set_title(f"{nm} mask", fontsize=8)
+            axes[r, 3*c+2].imshow(painted.clip(0, 1)); axes[r, 3*c+2].set_title(f"{nm} inpainted", fontsize=8)
     for a in axes.ravel(): a.axis("off")
-    fig.suptitle(f"agent INPAINTED (bg-filled) — H-vs-R probe={acc:.2f} (raw 1.00)", fontsize=12)
+    fig.suptitle(f"agent removal (masks_arm-seeded whole arm) — H-vs-R probe={acc:.2f} (raw 1.00)", fontsize=13)
     fig.tight_layout(); fig.savefig("outputs/inpaint_gap_test.png", dpi=120)
     print("saved outputs/inpaint_gap_test.png")
 
