@@ -97,22 +97,20 @@ def train_probe_mlp(feats, labels, hidden=128, epochs=10, lr=1e-3, val_ratio=0.2
 
 
 # ----------------------------------------------------------------------------
-# SAM2 agent mask: multi-point seeded on the agent-colored region.
-#   robot agent = near-black gripper/arm  -> seed on darkest pixels
-#   human agent = skin hand               -> seed on most skin-like pixels
-# Multiple spread-out seeds make SAM2 capture the FULL agent (a single darkest
-# pixel often lands on the wrong dark blob and the gripper survives).
+# SAM2 agent mask: multi-point seeded on the agent region.
+# In THIS data BOTH agents are dark: robot = near-black gripper/arm; human = dark
+# long-sleeve arm+hand (this user wears long sleeves, NO visible skin — a skin
+# seed wrongly grabbed the red cube while leaving the dark arm). So seed both on
+# the DARKEST pixels. Multiple spread-out seeds make SAM2 capture the FULL agent
+# (a single darkest pixel often lands on the wrong dark blob and the agent
+# survives). blue-reject keeps the bowl/plate; the red cube is not dark so the
+# dark seed won't pick it.
 # ----------------------------------------------------------------------------
 _RNG = np.random.default_rng(0)
 
 
-def agent_score(img, domain):  # HWC [0,1] -> per-pixel agent-likelihood
-    if domain == "robot":
-        return -cv2.GaussianBlur(img.mean(axis=2).astype(np.float32), (9, 9), 0)  # dark
-    hsv = cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
-    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
-    skin = ((h < 20) | (h > 160)).astype(np.float32) * (s / 255.0) * (v / 255.0)
-    return cv2.GaussianBlur(skin, (9, 9), 0)
+def agent_score(img, domain):  # HWC [0,1] -> per-pixel agent-likelihood (darkness)
+    return -cv2.GaussianBlur(img.mean(axis=2).astype(np.float32), (9, 9), 0)
 
 
 def agent_seeds(img, domain, k=6, topn=300):

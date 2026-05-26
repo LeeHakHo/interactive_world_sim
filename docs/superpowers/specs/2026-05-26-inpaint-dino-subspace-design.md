@@ -120,29 +120,35 @@ val clip (T,C,H,W)[0,1] 128²
 - Robot-arm FK-render mask (more accurate but heavier); SAM2 chosen, FK only as
   fallback if SAM2 visibly leaks robot pixels.
 
-## Results (2026-05-26, job 45732, n=900/domain)
+## Results (2026-05-26, job 45733, n=900/domain — corrected mask)
 
-Visual QC **passed**: SAM2 multi-point masks cleanly remove the human hand
-(blue bowl preserved) and the robot gripper (manipulated object preserved);
-E2FGVI fills plausible background, no black holes. Residuals: human sleeved
-forearm + a left-edge dark object on robot are not fully removed (small).
+**Mask correction:** the human user wears long sleeves (no visible skin) — the
+visible agent in-crop is a DARK arm. The first run's skin-seed wrongly masked the
+red **cube** (a task object) and left the dark arm in frame. Fixed: seed BOTH
+domains on the darkest pixels (robot gripper + human dark arm are both dark);
+blue-reject keeps the bowl/plate; the red cube is not dark so it is preserved.
+Numbers below are post-fix; the buggy run is superseded.
+
+Visual QC **passed** (post-fix): masks target the dark agent (robot gripper /
+human dark arm), preserving the blue bowl/plate and the red cube; E2FGVI fills
+plausible background, no black holes. Residual: human arm runs off the frame edge
+so a small corner stub remains; robot has a small left-edge dark object — both minor.
 
 | metric | RAW (agent present) | INPAINTED (agent removed) |
 |---|---|---|
 | between-domain probe acc | **1.000** | **1.000** |
-| between-domain RBF-MMD² | 0.7741 | 0.7606 |
-| within-domain probe (H1/H2, R1/R2) | 0.498 / 0.480 | 0.494 / 0.489 |
-| MMD between/within ratio | 599.8 | 356.9 |
+| between-domain RBF-MMD² | 0.7741 | **0.5939** (−23%) |
+| within-domain probe (H1/H2, R1/R2) | 0.526 / 0.507 | 0.487 / 0.524 |
+| MMD between/within ratio | 430.2 | 326.4 |
 
-**Conclusion — premise does NOT hold for frozen DINOv2.** Removing the agent
-leaves human and robot perfectly separable (probe 1.000) and barely changes the
-between-domain distance (MMD 0.774 → 0.761, ~2%). PCA (`outputs/inpaint_dino_subspace/pca.png`)
-shows two disjoint clusters split along PC1 (the dominant variance axis) with a
-large empty gap, in BOTH raw and inpainted — inpainting does not close it. So
-here the cross-embodiment gap is dominated by **scene/object/camera** (bowl vs
-plate, warm vs cool white-balance, table texture), not the agent's pixels.
-The MMD ratio dropping 600→357 is mostly the within-domain spread growing from
-inpaint variance, not the between-domain gap shrinking.
+**Conclusion — premise does NOT hold for frozen DINOv2.** Properly removing the
+agent shrinks the between-domain distance a real amount (MMD 0.774 → 0.594, −23%
+— so the agent *is* part of the gap), but the domains stay **perfectly separable**
+(probe 1.000). PCA (`outputs/inpaint_dino_subspace/pca.png`) shows two disjoint
+clusters split along PC1 (the dominant variance axis) with a clear gap, in BOTH
+raw and inpainted — inpainting narrows but does not close it. So the residual
+cross-embodiment gap is dominated by **scene/object/camera** (bowl vs plate, warm
+vs cool white-balance, table texture), not the agent's pixels.
 
 **Implication for Phase 1 inpaint-as-forcing-function:** inpainting the agent
 alone will not align the two domains' observation latents while scenes/objects/
