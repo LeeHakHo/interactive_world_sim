@@ -103,44 +103,72 @@ def train_probe_mlp(feats, labels, hidden=128, epochs=10, lr=1e-3, val_ratio=0.2
 # seed wrongly grabbed the red cube while leaving the dark arm). So seed both on
 # the DARKEST pixels. Multiple spread-out seeds make SAM2 capture the FULL agent
 # (a single darkest pixel often lands on the wrong dark blob and the agent
-# survives). blue-reject keeps the bowl/plate; the red cube is not dark so the
-# dark seed won't pick it.
+# survives). The agent = hand (light skin) + forearm (BLACK sleeve), one limb; we
+# seed BOTH a skin term and a dark-desaturated term so SAM2 grabs the WHOLE arm,
+# not just the sleeve. blue-reject keeps the bowl; the red cube is dark+saturated
+# so neither term seeds it (and it's not picked as the largest arm mask).
 # ----------------------------------------------------------------------------
 _RNG = np.random.default_rng(0)
 
 
-def agent_score(img, domain):  # HWC [0,1] -> per-pixel agent-likelihood (darkness)
-    return -cv2.GaussianBlur(img.mean(axis=2).astype(np.float32), (9, 9), 0)
+def skin_dark_scores(img):  # HWC [0,1] -> (skin, dark) per-pixel maps, each ~[0,1]
+    hsv = cv2.cvtColor((img * 255).astype(np.uint8), cv2.COLOR_RGB2HSV).astype(np.float32)
+    h, s, v = hsv[..., 0], hsv[..., 1] / 255.0, hsv[..., 2] / 255.0
+    red = ((h < 20) | (h > 160)).astype(np.float32)
+    skin = red * np.minimum(s, 0.6) * v          # light reddish hand (dark cube -> low v)
+    lum = cv2.GaussianBlur(img.mean(axis=2).astype(np.float32), (9, 9), 0)
+    dark = 1.0 - lum                              # black sleeve / gripper = darkest (not table)
+    skin = cv2.GaussianBlur(skin, (9, 9), 0)
+    return skin / (skin.max() + 1e-6), dark / (dark.max() + 1e-6)
 
 
-def agent_seeds(img, domain, k=6, topn=300):
-    sc = agent_score(img, domain).ravel()
-    top = np.argsort(sc)[-topn:]
-    sel = _RNG.choice(top, size=min(k, len(top)), replace=False)
-    ys, xs = np.unravel_index(sel, img.shape[:2])
-    return np.stack([xs, ys], 1)  # (k,2) as (x,y)
+def agent_seed_groups(img, k=6, topn=150):
+    """Separate seed groups for hand (skin) and sleeve/gripper (dark). Each group
+    is segmented tightly then unioned, so the whole arm+hand is covered without a
+    single over-inclusive mask swallowing the table. Robot: skin absent -> dark only."""
+    skin, dark = skin_dark_scores(img)
+    groups = []
+    for sc in (skin, dark):
+        if sc.max() > 0.3:                        # this term actually present
+            top = np.argsort(sc.ravel())[-topn:]
+            sel = _RNG.choice(top, size=min(k, len(top)), replace=False)
+            ys, xs = np.unravel_index(sel, img.shape[:2])
+            groups.append(np.stack([xs, ys], 1))
+    return groups
 
 
 def _is_blue(img, m):  # masked region predominantly blue -> the bowl/plate, not agent
-    mean = img[m].mean(0)  # RGB
-    return mean[2] > mean[0] + 0.06 and mean[2] > mean[1] + 0.06
+    r, g, b = img[m].mean(0)
+    return b > r + 0.06 and b > g + 0.06
 
 
-def sam_mask(predictor, img, pts, dilate=17):
-    """Best agent-sized SAM2 mask consistent with the multi-point seeds, rejecting
-    the blue bowl/plate. Generously dilated so no agent edge pixels survive."""
-    predictor.set_image((img * 255).astype(np.uint8))
+def _is_cube(img, m):  # dark saturated red block -> the cube (a task object), not agent
+    r, g, b = img[m].mean(0)
+    return r > g + 0.04 and r > b + 0.04 and max(r, g, b) < 0.5
+
+
+def _pick_tight(predictor, img, pts):
+    """Highest-score SAM2 mask in [0.5%, 40%] area, rejecting bowl(blue)/cube(red)."""
     masks, scores, _ = predictor.predict(
         point_coords=pts, point_labels=np.ones(len(pts), dtype=int), multimask_output=True)
-    masks = [m.astype(bool) for m in masks]            # SAM2 returns float masks
+    masks = [m.astype(bool) for m in masks]
     cand = [(sc, m) for m, sc in zip(masks, scores)
-            if 0.01 <= m.mean() <= 0.50 and not _is_blue(img, m)]
-    if cand:
-        m = max(cand, key=lambda t: t[0])[1]           # highest-score valid agent mask
-    else:
-        m = min(masks, key=lambda mm: mm.sum())        # fallback: smallest
+            if 0.005 <= m.mean() <= 0.40 and not _is_blue(img, m) and not _is_cube(img, m)]
+    return max(cand, key=lambda t: t[0])[1] if cand else None
+
+
+def sam_mask(predictor, img, groups, dilate=15):
+    """Union of the tight hand mask and the tight sleeve/gripper mask = the whole
+    arm+hand, dilated. Bowl and cube preserved by the rejects."""
+    predictor.set_image((img * 255).astype(np.uint8))
+    H, W = img.shape[:2]
+    agent = np.zeros((H, W), dtype=bool)
+    for pts in groups:
+        m = _pick_tight(predictor, img, pts)
+        if m is not None:
+            agent |= m
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate, dilate))
-    return cv2.dilate(m.astype(np.uint8), k).astype(bool)
+    return cv2.dilate(agent.astype(np.uint8), k).astype(bool)
 
 
 # ----------------------------------------------------------------------------
@@ -175,11 +203,33 @@ def inpaint_clip(model, clip, masks):
 
 
 # ----------------------------------------------------------------------------
-# Feature extraction (raw + inpainted on the same frames)
+# Color-normalization controls (applied to the inpainted frames before DINO).
+#   grayworld: per-image gray-world white balance -> removes global color cast.
+#   gray:      luminance only -> removes ALL color, keeps structure/texture.
+# If grayworld collapses the gap it was white-balance; if gray still separates,
+# the gap is structural (geometry/texture/objects), not color.
+# ----------------------------------------------------------------------------
+def grayworld(x):  # (T,C,H,W) [0,1] -> per-image channel-mean-equalized
+    m = x.mean(dim=(2, 3), keepdim=True)              # (T,C,1,1)
+    g = m.mean(dim=1, keepdim=True)                   # (T,1,1,1)
+    return (x * g / (m + 1e-6)).clamp(0, 1)
+
+
+def grayscale(x):  # (T,C,H,W) [0,1] -> luminance replicated to 3 channels
+    l = (0.299 * x[:, 0] + 0.587 * x[:, 1] + 0.114 * x[:, 2]).unsqueeze(1)
+    return l.repeat(1, 3, 1, 1)
+
+
+CONFIGS = ["raw", "inpaint", "inpaint+grayworld", "inpaint+gray"]
+
+
+# ----------------------------------------------------------------------------
+# Feature extraction: raw + inpainted (+ color-normalized inpainted) same frames
 # ----------------------------------------------------------------------------
 @torch.no_grad()
 def collect(ext, predictor, e2fgvi, clips_np, device, domain, res, per_domain, n_qc):
-    raw_feats, inp_feats, qc, seen = [], [], [], 0
+    feats = {c: [] for c in CONFIGS}
+    qc, seen = [], 0
     for clip_u8 in clips_np:                          # (T,C,h,w) uint8
         clip = torch.from_numpy(clip_u8).float().to(device) / 255.0
         T = clip.shape[0]
@@ -187,18 +237,22 @@ def collect(ext, predictor, e2fgvi, clips_np, device, domain, res, per_domain, n
         masks = torch.zeros((T, res, res), dtype=torch.bool, device=device)
         for t in range(T):
             img = clip[t].permute(1, 2, 0).cpu().numpy()
-            pts = agent_seeds(img, domain)
-            masks[t] = torch.from_numpy(sam_mask(predictor, img, pts)).to(device)
+            groups = agent_seed_groups(img)
+            masks[t] = torch.from_numpy(sam_mask(predictor, img, groups)).to(device)
         inp = inpaint_clip(e2fgvi, clip, masks)
-        raw_feats.append(ext(clip).cpu())
-        inp_feats.append(ext(inp).cpu())
+        inp_gw, inp_g = grayworld(inp), grayscale(inp)
+        feats["raw"].append(ext(clip).cpu())
+        feats["inpaint"].append(ext(inp).cpu())
+        feats["inpaint+grayworld"].append(ext(inp_gw).cpu())
+        feats["inpaint+gray"].append(ext(inp_g).cpu())
         if len(qc) < n_qc:
             mid = T // 2
-            qc.append((clip[mid].cpu(), masks[mid].cpu(), inp[mid].cpu()))
+            qc.append((clip[mid].cpu(), masks[mid].cpu(), inp[mid].cpu(),
+                       inp_gw[mid].cpu(), inp_g[mid].cpu()))
         seen += T
         if seen >= per_domain:
             break
-    return torch.cat(raw_feats)[:per_domain], torch.cat(inp_feats)[:per_domain], qc
+    return {c: torch.cat(v)[:per_domain] for c, v in feats.items()}, qc
 
 
 # ----------------------------------------------------------------------------
@@ -242,20 +296,23 @@ def report(tag, H, R):
 # Plots
 # ----------------------------------------------------------------------------
 def save_qc(qc, domain, out_dir):
+    cols = ["raw", "SAM2 mask", "inpaint", "inpaint+grayworld", "inpaint+gray"]
     n = len(qc)
-    fig, axes = plt.subplots(n, 3, figsize=(9, 3 * n))
+    fig, axes = plt.subplots(n, 5, figsize=(15, 3 * n))
     if n == 1:
         axes = axes[None, :]
-    for i, (raw, mask, inp) in enumerate(qc):
+    for i, (raw, mask, inp, gw, g) in enumerate(qc):
         r = raw.permute(1, 2, 0).numpy().clip(0, 1)
         ov = r.copy()
         ov[mask.numpy()] = ov[mask.numpy()] * 0.3 + np.array([1.0, 0, 0]) * 0.7
-        axes[i, 0].imshow(r); axes[i, 0].set_title("raw", fontsize=8)
-        axes[i, 1].imshow(ov.clip(0, 1)); axes[i, 1].set_title("SAM2 mask", fontsize=8)
-        axes[i, 2].imshow(inp.permute(1, 2, 0).numpy().clip(0, 1)); axes[i, 2].set_title("E2FGVI inpaint", fontsize=8)
+        imgs = [r, ov.clip(0, 1)] + [t.permute(1, 2, 0).numpy().clip(0, 1) for t in (inp, gw, g)]
+        for j, im in enumerate(imgs):
+            axes[i, j].imshow(im)
+            if i == 0:
+                axes[i, j].set_title(cols[j], fontsize=9)
     for a in axes.ravel():
         a.axis("off")
-    fig.suptitle(f"{domain}: agent removal QC (raw | mask | inpaint)", fontsize=11)
+    fig.suptitle(f"{domain}: agent removal + color-norm QC", fontsize=12)
     fig.tight_layout()
     p = os.path.join(out_dir, f"qc_{domain}.png")
     fig.savefig(p, dpi=110); plt.close(fig)
@@ -268,15 +325,15 @@ def pca2(X):
     return (Xc @ V[:2].T).numpy()
 
 
-def save_pca(Hr, Rr, Hi, Ri, out_dir):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    for ax, (H, R, tag) in zip(axes, [(Hr, Rr, "raw (agent present)"),
-                                       (Hi, Ri, "inpainted (agent removed)")]):
+def save_pca(Hf, Rf, out_dir):
+    fig, axes = plt.subplots(1, len(CONFIGS), figsize=(5 * len(CONFIGS), 5))
+    for ax, c in zip(axes, CONFIGS):
+        H, R = Hf[c], Rf[c]
         n = min(len(H), len(R))
         Z = pca2(torch.cat([H[:n], R[:n]], 0))
         ax.scatter(Z[:n, 0], Z[:n, 1], s=6, alpha=0.5, label="human", c="tab:orange")
         ax.scatter(Z[n:, 0], Z[n:, 1], s=6, alpha=0.5, label="robot", c="tab:blue")
-        ax.set_title(tag, fontsize=11); ax.legend(fontsize=8)
+        ax.set_title(c, fontsize=11); ax.legend(fontsize=8)
     fig.suptitle("DINOv2 pooled features — PCA, colored by domain", fontsize=12)
     fig.tight_layout()
     p = os.path.join(out_dir, "pca.png")
@@ -306,20 +363,21 @@ def main():
     print(f"[run] per_domain={args.per_domain} res={args.res} device={device} "
           f"robot_clips={robot_clips.shape} human_clips={human_clips.shape}")
 
-    Rr, Ri, rqc = collect(ext, predictor, e2fgvi, robot_clips, device, "robot",
-                          args.res, args.per_domain, args.n_qc)
-    Hr, Hi, hqc = collect(ext, predictor, e2fgvi, human_clips, device, "human",
-                          args.res, args.per_domain, args.n_qc)
+    Rf, rqc = collect(ext, predictor, e2fgvi, robot_clips, device, "robot",
+                      args.res, args.per_domain, args.n_qc)
+    Hf, hqc = collect(ext, predictor, e2fgvi, human_clips, device, "human",
+                      args.res, args.per_domain, args.n_qc)
 
     save_qc(hqc, "human", args.out_dir)
     save_qc(rqc, "robot", args.out_dir)
-    save_pca(Hr, Rr, Hi, Ri, args.out_dir)
+    save_pca(Hf, Rf, args.out_dir)
 
-    raw_p, raw_ratio = report("RAW (agent present)", Hr, Rr)
-    inp_p, inp_ratio = report("INPAINTED (agent removed)", Hi, Ri)
-    print("\n========== SUMMARY ==========")
-    print(f"between-domain probe acc : raw {raw_p:.3f} -> inpainted {inp_p:.3f}  (0.5 = aligned)")
-    print(f"MMD between/within ratio : raw {raw_ratio:.1f} -> inpainted {inp_ratio:.1f}  (1 = no gap)")
+    summary = {c: report(c, Hf[c], Rf[c]) for c in CONFIGS}
+    print("\n========== SUMMARY (between-domain) ==========")
+    print(f"{'config':22s} {'probe-acc':>10s} {'MMD ratio':>10s}  (probe 0.5=aligned, ratio 1=no gap)")
+    for c in CONFIGS:
+        p, r = summary[c]
+        print(f"{c:22s} {p:>10.3f} {r:>10.1f}")
 
 
 if __name__ == "__main__":

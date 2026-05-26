@@ -120,47 +120,45 @@ val clip (T,C,H,W)[0,1] 128²
 - Robot-arm FK-render mask (more accurate but heavier); SAM2 chosen, FK only as
   fallback if SAM2 visibly leaks robot pixels.
 
-## Results (2026-05-26, job 45733, n=900/domain — corrected mask)
+## Results (2026-05-26, job 45740, n=900/domain — final mask + color-norm control)
 
-**Mask correction:** the human user wears long sleeves (no visible skin) — the
-visible agent in-crop is a DARK arm. The first run's skin-seed wrongly masked the
-red **cube** (a task object) and left the dark arm in frame. Fixed: seed BOTH
-domains on the darkest pixels (robot gripper + human dark arm are both dark);
-blue-reject keeps the bowl/plate; the red cube is not dark so it is preserved.
-Numbers below are post-fix; the buggy run is superseded.
+**Mask evolution (two user corrections):** (1) human user wears long sleeves, no
+visible skin — the first skin-seed masked the red **cube** (task object) and left
+the arm; (2) pure dark-seed then masked only the **black sleeve**, leaving the pink
+**hand**. Final mask seeds BOTH a skin term (light pink hand) and a luminance-dark
+term (black sleeve / robot gripper), segments each tightly and **unions** them =
+the whole arm+hand. blue-reject keeps the bowl/plate; cube-reject (dark saturated
+red) keeps the cube. Robot has ~no skin → dark seed only → gripper.
 
-Visual QC **passed** (post-fix): masks target the dark agent (robot gripper /
-human dark arm), preserving the blue bowl/plate and the red cube; E2FGVI fills
-plausible background, no black holes. Residual: human arm runs off the frame edge
-so a small corner stub remains; robot has a small left-edge dark object — both minor.
+Visual QC **passed**: the whole arm+hand (human) and the gripper (robot) are
+removed; the blue bowl/plate, red cube, and the robot's manipulated object are all
+preserved; E2FGVI fills plausible background, no black holes.
 
-| metric | RAW (agent present) | INPAINTED (agent removed) |
+Probe acc = **1.000 in every config** (n=900). Between-domain RBF-MMD²:
+
+| config | MMD² | vs raw |
 |---|---|---|
-| between-domain probe acc | **1.000** | **1.000** |
-| between-domain RBF-MMD² | 0.7741 | **0.5939** (−23%) |
-| within-domain probe (H1/H2, R1/R2) | 0.526 / 0.507 | 0.487 / 0.524 |
-| MMD between/within ratio | 430.2 | 326.4 |
+| raw (agent present) | 0.7741 | — |
+| inpaint (agent removed) | 0.5943 | −23% |
+| inpaint + grayworld (white-balance removed) | 0.5946 | ≈ inpaint (no effect) |
+| inpaint + grayscale (all color removed) | 0.7080 | still fully separable |
 
-**Conclusion — premise does NOT hold for frozen DINOv2.** Properly removing the
-agent shrinks the between-domain distance a real amount (MMD 0.774 → 0.594, −23%
-— so the agent *is* part of the gap), but the domains stay **perfectly separable**
-(probe 1.000). PCA (`outputs/inpaint_dino_subspace/pca.png`) shows two disjoint
-clusters split along PC1 (the dominant variance axis) with a clear gap, in BOTH
-raw and inpainted — inpainting narrows but does not close it. So the residual
-cross-embodiment gap is dominated by **scene/object/camera** (bowl vs plate, warm
-vs cool white-balance, table texture), not the agent's pixels.
+**Conclusion — premise does NOT hold, and the residual gap is STRUCTURAL, not
+color.** (1) Removing the agent shrinks the gap a real amount (MMD −23%) so the
+agent *is* part of it, but the domains stay **perfectly separable** (probe 1.000).
+(2) Per-image white-balance normalization (grayworld) changes the gap by ~0 (0.594
+→ 0.595) — so it is **not** a global color cast. (3) In **grayscale** the domains
+are *still* perfectly separable (probe 1.000) — so the residual gap is **structural**:
+different objects (bowl vs plate), table texture/grain, layout, geometry. PCA
+(`outputs/inpaint_dino_subspace/pca.png`) shows two disjoint clusters along PC1 in
+all four configs.
 
-**Implication for Phase 1 inpaint-as-forcing-function:** inpainting the agent
-alone will not align the two domains' observation latents while scenes/objects/
-cameras differ. Alignment needs either matched collection (same workspace/objects/
-camera) or an explicit scene-gap treatment (e.g. white-balance/color normalization,
-or OT/contrastive on top). Consistent with memory `project_stage1_hr_alignment_eval`
-(trained encoder also fully disjoint, MMD ratio 627).
-
-**Caveat / next diagnostic:** DINOv2 pooled features are dominated by global
-color/white-balance, which alone separates the datasets. Before concluding the
-gap is "structural", re-run with per-image color/white-balance normalization (or
-compare patch-token *structure*) to factor out trivial color shift.
+**Implication for Phase 1 inpaint-as-forcing-function:** inpainting the agent (and
+even normalizing color) will not align the two domains' observation latents — the
+scenes/objects themselves differ structurally. Alignment needs matched collection
+(same workspace/objects/camera) or an explicit cross-scene treatment, not just
+agent removal. Consistent with `project_stage1_hr_alignment_eval` (trained encoder
+also fully disjoint, MMD ratio 627).
 
 ## Known caveats
 
