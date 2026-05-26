@@ -120,6 +120,42 @@ val clip (T,C,H,W)[0,1] 128²
 - Robot-arm FK-render mask (more accurate but heavier); SAM2 chosen, FK only as
   fallback if SAM2 visibly leaks robot pixels.
 
+## Results (2026-05-26, job 45732, n=900/domain)
+
+Visual QC **passed**: SAM2 multi-point masks cleanly remove the human hand
+(blue bowl preserved) and the robot gripper (manipulated object preserved);
+E2FGVI fills plausible background, no black holes. Residuals: human sleeved
+forearm + a left-edge dark object on robot are not fully removed (small).
+
+| metric | RAW (agent present) | INPAINTED (agent removed) |
+|---|---|---|
+| between-domain probe acc | **1.000** | **1.000** |
+| between-domain RBF-MMD² | 0.7741 | 0.7606 |
+| within-domain probe (H1/H2, R1/R2) | 0.498 / 0.480 | 0.494 / 0.489 |
+| MMD between/within ratio | 599.8 | 356.9 |
+
+**Conclusion — premise does NOT hold for frozen DINOv2.** Removing the agent
+leaves human and robot perfectly separable (probe 1.000) and barely changes the
+between-domain distance (MMD 0.774 → 0.761, ~2%). PCA (`outputs/inpaint_dino_subspace/pca.png`)
+shows two disjoint clusters split along PC1 (the dominant variance axis) with a
+large empty gap, in BOTH raw and inpainted — inpainting does not close it. So
+here the cross-embodiment gap is dominated by **scene/object/camera** (bowl vs
+plate, warm vs cool white-balance, table texture), not the agent's pixels.
+The MMD ratio dropping 600→357 is mostly the within-domain spread growing from
+inpaint variance, not the between-domain gap shrinking.
+
+**Implication for Phase 1 inpaint-as-forcing-function:** inpainting the agent
+alone will not align the two domains' observation latents while scenes/objects/
+cameras differ. Alignment needs either matched collection (same workspace/objects/
+camera) or an explicit scene-gap treatment (e.g. white-balance/color normalization,
+or OT/contrastive on top). Consistent with memory `project_stage1_hr_alignment_eval`
+(trained encoder also fully disjoint, MMD ratio 627).
+
+**Caveat / next diagnostic:** DINOv2 pooled features are dominated by global
+color/white-balance, which alone separates the datasets. Before concluding the
+gap is "structural", re-run with per-image color/white-balance normalization (or
+compare patch-token *structure*) to factor out trivial color shift.
+
 ## Known caveats
 
 - Long-sleeve human (memory `project_arm_mask_sleeve_extension`): SAM2 skin seed
