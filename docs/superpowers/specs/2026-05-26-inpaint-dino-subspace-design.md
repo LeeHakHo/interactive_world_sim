@@ -120,7 +120,43 @@ val clip (T,C,H,W)[0,1] 128²
 - Robot-arm FK-render mask (more accurate but heavier); SAM2 chosen, FK only as
   fallback if SAM2 visibly leaks robot pixels.
 
-## Results (2026-05-26, job 45740, n=900/domain — final mask + color-norm control)
+## CANONICAL RESULT (inpaint_gap_test.py, job 45741, K=220/domain)
+
+The two-stage `inpaint_dino_subspace.py` pipeline below used a color-heuristic
+human mask (inferior) and only 1 val episode/domain (low diversity → probe
+saturates at 1.0). The **correct** experiment is `inpaint_gap_test.py`: it seeds
+SAM2 from phantom's real `masks_arm` HAND location so SAM2 grabs the WHOLE
+connected arm (hand+sleeve) cleanly, keeps the cube, and uses 3 human chunks + 3
+robot episodes. Verified visually (`outputs/inpaint_gap_test.png`): whole arm+hand
+removed, cube + plate preserved.
+
+| config | probe-acc | MMD ratio |
+|---|---|---|
+| raw (agent present) | 1.00 | ~582 |
+| **inpaint (agent removed)** | **0.939** | **63** |
+| inpaint + color-matched (robot→human chan mean/std) | 0.955 | 67 |
+| inpaint + grayscale (all color removed) | 0.977 | 86 |
+| within-domain control (H1 vs H2) | 0.492 | — |
+
+**Conclusion (canonical):** with a correct, complete agent mask, removing the
+agent makes a **large** dent — probe 1.00 → 0.94 and the MMD ratio drops ~9×
+(582 → 63). So the agent is a **major** contributor to the cross-embodiment gap.
+But a residual remains (probe 0.94, not chance), and it is **structural, not
+color**: matching robot color to human (0.955) and removing all color via
+grayscale (0.977) do not reduce it — they leave the domains separable on
+objects/texture/geometry (bowl vs plate, table grain, layout). So inpainting the
+agent helps a lot but does not fully align the observation latents; the residual
+scene/object gap needs matched collection or an explicit cross-scene treatment.
+
+---
+
+## Pipeline results (inpaint_dino_subspace.py, job 45740 — superseded by above)
+
+Note: human mask here is a color-heuristic (skin+dark union) and val data is 1
+episode/domain, so probe saturates at 1.0; numbers are kept for the record but the
+canonical result above (correct masks_arm seeding, diverse data) supersedes them.
+
+### Details (2026-05-26, job 45740, n=900/domain — color-heuristic mask)
 
 **Mask evolution (two user corrections):** (1) human user wears long sleeves, no
 visible skin — the first skin-seed masked the red **cube** (task object) and left
