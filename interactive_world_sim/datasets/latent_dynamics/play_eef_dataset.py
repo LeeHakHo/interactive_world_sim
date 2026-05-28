@@ -360,6 +360,14 @@ class PlayEEFDataset(BaseImageDataset):
             video_arrays.append(arr)
         ep["video_arrays"] = video_arrays
 
+        # Precomputed agent mask (deterministic whole-arm mask, 1:1 aligned with the
+        # PRIMARY view's video memmap). See precompute_agent_masks.py. None if absent.
+        mask_cache = (
+            ep["cache_dir"]
+            / f"agent_mask_res{self.resolution}_{_crop_tag(self.crops[0])}.npy"
+        )
+        ep["mask_array"] = np.load(mask_cache) if mask_cache.exists() else None
+
     def _build_action_chunk(
         self,
         cols: dict[str, np.ndarray],
@@ -515,13 +523,19 @@ class PlayEEFDataset(BaseImageDataset):
                 np.asarray(varr[gframe]).astype(np.float32) / 255.0
             )
         actions = ep["actions"][idxs].astype(np.float32)  # (T, 8)
-        return {
+        out = {
             "obs": obs_dict,
             "goal": goal_dict,
             "action": torch.from_numpy(actions),
             "is_early_stop": torch.tensor([False]),
             "rel_stop_idx": torch.tensor([horizon - 1], dtype=torch.long),
         }
+        if ep.get("mask_array") is not None:
+            mseq = np.asarray(ep["mask_array"][idxs])           # (T, H, W) uint8
+            out["agent_mask"] = torch.from_numpy(
+                (mseq > 0).astype(np.float32)
+            ).unsqueeze(1)                                       # (T, 1, H, W)
+        return out
 
 
 class MixedPlayEEFDataset(BaseImageDataset):
@@ -640,15 +654,8 @@ class MixedPlayEEFDataset(BaseImageDataset):
         item["domain_label"] = torch.tensor(
             1 if emb == "robot" else 0, dtype=torch.long,
         )
-        # Whole-arm agent mask for mask_subtract decomposition (v1 heuristic
-        # source; the model consumes batch["agent_mask"], so SAM2/precomputed
-        # masks are a drop-in via the same key). obs frames are (T,3,H,W) in [0,1].
-        from interactive_world_sim.algorithms.latent_decompose.agent_mask import (
-            whole_arm_mask,
-        )
-        primary = self.obs_keys[0]
-        frames = item["obs"][primary]                 # (T,3,H,W) float [0,1]
-        item["agent_mask"] = whole_arm_mask(frames, emb)  # (T,1,H,W) whole arm
+        # agent_mask is emitted by the per-domain PlayEEFDataset._sample_window from
+        # the precomputed deterministic whole-arm mask cache (precompute_agent_masks.py).
         return item
 
     def get_validation_dataset(self) -> "MixedPlayEEFDataset":
