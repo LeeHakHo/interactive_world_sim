@@ -79,14 +79,14 @@ def build_robot_episode(ep, predictor):
     for ci, (a, b) in enumerate(_clip_bounds(n)):
         fr = frames_full[a:b]
         eef = np.concatenate([pos_cam[a:b], quat[a:b], grip[a:b]], axis=1).astype(np.float32)
-        amask = np.stack([robot_gripper_mask(predictor, fr[t]) for t in range(b - a)])
         obj = np.full((b - a, CFG.k_obj, 3), np.nan, np.float32)            # robot 无 VGGT 深度 → NaN
         mid = (b - a) // 2
         uv_mid = project_points_to_pixels(K, eef[mid:mid + 1, :3])[0]
         cimg = crop_around(fr[mid], uv_mid, CFG.emb_crop)
         frames = np.stack([crop_resize(f, list(CFG.crop), CFG.res) for f in fr])
-        amask_rs = np.stack([crop_resize(m.astype(np.uint8) * 255, list(CFG.crop), CFG.res) > 127
-                             for m in amask])
+        # 夹爪 mask 在 crop 后的桌面图上算：最暗点=桌上孤立的黑夹爪，
+        # 避免在全帧找最暗点时种到 crop 外的黑色 mount/边框
+        amask_rs = np.stack([robot_gripper_mask(predictor, frames[t]) for t in range(b - a)])
         rec = assemble_clip(frames, amask_rs, eef, obj, cimg, "robot",
                             {"source_id": f"robot_{ep}", "frame_start": int(a),
                              "fps": 30, "crop": list(CFG.crop)})

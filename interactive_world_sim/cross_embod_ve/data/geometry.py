@@ -3,9 +3,16 @@ import numpy as np
 
 
 def load_intrinsics(path: str) -> np.ndarray:
-    """读 cam_high 内参 JSON → 3x3 K (float32)。兼容 {fx,fy,cx,cy} 或 {K:[9]} 两种格式。"""
+    """读 cam_high 内参 JSON → 3x3 K (float32)。兼容 {fx,fy,cx,cy}、{K:[9]}，
+    以及参数嵌套在 {"left"/"right": {...}} 子字典中的格式 (D405 出厂内参文件)。"""
     with open(path) as f:
         d = json.load(f)
+    # 参数嵌套在 left/right 子字典里 (e.g. D405 intrinsics_cam_high.json)
+    if "K" not in d and "fx" not in d:
+        for key in ("left", "right"):
+            if key in d and isinstance(d[key], dict):
+                d = d[key]
+                break
     if "K" in d:
         return np.asarray(d["K"], dtype=np.float32).reshape(3, 3)
     return np.array([[d["fx"], 0, d["cx"]],

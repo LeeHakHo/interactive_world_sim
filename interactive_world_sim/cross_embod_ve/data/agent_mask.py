@@ -31,6 +31,17 @@ def human_arm_mask_from_hand(img_rgb: np.ndarray, hand_mask: np.ndarray,
 
 
 def build_sam2_predictor(cfg_name: str, ckpt: str, device: str = "cuda"):
+    import os
+    import sys
+    # sam2 是 vendored submodule（未 pip 安装），按仓库惯例加入 path
+    if not any(p.endswith("submodules/sam2") for p in sys.path):
+        for cand in ("phantom/submodules/sam2",
+                     os.path.join(os.path.dirname(__file__),
+                                  "../../../phantom/submodules/sam2")):
+            cand = os.path.abspath(cand)
+            if os.path.isdir(cand) and cand not in sys.path:
+                sys.path.insert(0, cand)
+                break
     from sam2.build_sam import build_sam2
     from sam2.sam2_image_predictor import SAM2ImagePredictor
     return SAM2ImagePredictor(build_sam2(cfg_name, ckpt, device=device))
