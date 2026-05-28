@@ -16,7 +16,7 @@ from interactive_world_sim.cross_embod_ve.data.video_io import (
 from interactive_world_sim.cross_embod_ve.data.geometry import (
     load_intrinsics, transform_points, project_points_to_pixels)
 from interactive_world_sim.cross_embod_ve.data.agent_mask import (
-    human_arm_mask_from_hand, build_sam2_predictor, robot_gripper_mask)
+    human_arm_mask_from_hand, robot_gripper_mask)
 from interactive_world_sim.cross_embod_ve.data.object_track import object_traj_3d
 from interactive_world_sim.cross_embod_ve.data.embodiment_image import crop_around
 from interactive_world_sim.cross_embod_ve.data.clip_record import (
@@ -32,11 +32,18 @@ def _clip_bounds(n):
     return [(s, s + CFG.t_clip) for s in range(0, n - CFG.t_clip + 1, CFG.stride)]
 
 
-def build_human_chunk(chunk_id, predictor=None):
+def build_human_chunk(chunk_id):
     base = f"{CFG.human.chunks_root}/{chunk_id}"
-    frames_full = read_human_frames(f"{base}/video_rgb_imgs.mkv")          # (T,480,640,3)
-    masks_arm = np.load(f"{base}/segmentation_processor/masks_arm.npy")     # (T,480,640) bool
-    act = np.load(f"{base}/smoothing_processor/smoothed_actions_right_single_arm.npz")
+    act_path = f"{base}/smoothing_processor/smoothed_actions_right_single_arm.npz"
+    masks_path = f"{base}/segmentation_processor/masks_arm.npy"
+    vid_path = f"{base}/video_rgb_imgs.mkv"
+    missing = [p for p in (act_path, masks_path, vid_path) if not os.path.exists(p)]
+    if missing:
+        print(f"[skip] human chunk {chunk_id}: missing {missing}")
+        return
+    frames_full = read_human_frames(vid_path)                              # (T,480,640,3)
+    masks_arm = np.load(masks_path)                                        # (T,480,640) bool
+    act = np.load(act_path)
     ee_pts, ee_oris, ee_w = act["ee_pts"], act["ee_oris"], act["ee_widths"]
     n = min(len(frames_full), len(masks_arm), len(ee_pts))
     depth_path = f"{base}/depth.npy"
@@ -45,15 +52,16 @@ def build_human_chunk(chunk_id, predictor=None):
         fr = frames_full[a:b]
         quat = Rotation.from_matrix(ee_oris[a:b]).as_quat()                 # xyzw
         eef = np.concatenate([ee_pts[a:b], quat, ee_w[a:b, None]], axis=1).astype(np.float32)
-        amask = np.stack([human_arm_mask_from_hand(fr[t], masks_arm[a + t]) for t in range(b - a)])
         obj = (object_traj_3d(fr, depth[a:b], K) if depth is not None
                else np.full((b - a, CFG.k_obj, 3), np.nan, np.float32))
         mid = (b - a) // 2
         uv_mid = project_points_to_pixels(K, eef[mid:mid + 1, :3])[0]
         cimg = crop_around(fr[mid], uv_mid, CFG.emb_crop)
         frames = np.stack([crop_resize(f, list(CFG.crop), CFG.res) for f in fr])
-        amask_rs = np.stack([crop_resize(m.astype(np.uint8) * 255, list(CFG.crop), CFG.res) > 127
-                             for m in amask])
+        # arm mask 在裁好的桌面图上算（桌外暗背景天然排除，避免连通域外溢到背景）
+        hand_crop = [crop_resize(masks_arm[a + t].astype(np.uint8) * 255, list(CFG.crop), CFG.res) > 127
+                     for t in range(b - a)]
+        amask_rs = np.stack([human_arm_mask_from_hand(frames[t], hand_crop[t]) for t in range(b - a)])
         rec = assemble_clip(frames, amask_rs, eef, obj, cimg, "human",
                             {"source_id": f"chunk_{chunk_id}", "frame_start": int(a),
                              "fps": 30, "crop": list(CFG.crop)})
@@ -64,7 +72,7 @@ def build_human_chunk(chunk_id, predictor=None):
         print("wrote", out)
 
 
-def build_robot_episode(ep, predictor):
+def build_robot_episode(ep):
     base = f"{CFG.robot.dataset_root}/play_robot_{ep}_eef"
     mp4 = f"{base}/videos/chunk-000/observation.images.cam_high/episode_000000.mp4"
     pq = f"{base}/data/chunk-000/episode_000000.parquet"
@@ -84,9 +92,14 @@ def build_robot_episode(ep, predictor):
         uv_mid = project_points_to_pixels(K, eef[mid:mid + 1, :3])[0]
         cimg = crop_around(fr[mid], uv_mid, CFG.emb_crop)
         frames = np.stack([crop_resize(f, list(CFG.crop), CFG.res) for f in fr])
-        # 夹爪 mask 在 crop 后的桌面图上算：最暗点=桌上孤立的黑夹爪，
-        # 避免在全帧找最暗点时种到 crop 外的黑色 mount/边框
-        amask_rs = np.stack([robot_gripper_mask(predictor, frames[t]) for t in range(b - a)])
+        # 夹爪 mask 在 crop 桌面图上算，用每帧 EEF 投影像素当 SAM2 种子（比最暗点可靠，
+        # 避免夹爪移位时种到边缘阴影）；种子越界则 robot_gripper_mask 内部退回最暗点
+        cx, cy, cw, ch = list(CFG.crop)
+        uv_full = project_points_to_pixels(K, eef[:, :3])                   # (T,2) 全帧像素
+        seeds = [((uv_full[t, 0] - cx) * CFG.res / cw,
+                  (uv_full[t, 1] - cy) * CFG.res / ch) for t in range(b - a)]
+        amask_rs = np.stack([robot_gripper_mask(frames[t], seed=seeds[t])
+                             for t in range(b - a)])
         rec = assemble_clip(frames, amask_rs, eef, obj, cimg, "robot",
                             {"source_id": f"robot_{ep}", "frame_start": int(a),
                              "fps": 30, "crop": list(CFG.crop)})
@@ -103,13 +116,18 @@ def main():
     ap.add_argument("--limit", type=int, default=None, help="只处理前 N 个 source")
     args = ap.parse_args()
     os.makedirs(CFG.out_root, exist_ok=True)
-    predictor = build_sam2_predictor(CFG.sam2_cfg, CFG.sam2_ckpt)
     if args.domain in ("human", "all"):
         for cid in list(CFG.human.chunk_ids)[: args.limit]:
-            build_human_chunk(cid, predictor)
+            try:
+                build_human_chunk(cid)
+            except Exception as e:
+                print(f"[error] human chunk {cid}: {type(e).__name__}: {e}")
     if args.domain in ("robot", "all"):
         for ep in list(CFG.robot.episodes)[: args.limit]:
-            build_robot_episode(ep, predictor)
+            try:
+                build_robot_episode(ep)
+            except Exception as e:
+                print(f"[error] robot ep {ep}: {type(e).__name__}: {e}")
 
 
 if __name__ == "__main__":

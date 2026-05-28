@@ -47,20 +47,29 @@ def build_sam2_predictor(cfg_name: str, ckpt: str, device: str = "cuda"):
     return SAM2ImagePredictor(build_sam2(cfg_name, ckpt, device=device))
 
 
-def robot_gripper_mask(predictor, img_rgb: np.ndarray, dilate: int = 21) -> np.ndarray:
-    """robot 夹爪 mask：在图内最暗点种 SAM2，取面积合理的 mask，膨胀。返回 (H,W) bool。"""
+def robot_gripper_mask(img_rgb: np.ndarray, dilate: int = 15,
+                       seed=None, dark_thr: int = 70) -> np.ndarray:
+    """robot 夹爪 mask：桌面 crop 上靠近 seed 的暗连通域（gripper 是浅色桌面上唯一的
+    黑色物体）。seed=(x,y) 来自 EEF 投影用于选对的连通域；无 seed 取最大暗域。
+    比点种 SAM2 稳——SAM2 会从夹爪点抓到整条连通 mount/盘子。返回 (H,W) bool。"""
+    H, W = img_rgb.shape[:2]
     gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    yx = np.unravel_index(np.argmin(gray), gray.shape)
-    pt = np.array([[yx[1], yx[0]]], dtype=np.float32)   # (x,y)
-    predictor.set_image(img_rgb)
-    masks, scores, _ = predictor.predict(
-        point_coords=pt, point_labels=np.array([1]), multimask_output=True)
-    area = img_rgb.shape[0] * img_rgb.shape[1]
-    cand = [(s, m) for s, m in zip(scores, masks)
-            if 0.01 * area < m.sum() < 0.5 * area]
-    if not cand:
-        best = masks[int(np.argmax(scores))]
+    dark = (gray < dark_thr).astype(np.uint8)
+    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE,
+                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(dark)
+    if num <= 1:
+        return np.zeros((H, W), bool)
+    if seed is not None and 0 <= seed[0] < W and 0 <= seed[1] < H:
+        # 选与 seed 周围小圆盘重叠最多的暗连通域（比"质心最近"鲁棒：
+        # 避免 seed 旁的小噪声域质心更近而漏掉大夹爪域）
+        disk = np.zeros((H, W), np.uint8)
+        cv2.circle(disk, (int(seed[0]), int(seed[1])), 14, 1, -1)
+        overlaps = [int(((labels == i) & (disk > 0)).sum()) for i in range(1, num)]
+        idx = (1 + int(np.argmax(overlaps))) if max(overlaps) > 0 \
+            else 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
     else:
-        best = max(cand, key=lambda sm: sm[0])[1]
+        idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    m = (labels == idx)
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate, dilate))
-    return cv2.dilate(best.astype(np.uint8), k).astype(bool)
+    return cv2.dilate(m.astype(np.uint8), k).astype(bool)
