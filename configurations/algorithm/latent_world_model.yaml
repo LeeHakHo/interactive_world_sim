@@ -157,11 +157,31 @@ latent_decompose:
   enabled: false
   # method: channel_split (v3, GRL adversary on a sliced ViT feature) |
   #         dual_head    (v4, two independent projection heads + CLUB MI penalty,
-  #                       decoder untouched so reconstruction is not sacrificed)
+  #                       decoder untouched so reconstruction is not sacrificed) |
+  #         emb_film     (v5, Phase 0a: global appearance code (c_emb) from the
+  #                       [CLS] token, broadcast + appended to the decoder
+  #                       conditioning. Scene latent + dynamics untouched; runs
+  #                       under automatic optimisation. measure-first = no
+  #                       alignment loss, only detached domain probes.)
   method: channel_split
   d_task: 288
   d_emb: 96
   lambda_dom: 0.1
+  # --- emb_film (v5) only ---
+  c_emb: 16                 # per-view appearance-code width (appended channels)
+  # --- ot_align (v5 Phase 0b): EgoBridge-style OT on z_scene (emb_film only) ---
+  ot_align:
+    enabled: false          # turn on for Phase 0b (aligns z_scene across domains)
+    alpha: 0.1              # OT loss weight (capped); ramped in over warmup
+    warmup_start: 5000      # step to start ramping alpha
+    warmup_end: 20000       # step alpha reaches its full value
+    eps: 0.1                # Sinkhorn entropic reg (relative to mean cost)
+    n_iters: 50             # Sinkhorn iterations
+    lam: 0.1                # DTW pseudo-pair cost discount (0<lam<<1)
+    use_dtw: true           # use DTW pseudo-pairs to shape the OT cost
+    action_weight: 1.0      # weight of the action term in the joint cost
+    bank_cap: 128           # per-domain memory-bank capacity (frames)
+    min_bank: 16            # min opposite-domain bank size before OT kicks in
   # --- channel_split (v3) only ---
   lambda_adv_schedule:
     type: linear_ramp
@@ -175,3 +195,14 @@ latent_decompose:
   club_lr: 1.0e-4           # lr for the variational q-network
   club_every_n_steps: 10    # apply CLUB MI penalty to encoder every N steps (paper: 10)
   club_hidden: 256          # hidden width of the q-network MLPs
+  # --- mask_subtract (2026-05-28) only ---
+  # method: mask_subtract — agent-mask-grounded z_emb (anchor + agent recon),
+  #   DETACHED from encoder-decoder; z_scene = F with the anchored embodiment
+  #   direction projected out. No CLUB, no adversary. Decoder unchanged (z_scene
+  #   and z_full are both num_latent_channel channels). Needs batch["agent_mask"].
+  d_emb_mask: 64            # pooled embedding width for the anchor
+  removal_op: ortho_proj    # ortho_proj | gate
+  lambda_agent_rec: 1.0     # mask-interior agent reconstruction weight
+  lambda_anchor: 0.5        # domain supcon anchor weight
+  lambda_scene_rec: 1.0     # mask-exterior z_scene reconstruction (sufficiency); 0 disables
+  anchor_temperature: 0.1

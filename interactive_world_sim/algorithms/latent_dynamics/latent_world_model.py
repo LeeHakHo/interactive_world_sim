@@ -94,17 +94,27 @@ class LatentWorldModel(BasePytorchAlgo):
         # Phase 0 latent decomposition flag. Mirrors dynamo_ssl pattern.
         # Active only in Stage 1; Stages 2/3 ignore it.
         ld_cfg = cfg.get("latent_decompose", None)
-        self.use_latent_decompose = bool(
+        _decompose_on = bool(
             ld_cfg is not None
             and ld_cfg.get("enabled", False)
             and self.training_stage == 1
             and self.use_vit_encoder
         )
         # method: "channel_split" (v3, GRL adversary) | "dual_head" (v4, two
-        # independent projection heads + CLUB MI penalty, decoder untouched).
+        # independent projection heads + CLUB MI penalty, decoder untouched) |
+        # "emb_film" (v5, Phase 0a, global appearance code appended to the
+        # decoder conditioning; scene latent + dynamics untouched).
         self.decompose_method = (
             ld_cfg.get("method", "channel_split")
             if ld_cfg is not None else "channel_split"
+        )
+        # emb_film is a separate path: it does NOT use the split machinery
+        # (z_task_list/z_emb_list) or the GRL/CLUB classifiers, and runs under
+        # automatic optimisation. Keep `use_latent_decompose` meaning the split
+        # paths only, so the existing branches stay untouched.
+        self.use_emb_film = bool(_decompose_on and self.decompose_method == "emb_film")
+        self.use_latent_decompose = bool(
+            _decompose_on and self.decompose_method in ("channel_split", "dual_head")
         )
         if self.use_latent_decompose and self.decompose_method == "channel_split":
             assert (
@@ -114,6 +124,29 @@ class LatentWorldModel(BasePytorchAlgo):
         self.use_dual_head = (
             self.use_latent_decompose and self.decompose_method == "dual_head"
         )
+        # mask_subtract (2026-05-28): separate path like emb_film — runs under
+        # automatic optimisation, decoder unchanged, embodiment path detached.
+        self.use_mask_subtract = bool(
+            _decompose_on and self.decompose_method == "mask_subtract"
+        )
+        # emb_film: per-view global appearance-code width appended as constant
+        # channels to the decoder conditioning. Total appended = c_emb*num_views.
+        self.c_emb = int(ld_cfg.get("c_emb", 16)) if (ld_cfg is not None) else 16
+        self.c_emb_total = self.c_emb * self.num_views
+
+        # Phase 0b: EgoBridge-style OT alignment on z_scene (only with emb_film).
+        ot_cfg = ld_cfg.get("ot_align", None) if ld_cfg is not None else None
+        self.use_ot_align = bool(
+            self.use_emb_film and ot_cfg is not None and ot_cfg.get("enabled", False)
+        )
+        self.ot_cfg = ot_cfg
+        # per-domain memory banks (plain attrs, not in state_dict): tuples of
+        # (flattened z_scene, action traj, mean action), kept on the model device.
+        self._ot_bank = {0: None, 1: None}
+        # robot world->cam_high extrinsic for unifying EEF position frames in the
+        # OT cost (robot EEF is world-frame, human EEF is cam-frame). Lazily
+        # materialised on the model device on first use.
+        self._T_cam_world_t = None
 
         super().__init__(cfg)
 
@@ -157,11 +190,21 @@ class LatentWorldModel(BasePytorchAlgo):
         self.robust_latent = cfg.robust_latent if "robust_latent" in cfg else False
 
     def _build_model(self) -> None:
-        # decoder
+        # decoder. For emb_film we append c_emb_total constant "appearance"
+        # channels to the conditioning latent, so the control_net must accept
+        # (num_latent_channel + c_emb_total) cond channels. Only the decoder's
+        # cond width changes; the dynamics latent stays num_latent_channel.
+        dec_diff_cfg = self.cfg.diffusion
+        if getattr(self, "use_emb_film", False):
+            from omegaconf import OmegaConf
+            dec_diff_cfg = OmegaConf.create(OmegaConf.to_container(self.cfg.diffusion, resolve=True))
+            dec_diff_cfg.num_latent_channel = (
+                int(self.cfg.num_latent_channel) + int(self.c_emb_total)
+            )
         self.decoder: CMDecoder = CMDecoder(
             self.cfg.x_shape,
             self.cfg.latent_dim,
-            self.cfg.diffusion,
+            dec_diff_cfg,
             dtype=self.dtype,
         )
 
@@ -238,6 +281,42 @@ class LatentWorldModel(BasePytorchAlgo):
                         x_dim=d_task, y_dim=d_emb,
                         hidden=int(ld.get("club_hidden", 256)),
                     )
+                if self.use_emb_film:
+                    from interactive_world_sim.algorithms.latent_decompose.emb_film import (
+                        EmbHead,
+                        DomainProbe,
+                    )
+                    # Global appearance code from the [CLS] token (shared across
+                    # views); broadcast + appended to the decoder conditioning.
+                    self.emb_head = EmbHead(in_dim=vit_dim, c_emb=self.c_emb)
+                    # Detached diagnostic probes (measure-first): how domain-
+                    # separable are the scene latent vs the appearance code?
+                    self.probe_scene = DomainProbe(int(self.cfg.num_latent_channel))
+                    self.probe_emb = DomainProbe(int(self.c_emb_total))
+                if getattr(self, "use_mask_subtract", False):
+                    from interactive_world_sim.algorithms.latent_decompose.mask_subtract import (
+                        MaskSubtractHead,
+                        AgentReconHead,
+                    )
+                    from interactive_world_sim.algorithms.latent_decompose.emb_film import (
+                        DomainProbe,
+                    )
+                    ld = self.cfg.latent_decompose
+                    c_scene = int(self.cfg.num_latent_channel)
+                    d_emb = int(ld.get("d_emb_mask", 64))
+                    self.mask_subtract = MaskSubtractHead(
+                        c_scene=c_scene,
+                        latent_hw=int(self.latent_resolution),
+                        d_emb=d_emb,
+                        removal=str(ld.get("removal_op", "ortho_proj")),
+                    )
+                    self.agent_recon = AgentReconHead(
+                        c_scene=c_scene, out_hw=int(self.cfg.x_shape[1]),
+                    )
+                    # detached diagnostics: z_full / z_scene / z_emb separability
+                    self.probe_full = DomainProbe(c_scene)
+                    self.probe_scene = DomainProbe(c_scene)
+                    self.probe_emb = DomainProbe(d_emb)
             else:
                 # ResNet18 backbone + spatial projection for decoder
                 self.resnet_encoder = ResNet18SpatialEncoder(
@@ -352,10 +431,35 @@ class LatentWorldModel(BasePytorchAlgo):
                 encoder_params = list(self.encoder.parameters())
             else:
                 encoder_params = list(self.resnet_encoder.parameters()) + list(self.spatial_proj.parameters())
+            # emb_film: the appearance head produces part of the reconstruction
+            # conditioning, so it warms up with the encoder (group 1).
+            if self.use_emb_film:
+                encoder_params = encoder_params + list(self.emb_head.parameters())
             param_groups = [
                 {"params": self.decoder.parameters(), "lr": self.cfg.lr},
                 {"params": encoder_params, "lr": self.cfg.lr},
             ]
+            if self.use_emb_film:
+                # Detached diagnostic probes: constant LR (aux group, idx>=2).
+                param_groups.append({
+                    "params": list(self.probe_scene.parameters())
+                              + list(self.probe_emb.parameters()),
+                    "lr": self.cfg.lr,
+                })
+            if getattr(self, "use_mask_subtract", False):
+                # embodiment path (detached from E via stop_grad): own group, main LR
+                param_groups.append({
+                    "params": list(self.mask_subtract.parameters())
+                              + list(self.agent_recon.parameters()),
+                    "lr": self.cfg.lr,
+                })
+                # detached probes: aux group, constant LR (idx>=2)
+                param_groups.append({
+                    "params": list(self.probe_full.parameters())
+                              + list(self.probe_scene.parameters())
+                              + list(self.probe_emb.parameters()),
+                    "lr": self.cfg.lr,
+                })
             if self.use_latent_decompose and self.decompose_method == "channel_split":
                 param_groups.append({
                     "params": list(self.clf_emb.parameters())
@@ -400,20 +504,21 @@ class LatentWorldModel(BasePytorchAlgo):
             # the auxiliary classifier lr ramps from start_factor·lr up over
             # warmup_steps, under-driving the discriminator early in training
             # (Phase 0 spec requires lr_classifiers to be constant).
-            if self.use_dynamo_ssl or self.use_latent_decompose:
+            if (self.use_dynamo_ssl or self.use_latent_decompose or self.use_emb_film
+                    or getattr(self, "use_mask_subtract", False)):
                 warmup_steps = self.cfg.warmup_steps
                 start_factor = 1e-4
 
                 def lr_lambda_fn(group_idx):
                     if group_idx < 2:
-                        # decoder, encoder: linear warmup
+                        # decoder, encoder(+emb_head): linear warmup
                         def fn(step):
                             if step >= warmup_steps:
                                 return 1.0
                             return start_factor + (1.0 - start_factor) * step / warmup_steps
                         return fn
                     else:
-                        # auxiliary groups (classifiers, SSL heads): constant LR
+                        # auxiliary groups (probes, classifiers, SSL heads): constant LR
                         return lambda step: 1.0
 
                 lr_scheduler = LambdaLR(
@@ -474,6 +579,31 @@ class LatentWorldModel(BasePytorchAlgo):
                 "name": "lr_scheduler",
             },
         }
+
+    def configure_gradient_clipping(
+        self, optimizer, gradient_clip_val=None, gradient_clip_algorithm=None
+    ):
+        """For emb_film, clip ONLY the model param groups (decoder=0,
+        encoder+emb_head=1), NOT the detached diagnostic probes (group 2).
+
+        The probes are added to the optimised loss so their params train, but
+        their gradients must not inflate the global grad-norm — otherwise the
+        single global clip would dilute the model's clipped gradient budget.
+        """
+        if (self.use_emb_film or getattr(self, "use_mask_subtract", False)) and gradient_clip_val:
+            model_params = [
+                p
+                for g in optimizer.param_groups[:2]
+                for p in g["params"]
+                if p.grad is not None
+            ]
+            torch.nn.utils.clip_grad_norm_(model_params, float(gradient_clip_val))
+            return
+        super().configure_gradient_clipping(
+            optimizer,
+            gradient_clip_val=gradient_clip_val,
+            gradient_clip_algorithm=gradient_clip_algorithm,
+        )
 
     # ------------------------------------------------------------------
     # Latent-decompose helpers (Phase 0 align module)
@@ -621,6 +751,224 @@ class LatentWorldModel(BasePytorchAlgo):
         self.log("training/loss", total_loss)
         return total_loss
 
+    def _emb_film_probe_loss(
+        self,
+        batch: dict,
+        z: torch.Tensor,
+        seq_len: int,
+    ) -> torch.Tensor:
+        """emb_film (measure-first): DETACHED domain probes on the scene latent
+        and the appearance code; logs their accuracy. Inputs are detached so the
+        probe gradients NEVER reach the encoder/decoder — this only *measures*
+        domain-separability, applying no alignment pressure.
+
+        Returns ONLY the probe CE (kept OUT of the reported model loss, and
+        excluded from the model's gradient clipping — see
+        configure_gradient_clipping). z is the augmented latent
+        (B*T, C_scene + c_emb_total, H, W).
+        """
+        if "domain_label" not in batch:
+            return z.new_zeros(())
+        c_scene = int(self.cfg.num_latent_channel)
+        z_scene = z[:, :c_scene].mean(dim=(2, 3))          # (B*T, C_scene)
+        z_emb_vec = z[:, c_scene:].mean(dim=(2, 3))         # (B*T, c_emb_total)
+        dl = batch["domain_label"].to(z.device).long()      # (B,)
+        dl_rep = dl.repeat_interleave(seq_len)               # (B*T,) b-slow t-fast
+
+        logits_scene = self.probe_scene(z_scene.detach())
+        logits_emb = self.probe_emb(z_emb_vec.detach())
+        loss_scene = F.cross_entropy(logits_scene, dl_rep)
+        loss_emb = F.cross_entropy(logits_emb, dl_rep)
+
+        with torch.no_grad():
+            acc_scene = (logits_scene.argmax(-1) == dl_rep).float().mean()
+            acc_emb = (logits_emb.argmax(-1) == dl_rep).float().mean()
+        # We WANT acc_scene -> chance (~0.5, scene becomes embodiment-agnostic)
+        # and acc_emb -> high (appearance code carries embodiment).
+        self.log("training/probe_scene_acc", acc_scene)
+        self.log("training/probe_emb_acc", acc_emb)
+        self.log("training/probe_scene_loss", loss_scene)
+        self.log("training/probe_emb_loss", loss_emb)
+        return loss_scene + loss_emb
+
+    def _mask_subtract_losses(self, batch: dict, z: torch.Tensor, seq_len: int):
+        """mask_subtract: derive z_scene from the full latent F, compute the
+        embodiment-path losses (detached from the encoder via MaskSubtractHead)
+        plus detached domain probes.
+
+        Returns (z_scene (B*T,C,Hl,Wl), aux_loss). aux_loss = agent-recon +
+        anchor + detached-probe CE. The mask-exterior scene-reconstruction term is
+        added in training_step (it needs a decoder forward). z is F of shape
+        (B*T, C_scene, Hl, Wl); batch["agent_mask"] is (B,T,1,H,W).
+        """
+        Hl = z.shape[-1]
+        m = batch["agent_mask"].to(z.device).float()        # (B,T,1,H,W)
+        B, T = m.shape[0], m.shape[1]
+        m = m.reshape(B * T, 1, m.shape[-2], m.shape[-1])    # (B*T,1,H,W)
+        mask_lat = F.interpolate(m, size=(Hl, Hl), mode="area")
+        mask_lat = (mask_lat > 0.5).float()                  # (B*T,1,Hl,Wl)
+
+        out = self.mask_subtract(z, mask_lat)
+        z_scene = out["z_scene"]
+
+        # (1) agent reconstruction (mask interior) against the input frames
+        xs = batch["obs"][self.obs_keys[0]].to(z.device).float()   # (B,T,3,H,W)
+        xs = xs.reshape(B * T, *xs.shape[2:])                # (B*T,3,H,W)
+        agent_rgb = self.agent_recon(out["z_emb_spatial"])   # (B*T,3,H,W)
+        m_img = (F.interpolate(m, size=agent_rgb.shape[-2:], mode="area") > 0.5).float()
+        denom = (m_img.sum() * 3.0).clamp_min(1.0)
+        L_agent = (((agent_rgb - xs) ** 2) * m_img).sum() / denom
+
+        # (2) supervised-contrastive domain anchor on the pooled embedding
+        from interactive_world_sim.algorithms.latent_decompose.mask_subtract import (
+            supcon_anchor,
+        )
+        dl = batch["domain_label"].to(z.device).long()       # (B,)
+        dl_rep = dl.repeat_interleave(T)                      # (B*T,)
+        L_anchor = supcon_anchor(
+            out["e"], dl_rep,
+            temperature=float(self.cfg.latent_decompose.get("anchor_temperature", 0.1)),
+        )
+
+        # (3) detached probes (measure only; never reach the encoder)
+        zf = z.mean(dim=(2, 3)).detach()
+        zs = z_scene.mean(dim=(2, 3)).detach()
+        ze = out["e"].detach()
+        lf, ls, le = self.probe_full(zf), self.probe_scene(zs), self.probe_emb(ze)
+        probe_ce = (F.cross_entropy(lf, dl_rep)
+                    + F.cross_entropy(ls, dl_rep)
+                    + F.cross_entropy(le, dl_rep))
+        with torch.no_grad():
+            self.log("training/probe_full_acc", (lf.argmax(-1) == dl_rep).float().mean())
+            self.log("training/probe_scene_acc", (ls.argmax(-1) == dl_rep).float().mean())
+            self.log("training/probe_emb_acc", (le.argmax(-1) == dl_rep).float().mean())
+        self.log("training/L_agent_rec", L_agent)
+        self.log("training/L_anchor", L_anchor)
+
+        ld = self.cfg.latent_decompose
+        aux = (float(ld.get("lambda_agent_rec", 1.0)) * L_agent
+               + float(ld.get("lambda_anchor", 0.5)) * L_anchor
+               + probe_ce)
+        return z_scene, aux
+
+    def _ot_alpha_now(self) -> float:
+        """Warmup ramp for the OT loss weight (0 -> alpha over [start, end])."""
+        oc = self.ot_cfg
+        a = float(oc.get("alpha", 0.1))
+        s0 = int(oc.get("warmup_start", 5000))
+        s1 = int(oc.get("warmup_end", 20000))
+        step = int(self.global_step)
+        if step <= s0:
+            return 0.0
+        if step >= s1:
+            return a
+        return a * (step - s0) / max(1, s1 - s0)
+
+    def _get_T_cam_world(self, device):
+        """Cached robot world->cam_high extrinsic (4,4) on the given device."""
+        if self._T_cam_world_t is None:
+            from interactive_world_sim.algorithms.latent_decompose.ot_align import (
+                robot_world_to_cam,
+            )
+            urdf = self.ot_cfg.get("urdf_path", None) if self.ot_cfg is not None else None
+            T = robot_world_to_cam(urdf) if urdf else robot_world_to_cam()
+            self._T_cam_world_t = torch.as_tensor(T, dtype=torch.float32)
+        return self._T_cam_world_t.to(device)
+
+    def _ot_bank_push(self, d: int, f, traj, a, cap: int) -> None:
+        """FIFO push of detached opposite-domain features into the memory bank."""
+        cur = self._ot_bank[d]
+        if cur is None:
+            new = (f, traj, a)
+        else:
+            new = (
+                torch.cat([cur[0], f]),
+                torch.cat([cur[1], traj]),
+                torch.cat([cur[2], a]),
+            )
+        if new[0].shape[0] > cap:
+            new = tuple(x[-cap:] for x in new)
+        self._ot_bank[d] = new
+
+    def _apply_ot_align(self, z, action, batch, seq_len: int):
+        """EgoBridge-style OT alignment of z_scene across domains (Phase 0b).
+
+        Aligns ONLY the scene channels z[:, :C_scene] (z_emb is left untouched so
+        the decoder keeps its embodiment-specific route). Current-batch features
+        (with grad) are transported toward the OPPOSITE-domain memory bank
+        (detached), so the encoder is pulled to overlap the two domains' scene
+        distributions while DTW pseudo-pairs keep the coupling behaviour-aware.
+        """
+        if "domain_label" not in batch:
+            return None
+        from interactive_world_sim.algorithms.latent_decompose.ot_align import (
+            ot_align_loss,
+        )
+        oc = self.ot_cfg
+        c_scene = int(self.cfg.num_latent_channel)
+        f = z[:, :c_scene].flatten(1)                     # (B*T, F) grad
+        B = int(batch["domain_label"].shape[0])
+        T = int(seq_len)
+        dl = batch["domain_label"].to(z.device).long()
+        dl_rep = dl.repeat_interleave(T)                  # (B*T,) b-slow t-fast
+
+        # Action behaviour = EEF POSITION trajectory, unified to the cam_high
+        # frame. Robot EEF (domain_label==1) is world-frame -> transform with the
+        # static extrinsic; human EEF (==0) is already cam-frame. Position-only
+        # (no rotation) keeps the transform robust and is the dominant behaviour
+        # signal for DTW pseudo-pairing.
+        raw_act = batch["action"].to(z.device).float()   # (B, T, 8) raw, native frame
+        pos = raw_act[..., :3].clone()                    # (B, T, 3)
+        robot_seq = dl == 1                               # (B,)
+        if bool(robot_seq.any()):
+            Tcw = self._get_T_cam_world(z.device)         # (4,4)
+            Rt, tt = Tcw[:3, :3], Tcw[:3, 3]
+            pos[robot_seq] = pos[robot_seq] @ Rt.t() + tt
+        # per-frame trajectory = its sequence's position trajectory; mean pos.
+        traj = pos[:, None].expand(B, T, T, 3).reshape(B * T, T, 3)
+        a_mean = pos.mean(dim=1).repeat_interleave(T, dim=0)  # (B*T, 3)
+
+        use_dtw = bool(oc.get("use_dtw", True))
+        min_bank = int(oc.get("min_bank", 16))
+        total = None
+        n_terms = 0
+        for d in (0, 1):
+            m = dl_rep == d
+            if int(m.sum()) < 1:
+                continue
+            bank = self._ot_bank[1 - d]
+            if bank is None or bank[0].shape[0] < min_bank:
+                continue
+            loss_d = ot_align_loss(
+                f[m], bank[0],
+                traj_cur=traj[m] if use_dtw else None,
+                traj_bank=bank[1] if use_dtw else None,
+                a_cur=a_mean[m], a_bank=bank[2],
+                eps=float(oc.get("eps", 0.1)),
+                n_iters=int(oc.get("n_iters", 50)),
+                lam=float(oc.get("lam", 0.1)),
+                action_weight=float(oc.get("action_weight", 1.0)),
+            )
+            total = loss_d if total is None else total + loss_d
+            n_terms += 1
+
+        # Update banks with detached current features (after computing the loss).
+        cap = int(oc.get("bank_cap", 128))
+        for d in (0, 1):
+            m = dl_rep == d
+            if int(m.sum()) > 0:
+                self._ot_bank_push(
+                    d, f[m].detach(), traj[m].detach(), a_mean[m].detach(), cap,
+                )
+
+        alpha = self._ot_alpha_now()
+        self.log("training/ot_alpha", torch.tensor(float(alpha), device=z.device))
+        if total is None or n_terms == 0:
+            return None
+        ot_mean = total / n_terms
+        self.log("training/ot_loss", ot_mean)
+        return alpha * ot_mean
+
     def encoder_forward(
         self,
         obs: torch.Tensor,
@@ -648,6 +996,7 @@ class LatentWorldModel(BasePytorchAlgo):
         z_task_list: list[torch.Tensor] = []
         z_emb_list:  list[torch.Tensor] = []
         emit_split = bool(return_split and self.use_latent_decompose)
+        emb_vecs: list[torch.Tensor] = []  # emb_film: per-view appearance codes
 
         if self.use_resnet_encoder:
             num_views = len(self.obs_keys)
@@ -680,6 +1029,8 @@ class LatentWorldModel(BasePytorchAlgo):
                         )
                     else:
                         spatial = self.spatial_proj(spatial_feat, cls_token)
+                    if self.use_emb_film:
+                        emb_vecs.append(self.emb_head(cls_token))  # (B, c_emb)
                 else:
                     resnet_feat = self.resnet_encoder(view_obs)
                     if self.use_dynamo_ssl and self.detach_rec_from_encoder:
@@ -698,6 +1049,17 @@ class LatentWorldModel(BasePytorchAlgo):
             z[:, i * c_per_v : (i + 1) * c_per_v] = z_chunk / (
                 torch.norm(z_chunk, dim=(1), keepdim=True) + 1e-8
             )
+
+        # emb_film: append the (un-normalised) global appearance code as constant
+        # spatial channels AFTER per-view L2 normalisation of the scene latent,
+        # so the appended code is not folded into the scene norm. The decoder's
+        # control_net was built with num_cond_channel = C_scene + c_emb_total.
+        if self.use_emb_film:
+            from interactive_world_sim.algorithms.latent_decompose.emb_film import (
+                broadcast_emb,
+            )
+            z_emb = torch.cat(emb_vecs, dim=1)  # (B, c_emb_total)
+            z = torch.cat([z, broadcast_emb(z_emb, z.shape[2], z.shape[3])], dim=1)
 
         if emit_split:
             return z, z_task_list, z_emb_list
@@ -1258,10 +1620,48 @@ class LatentWorldModel(BasePytorchAlgo):
                     total_loss = self._apply_decompose_losses(
                         batch, rec_loss, z_task_list, z_emb_list,
                     )
+                    log_loss = total_loss
+                elif self.use_emb_film:
+                    # Model objective = reconstruction (+ OT alignment in 0b).
+                    model_loss = rec_loss
+                    if self.use_ot_align:
+                        ot = self._apply_ot_align(z, action, batch, obs.shape[1])
+                        if ot is not None:
+                            model_loss = model_loss + ot
+                    # Diagnostic probes are added to the optimised loss so the
+                    # probe params train, but they are EXCLUDED from the reported
+                    # loss and from the model's gradient clip (see
+                    # configure_gradient_clipping) so they don't dilute training.
+                    probe_loss = self._emb_film_probe_loss(batch, z, obs.shape[1])
+                    total_loss = model_loss + probe_loss
+                    log_loss = model_loss   # report the clean model objective
+                elif getattr(self, "use_mask_subtract", False):
+                    z_scene, aux = self._mask_subtract_losses(batch, z, obs.shape[1])
+                    model_loss = rec_loss
+                    # mask-exterior scene reconstruction from z_scene
+                    # (sufficiency / anti-collapse). Second decoder forward.
+                    lam_sr = float(self.cfg.latent_decompose.get("lambda_scene_rec", 1.0))
+                    if lam_sr > 0:
+                        pred_scene = self._forward(
+                            self.decoder, noisy_xs_t, t, s, external_cond=z_scene,
+                        )
+                        m = batch["agent_mask"].to(z.device).float()
+                        Bb, Tt = m.shape[0], m.shape[1]
+                        m = m.reshape(Bb * Tt, 1, m.shape[-2], m.shape[-1])
+                        m_img = F.interpolate(m, size=pred_scene.shape[-2:], mode="area")
+                        ext = (m_img <= 0.5).float()             # mask EXTERIOR
+                        denom = (ext.sum() * pred_scene.shape[1]).clamp_min(1.0)
+                        L_scene = ((((pred_scene - noisy_xs_s.detach()) ** 2) * ext).sum()
+                                   / denom)
+                        self.log("training/L_scene_rec", L_scene)
+                        model_loss = model_loss + lam_sr * L_scene
+                    total_loss = model_loss + aux
+                    log_loss = model_loss
                 else:
                     total_loss = rec_loss
+                    log_loss = total_loss
                 self.log("training/rec_loss", rec_loss)
-                self.log("training/loss", total_loss)
+                self.log("training/loss", log_loss)
                 return {"loss": total_loss}
         elif self.training_stage == 2:
             # stage 2: train dynamics
