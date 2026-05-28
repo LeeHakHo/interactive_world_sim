@@ -1,4 +1,5 @@
 """Smoke: 读 1 human + 1 robot 视频首帧，验证解码与 crop。直接 `python` 运行。"""
+import cv2
 import numpy as np
 from omegaconf import OmegaConf
 from interactive_world_sim.cross_embod_ve.data.video_io import (
@@ -20,6 +21,18 @@ def main():
     assert rc.shape == (cfg.res, cfg.res, 3) and hc.shape == (cfg.res, cfg.res, 3)
     assert rf.ndim == 4 and hf.ndim == 4
     print("OK: decode + crop_resize")
+
+    # --- O_s smoke (human) ---
+    from interactive_world_sim.cross_embod_ve.data.object_track import object_pixels_one_frame
+    uv = object_pixels_one_frame(hf[0])
+    print("object pixels (blue, red):", uv)
+    vis = hf[0].copy()
+    for k, color in enumerate([(0, 255, 0), (255, 255, 0)]):
+        if not np.isnan(uv[k]).any():
+            cv2.circle(vis, (int(uv[k, 0]), int(uv[k, 1])), 8, color, 2)
+    import os; os.makedirs("outputs/ceve_qc", exist_ok=True)
+    cv2.imwrite("outputs/ceve_qc/obj_centroids.png", cv2.cvtColor(vis, cv2.COLOR_RGB2BGR))
+    print("wrote outputs/ceve_qc/obj_centroids.png")
 
 
 if __name__ == "__main__":
