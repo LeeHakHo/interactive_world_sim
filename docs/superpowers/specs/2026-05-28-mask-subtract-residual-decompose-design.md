@@ -16,9 +16,11 @@ Win condition (user-stated, two-part — both required):
    information must be enough"; an invariant-but-empty z_scene is a failure
    (this is exactly how the v3 GRL adversary died: PSNR 23.8).
 
-This is the decomposition + z_emb grounding step. Cross-domain numerical
-**alignment** of z_scene (residual scene/camera gap) is explicitly **deferred** to
-a later step (OT/whitening on the residual linear direction).
+This is the decomposition + z_emb grounding step. Any **residual** cross-domain
+separability that survives a *complete* agent removal — expected to be small, and
+to be incomplete-agent before it is true scene/camera (see "Interpretation" below) —
+is left to a later **alignment** step (OT/whitening on the residual linear
+direction) and is explicitly **deferred** here.
 
 ## Why this design (what failed before, and the gap it fixes)
 
@@ -54,6 +56,19 @@ with: (a) **agent-mask-grounded** supervision of z_emb, and (b) a figurative
 Both point to "domain signal ≈ a (few) linear direction(s)" → an **orthogonal
 projection** that removes that direction is the matched, low-risk, interpretable
 tool. It also **cannot collapse** z_scene (bounded rank-k removal).
+
+**Interpretation of the inpaint residual (user, reframes the scene-gap pessimism):**
+the inpaint experiments removed the agent *imperfectly* (residual forearm/sleeve on
+the long-sleeve human, residual gripper blocks on the robot), and the inpaint
+*artifacts* themselves leaked a little domain signal into the scene. So the residual
+near-perfect separability (probe ~0.95 with MMD already down ~9×) is read as
+**mostly still the agent (incomplete removal) + minor artifact-induced scene signal**,
+**not** a fundamental scene/camera gap. Implication for this design: the central
+lever is **mask completeness** — z_emb must capture the **whole** agent (arm + sleeve
++ hand for human, full gripper for robot), not just the hand. If it does, z_scene
+should align substantially better than the inpaint diagnostic's residual implied,
+because mask_subtract removes the agent in *latent* space (no inpaint artifacts) and
+is bounded only by how completely z_emb is grounded to the agent.
 
 ## Design
 
@@ -182,7 +197,7 @@ dynamics (everything outside the agent region is F unchanged).
 |---|---|---|
 | domain probe on z_emb | high (≫0.5) | z_emb captured the embodiment/domain — desired |
 | domain probe on z_scene vs z_full | **significantly lower** than z_full | removal stripped agent/domain signal |
-| z_scene probe on z_scene | **will NOT hit 0.5** | residual scene/camera gap (deferred) — expected |
+| z_scene probe residual | may not hit 0.5, but **lower is better** | per the user's read, residual is mostly incomplete-agent — a complete mask should push it well below the inpaint residual; a residual scene gap (if any) is deferred |
 | full reconstruction PSNR `D(F)` | ≈ emb_film (~40), no regression | recon not sacrificed |
 | mask-exterior PSNR `decode(z_scene)` | healthy | z_scene scene-sufficient (anti-collapse) |
 | sufficiency probe (EEF/object/future) | high | z_scene retains dynamics info (anti-collapse) |
@@ -205,7 +220,10 @@ dynamics (everything outside the agent region is F unchanged).
 - **(b) Domain signal not a single direction** → `ortho_proj` underfits; mitigation =
   top-k subspace or switch `removal_op=affine` (the swappable operator exists for
   exactly this).
-- **(c) Residual scene gap** → z_scene does not auto-align across domains; explicitly
-  deferred, not solved here.
+- **(c) Mask completeness is the central lever** (user's read of the inpaint
+  residual): if z_emb captures only the hand and leaves the sleeved forearm / partial
+  gripper, that residual agent stays in z_scene and keeps it separable. A genuine
+  residual scene gap (if any remains after a complete agent removal) is deferred, not
+  solved here — but is expected to be smaller than the inpaint diagnostic implied.
 - **(d) 4-channel capacity** for the agent code is small; if `L_agent_rec` cannot
   render the agent, increase z_emb capacity (decouple from the 4ch latent width).
