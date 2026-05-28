@@ -640,6 +640,15 @@ class MixedPlayEEFDataset(BaseImageDataset):
         item["domain_label"] = torch.tensor(
             1 if emb == "robot" else 0, dtype=torch.long,
         )
+        # Whole-arm agent mask for mask_subtract decomposition (v1 heuristic
+        # source; the model consumes batch["agent_mask"], so SAM2/precomputed
+        # masks are a drop-in via the same key). obs frames are (T,3,H,W) in [0,1].
+        from interactive_world_sim.algorithms.latent_decompose.agent_mask import (
+            whole_arm_mask,
+        )
+        primary = self.obs_keys[0]
+        frames = item["obs"][primary]                 # (T,3,H,W) float [0,1]
+        item["agent_mask"] = whole_arm_mask(frames, emb)  # (T,1,H,W) whole arm
         return item
 
     def get_validation_dataset(self) -> "MixedPlayEEFDataset":
