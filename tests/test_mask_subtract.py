@@ -46,3 +46,62 @@ def test_batched_and_temporal_shapes():
     batched = f.unsqueeze(0).unsqueeze(0).expand(2, 4, 3, 16, 16).contiguous()
     m = agent_mask_from_rgb(batched, "human")
     assert m.shape == (2, 4, 1, 16, 16)
+
+
+# --- mask_subtract modules ---
+from interactive_world_sim.algorithms.latent_decompose.mask_subtract import (
+    ortho_proj_remove,
+    MaskSubtractHead,
+    AgentReconHead,
+    supcon_anchor,
+)
+
+
+def test_ortho_proj_removes_the_direction():
+    B, C, H, W = 2, 4, 8, 8
+    Fm = torch.randn(B, C, H, W)
+    u = torch.randn(B, C * H * W)
+    u = u / u.norm(dim=-1, keepdim=True)
+    z = ortho_proj_remove(Fm, u)
+    assert z.shape == Fm.shape
+    comp = (z.flatten(1) * u).sum(-1)
+    assert torch.allclose(comp, torch.zeros(B), atol=1e-5)
+    z2 = ortho_proj_remove(z, u)             # idempotent → info preserved
+    assert torch.allclose(z, z2, atol=1e-5)
+
+
+def test_mask_subtract_head_shapes_and_detach():
+    B, C, Hl, Wl = 3, 4, 8, 8
+    head = MaskSubtractHead(c_scene=C, latent_hw=Hl, d_emb=16, removal="ortho_proj")
+    Fl = torch.randn(B, C, Hl, Wl, requires_grad=True)
+    mask_lat = torch.zeros(B, 1, Hl, Wl)
+    mask_lat[:, :, 2:5, 2:5] = 1.0
+    out = head(Fl, mask_lat)
+    assert out["z_emb_spatial"].shape == (B, C, Hl, Wl)
+    assert out["e"].shape == (B, 16)
+    assert out["z_scene"].shape == (B, C, Hl, Wl)
+    assert out["z_emb_spatial"][:, :, 0, 0].abs().max() == 0.0   # gated outside mask
+    # embodiment path detached from F: grad of e w.r.t. F is None
+    g = torch.autograd.grad(out["e"].sum(), Fl, retain_graph=True, allow_unused=True)[0]
+    assert g is None
+    # z_scene DOES carry grad to F
+    gz = torch.autograd.grad(out["z_scene"].sum(), Fl, allow_unused=True)[0]
+    assert gz is not None
+
+
+def test_agent_recon_head_upsamples_to_image():
+    head = AgentReconHead(c_scene=4, out_hw=32)
+    rgb = head(torch.randn(2, 4, 8, 8))
+    assert rgb.shape == (2, 3, 32, 32)
+    assert rgb.min() >= 0.0 and rgb.max() <= 1.0
+
+
+def test_supcon_anchor_lower_when_clustered_by_domain():
+    # same points (two tight clusters at ±2); labels that match the clusters give
+    # a LOW anchor loss, labels that split each cluster give a HIGH loss.
+    e = torch.tensor([[2.0, 0.0], [2.1, 0.1], [-2.0, 0.0], [-2.1, -0.1]])
+    dl_good = torch.tensor([0, 0, 1, 1])   # positives are the close points
+    dl_bad = torch.tensor([0, 1, 0, 1])    # positives are the far points
+    assert supcon_anchor(e, dl_good) < supcon_anchor(e, dl_bad)
+    # no positives (every sample a distinct domain) → 0 (guard against NaN)
+    assert float(supcon_anchor(torch.randn(4, 2), torch.tensor([0, 1, 2, 3]))) == 0.0
