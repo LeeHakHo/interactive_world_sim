@@ -47,29 +47,28 @@ def build_sam2_predictor(cfg_name: str, ckpt: str, device: str = "cuda"):
     return SAM2ImagePredictor(build_sam2(cfg_name, ckpt, device=device))
 
 
-def robot_gripper_mask(img_rgb: np.ndarray, dilate: int = 15,
-                       seed=None, dark_thr: int = 70) -> np.ndarray:
-    """robot 夹爪 mask：桌面 crop 上靠近 seed 的暗连通域（gripper 是浅色桌面上唯一的
-    黑色物体）。seed=(x,y) 来自 EEF 投影用于选对的连通域；无 seed 取最大暗域。
-    比点种 SAM2 稳——SAM2 会从夹爪点抓到整条连通 mount/盘子。返回 (H,W) bool。"""
+def robot_gripper_mask(img_rgb: np.ndarray, dilate: int = 11,
+                       seed=None, v_thr: int = 95, radius: int = 80) -> np.ndarray:
+    """robot 夹爪 mask：以 EEF 投影像素 seed 为中心，取「半径 radius 内 ∩ 暗(减蓝盘+红块)」。
+    用 seed 半径而非全图连通域，是因为桌面木纹暗线/阴影也 < 阈值（纯阈值/连通域会被噪点
+    和反光碎裂骗到）；夹爪一定在 EEF 投影附近，半径内的暗即夹爪+近臂。
+    无 seed 时退回最大暗连通域。返回 (H,W) bool。"""
     H, W = img_rgb.shape[:2]
-    gray = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY)
-    dark = (gray < dark_thr).astype(np.uint8)
-    dark = cv2.morphologyEx(dark, cv2.MORPH_CLOSE,
-                            cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)))
-    num, labels, stats, _ = cv2.connectedComponentsWithStats(dark)
-    if num <= 1:
-        return np.zeros((H, W), bool)
+    hsv = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2HSV)
+    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    blue = (h >= 90) & (h <= 135) & (s > 60)                    # 蓝盘
+    dark = (v < v_thr) & ~blue & ~red_cube_mask(img_rgb)        # 黑夹爪(含反光)，排除盘/块
     if seed is not None and 0 <= seed[0] < W and 0 <= seed[1] < H:
-        # 选与 seed 周围小圆盘重叠最多的暗连通域（比"质心最近"鲁棒：
-        # 避免 seed 旁的小噪声域质心更近而漏掉大夹爪域）
-        disk = np.zeros((H, W), np.uint8)
-        cv2.circle(disk, (int(seed[0]), int(seed[1])), 14, 1, -1)
-        overlaps = [int(((labels == i) & (disk > 0)).sum()) for i in range(1, num)]
-        idx = (1 + int(np.argmax(overlaps))) if max(overlaps) > 0 \
-            else 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        yy, xx = np.ogrid[:H, :W]
+        disk = (xx - seed[0]) ** 2 + (yy - seed[1]) ** 2 <= radius ** 2
+        m = (dark & disk).astype(np.uint8)
     else:
-        idx = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    m = (labels == idx)
+        d8 = dark.astype(np.uint8)
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(d8)
+        if num <= 1:
+            return np.zeros((H, W), bool)
+        m = (labels == 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))).astype(np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE,
+                         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9)))
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dilate, dilate))
-    return cv2.dilate(m.astype(np.uint8), k).astype(bool)
+    return cv2.dilate(m, k).astype(bool)
