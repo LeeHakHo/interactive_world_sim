@@ -96,7 +96,7 @@ def log_video(
         )
         logger.log(
             {
-                name: wandb.Video(video[i], fps=1, caption=captions, format="mp4"),
+                name: wandb.Video(video[i], fps=15, caption=captions, format="mp4"),
                 "trainer/global_step": step,
             }
         )

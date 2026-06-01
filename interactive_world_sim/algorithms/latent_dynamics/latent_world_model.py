@@ -397,42 +397,60 @@ class LatentWorldModel(BasePytorchAlgo):
         xs_pred = rearrange(xs_pred[T_hist:], "t b c h w -> b t c h w")
         return xs_pred
 
-    # Probe actions in normalized action space: [x, y, z, rx, ry, rz, gripper]
-    _PROBE_ACTIONS = {
-        "left":          [-1.0,  0.0,  0.0, 0.0, 0.0, 0.0,  0.0],
-        "right":         [ 1.0,  0.0,  0.0, 0.0, 0.0, 0.0,  0.0],
-        "up":            [ 0.0,  0.0,  1.0, 0.0, 0.0, 0.0,  0.0],
-        "down":          [ 0.0,  0.0, -1.0, 0.0, 0.0, 0.0,  0.0],
-        "gripper_open":  [ 0.0,  0.0,  0.0, 0.0, 0.0, 0.0, -1.0],
-        "gripper_close": [ 0.0,  0.0,  0.0, 0.0, 0.0, 0.0,  1.0],
+    # Probe key sequence: same delta mapping as play_single_eef_inference.py
+    # [dim, delta_in_raw_eef_space]  x/y/z step=0.01m, gripper step=0.04
+    _PROBE_KEY_DELTAS = {
+        "a": (1,  +0.01),   # y+
+        "d": (1,  -0.01),   # y-
+        "w": (0,  +0.01),   # x+
+        "s": (0,  -0.01),   # x-
+        "q": (2,  +0.01),   # z+
+        "e": (2,  -0.01),   # z-
+        "g": (6,  +0.04),   # gripper open
+        "h": (6,  -0.04),   # gripper close
     }
-    _PROBE_HORIZON = 100
+    _PROBE_KEY_SEQUENCE = "a" * 10 + "g" * 10 + "e" * 10 + "h" * 10 + \
+                          "q" * 10 + "w" * 10 + "s" * 20 + "d" * 10  # 90 steps
 
     @torch.no_grad()
-    def _probe_rollout_sequential(self, z_0: torch.Tensor, horizon: int = 10) -> torch.Tensor:
-        """Roll out dynamics with all probe actions sequentially in one continuous video.
+    def _probe_rollout_sequential(self, z_0: torch.Tensor, initial_action_norm: torch.Tensor, horizon: int = 10) -> torch.Tensor:
+        """Roll out dynamics using the probe key sequence starting from initial_action_norm.
 
-        Order: left → right → up → down → gripper_open → gripper_close,
-        each held for _PROBE_HORIZON steps.
-        Returns z_seq: (B, N_actions * _PROBE_HORIZON + 1, C, H, W) including z_0.
+        Applies EEF deltas in raw space (same as inference script), normalizes, feeds to dynamics.
+        Returns z_seq: (B, 91, C, H, W) including z_0.
         """
         B = z_0.shape[0]
+
+        # denormalize first action to get raw EEF state (use first batch item)
+        eef_raw = self.normalizer["action"].unnormalize(initial_action_norm[:1])  # (1, 7)
+        eef_raw = eef_raw[0].clone()  # (7,)
+
+        # build action sequence from key sequence
+        actions_raw = []
+        for key in self._PROBE_KEY_SEQUENCE:
+            dim, delta = self._PROBE_KEY_DELTAS[key]
+            eef_raw = eef_raw.clone()
+            eef_raw[dim] = eef_raw[dim] + delta
+            actions_raw.append(eef_raw.clone())
+
+        actions_raw = torch.stack(actions_raw, dim=0)  # (90, 7)
+        actions_norm = self.normalizer["action"].normalize(actions_raw)  # (90, 7)
+        actions_norm = actions_norm.unsqueeze(0).expand(B, -1, -1)  # (B, 90, 7)
+
+        n_steps = len(self._PROBE_KEY_SEQUENCE)
         z_seq_ls = []
         z_last = z_0.clone()
-        for action_norm in self._PROBE_ACTIONS.values():
-            a = torch.tensor(action_norm, dtype=torch.float32, device=self.device)
-            action_seq = a.unsqueeze(0).unsqueeze(0).expand(B, self._PROBE_HORIZON, -1)
-            for i in range(0, self._PROBE_HORIZON, horizon):
-                chunk = action_seq[:, i : i + horizon]
-                chunk_size = chunk.shape[1]
-                if chunk_size < horizon:
-                    chunk = F.pad(chunk, (0, 0, 0, horizon - chunk_size), mode="replicate")
-                z_pred = self.dynamics_forward(z_last[:, None], chunk)
-                z_pred = z_pred[:, :chunk_size]
-                z_seq_ls.append(z_pred)
-                z_last = z_pred[:, -1].clone()
+        for i in range(0, n_steps, horizon):
+            chunk = actions_norm[:, i : i + horizon]
+            chunk_size = chunk.shape[1]
+            if chunk_size < horizon:
+                chunk = F.pad(chunk, (0, 0, 0, horizon - chunk_size), mode="replicate")
+            z_pred = self.dynamics_forward(z_last[:, None], chunk)
+            z_pred = z_pred[:, :chunk_size]
+            z_seq_ls.append(z_pred)
+            z_last = z_pred[:, -1].clone()
         z_seq = torch.cat(z_seq_ls, 1)
-        return torch.cat([z_0.unsqueeze(1), z_seq], 1)  # (B, T+1, C, H, W)
+        return torch.cat([z_0.unsqueeze(1), z_seq], 1)  # (B, 91, C, H, W)
 
     def validation_step(
         self, batch: dict, batch_idx: int, namespace: str = "validation"
@@ -540,7 +558,7 @@ class LatentWorldModel(BasePytorchAlgo):
         ):
             z_0 = z_gt[:, 0]
             probe_horizon = z_gt.shape[1]
-            z_probe = self._probe_rollout_sequential(z_0, horizon=probe_horizon)  # (B, T+1, C, H, W)
+            z_probe = self._probe_rollout_sequential(z_0, action[:, 0], horizon=probe_horizon)  # (B, 91, C, H, W)
             z_probe_flat = rearrange(z_probe, "b t c h w -> (b t) c h w")
             xs_probe = render_img_cm(
                 self, z_probe_flat, obs.shape[-1],
