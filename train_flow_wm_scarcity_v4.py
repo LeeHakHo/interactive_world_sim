@@ -88,3 +88,16 @@ def inject_state_noise(hist, std, generator):
     # additive Gaussian noise on history object points (normalized coords); cheap DAgger
     noise = torch.randn(hist.shape, generator=generator, device=hist.device) * std
     return hist + noise
+
+
+def multi_step_consistency(model, tr, eef3, g):
+    # tr (B,L,P,2) -> (cons_pred, cons_tgt) each (B,P,overlap,2), overlap = L-2K
+    B = tr.shape[0]
+    hist1 = tr[:, :K].permute(0, 2, 1, 3)                       # (B,P,K,2)
+    pred1, _ = model(hist1, eef3, g)                            # (B,P,F,2) frames K..L-1
+    hist2 = pred1[:, :, :K, :]                                  # predicted frames K..2K-1
+    pred2, _ = model(hist2, eef3, g)                            # frames 2K..2K+F-1 (own-feedback)
+    overlap = L - 2 * K                                         # frames 2K..L-1 still have GT
+    cons_pred = pred2[:, :, :overlap, :]
+    cons_tgt = tr[:, 2 * K:].permute(0, 2, 1, 3)               # (B,P,overlap,2)
+    return cons_pred, cons_tgt

@@ -87,3 +87,15 @@ def test_inject_state_noise_shape_and_determinism():
     assert a.abs().mean() > 0                          # noise actually added
     # std in the right ballpark (normalized coords)
     assert 0.3 * v4.NOISE_STD < a.std().item() < 3 * v4.NOISE_STD
+
+
+def test_multi_step_consistency_shape():
+    B = 4
+    tr = torch.randn(B, v4.L, v4.P, 2)            # full clip (B,L,P,2)
+    eef3 = torch.randn(B, v4.L, 3, 2)
+    g = torch.rand(B, v4.L)
+    m = v4.FlowWMThick(v4.P, thin=False)
+    cons_pred, cons_tgt = v4.multi_step_consistency(m, tr, eef3, g)
+    overlap = v4.L - 2 * v4.K                       # 16 - 8 = 8
+    assert cons_pred.shape == (B, v4.P, overlap, 2)
+    assert cons_tgt.shape == (B, v4.P, overlap, 2)
