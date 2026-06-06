@@ -346,3 +346,32 @@ consistency)。代码 `train_flow_wm_scarcity_v4.py`(`--thin`复现v3;`--phase 1
 (不需contact/grasp/域标签/准入闸门)。thick latent对漂移无用,仅~10%绝对精度bonus(代价复杂度);去留取决于
 Phase-2跨域是否帮human-transfer(未做)。⚠️抗漂移牺牲开环精度(3.94→4.54),rollout场景可接受。
 结果文件:`outputs/flow_wm_v4/{probe_cg,phase1_robot_drift,phase1_ablation,phase1_horizon}/summary.txt`。
+
+### §6.1 CORRECTION (5-seed long-rollout + Phase-2) — supersedes §6 conclusion
+
+§6 above drew tentative conclusions from short/single-seed runs. Rigorous follow-up
+(5-seed long 36-frame rollout + 5-seed Phase-2) REVERSED two of them. Full organized
+results: `outputs/flow_wm_v4/REPORT/` (README + per-topic folders).
+
+REVERSALS:
+- **"anti-drift training is the drift fix" → FALSE on long rollout.** It only helps the
+  short 1-hop chained metric it trains for; on 5-seed long rollout it HURTS every metric
+  (thin→thin+antidrift: dyn_ADE 5.98→7.42, static-cube hallucination 46.8→68.3px doubled).
+- **"the contact-gate is useless" → it DAMPS cube hallucination.** Degenerate gate
+  (α≈const 0.35, because contact is a weak 2D proximity proxy — NO wrist-cam/depth) acts as
+  a blunt motion damper: least static hallucination (35.6 vs thin 46.8 / thin+ad 68.3) and
+  best static ADE. Cost: under-tracks genuine fast motion (dyn_ADE 7.22 vs thin 5.98).
+
+STILL TRUE:
+- Cube hallucination root cause = motion-biased data (v3 MOVE_MIN dropped all static cubes).
+  Data fix (`flow_ds_v4`, 36% static) cut static hallucination ~25% (12.6→9.5px) but the
+  gate stayed degenerate (weak 2D contact ceiling).
+
+NEW (Phase-2, the headline positive): **human demos strongly help a data-scarce robot WM**
+— N=50 ADE 13.2→5.9 (thin) / 10.9→5.6 (thick) ≈ 2.3×. Thick gives best ABSOLUTE robot+human
+ADE at every N (not harmful to transfer). The object-flow cross-embodiment pivot is validated.
+
+WINNER for the rollout cube-drift symptom: **contact-gate (thick) + flow_ds_v4 data,
+anti-drift OFF**. A principled fix needs real contact/depth (wrist-cam=robot-only→can't
+enter shared latent; 3D=single-view infeasible); next idea = denser AMPLIFY-style flow.
+Action-replay videos: `outputs/flow_wm_v4/REPORT/4_rollout_videos/`.
