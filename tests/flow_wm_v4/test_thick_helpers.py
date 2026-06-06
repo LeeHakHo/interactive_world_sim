@@ -99,3 +99,17 @@ def test_multi_step_consistency_shape():
     overlap = v4.L - 2 * v4.K                       # 16 - 8 = 8
     assert cons_pred.shape == (B, v4.P, overlap, 2)
     assert cons_tgt.shape == (B, v4.P, overlap, 2)
+
+
+def test_rollout_drift_static():
+    B, Pn = 10, v4.P
+    # GT: all static (centroid never moves); pred: half static, half drifting
+    gt = torch.zeros(B, v4.F, Pn, 2)
+    pred = torch.zeros(B, v4.F, Pn, 2)
+    pred[5:, :, :, 0] = torch.linspace(0, 0.1, v4.F)[None, :, None]  # drift in last 5
+    drift, n_static = v4.rollout_drift_static(pred, gt, tau=v4.STATIC_TAU)
+    assert n_static == B                              # all GT clips are static
+    assert drift > 0                                  # drifting preds counted
+    # a fully-static pred -> ~0 drift
+    drift0, _ = v4.rollout_drift_static(torch.zeros_like(gt), gt, tau=v4.STATIC_TAU)
+    assert drift0 < 1e-4

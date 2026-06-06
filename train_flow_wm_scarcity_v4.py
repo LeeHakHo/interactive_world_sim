@@ -101,3 +101,21 @@ def multi_step_consistency(model, tr, eef3, g):
     cons_pred = pred2[:, :, :overlap, :]
     cons_tgt = tr[:, 2 * K:].permute(0, 2, 1, 3)               # (B,P,overlap,2)
     return cons_pred, cons_tgt
+
+
+def _centroid_path_len(seq):
+    # seq (B,T,P,2) -> (B,) total centroid path length in normalized coords
+    c = seq.mean(2)                                            # (B,T,2)
+    return torch.linalg.norm(torch.diff(c, dim=1), dim=-1).sum(1)
+
+
+def rollout_drift_static(pred, gt, tau):
+    # pred,gt (B,F,P,2); restrict to GT-static clips, report mean predicted centroid
+    # path length there, in pixels (x224). Returns (drift_px, n_static).
+    gt_len = _centroid_path_len(gt)
+    static = gt_len < tau
+    n = int(static.sum().item())
+    if n == 0:
+        return 0.0, 0
+    drift = (_centroid_path_len(pred)[static].mean().item()) * 224.0
+    return drift, n
