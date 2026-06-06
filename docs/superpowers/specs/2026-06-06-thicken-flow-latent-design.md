@@ -49,23 +49,41 @@ contains the **future 12 frames of EEF** (it is the action conditioning), so per
 step contact can be computed against the known future EEF.
 
 ### 3.1 Contact / proximity feature `c`
-Normalized 224-coord distances between object points (or the object centroid) and the
-3 EEF points, at the anchor frame AND at each future step (future EEF is known). Same
-coordinate scale as flow. Captures "is the agent near/touching the object".
+Distances between object points (or the object centroid) and the EEF tips, at the anchor
+frame AND at each future step (future EEF is known). **Standardized per-domain (z-score:
+subtract per-domain mean, divide by per-domain std, a single scalar pair per domain)** so
+the distribution is domain-invariant. Captures "is the agent near/touching the object".
 
 ### 3.2 Grasp openness `g`
 `g = ‖eef3[:, 1] - eef3[:, 2]‖` — **structurally identical across domains**:
 - human: `eef3 = [wrist(0), thumb_tip(4), index_tip(8)]` → thumb–index pinch distance.
 - robot: `eef3 = [base, jaw+, jaw−]` → jaw separation = gripper width.
 
-Normalize **per-domain to [0, 1]** (scale alignment only — this is preprocessing, it does
-NOT inject domain-discriminative information; both end as "how open").
+**Standardize per-domain (z-score), NOT min-max [0,1].** Min-max was tried first and FAILED
+the §3.3 admission probe (see below): grasp min-max alone separated the domains at 0.773.
+Per-domain z-score is a monotone affine map (within-domain `corr(g_raw, g_z)=1.000` → zero
+loss of the open/close signal) that drops grasp separability to ~0.60 and the combined
+`[c,g]` to ~0.56. z-score requires the per-sample domain label, used ONLY to pick
+normalization constants that EQUALIZE the domains — it removes domain identity, it does not
+let the model exploit it (analogous to per-domain BatchNorm).
 
-### 3.3 Admission gate (hard requirement)
-Before wiring `[c, g]` into the model, run a **converged LogReg** (sklearn, large sample,
-held-out split — per `probe_must_converge` memory) on `[c, g]` to confirm probe ≈ 0.5.
-If it separates the domains, the offending channel is re-normalized or dropped. No channel
-enters the shared latent until it passes this body-check.
+### 3.3 Admission gate (hard requirement) — RESULT
+Before wiring `[c, g]` into the model, run a **converged LogReg** (sklearn `max_iter=2000`,
+N=4043, held-out 30%, stratified — per `probe_must_converge` memory) on the descriptor and
+confirm separability is near the flow calibration baseline (object net-displacement probes
+at 0.542, baseline 0.519).
+
+**Measured (2026-06-06):**
+- Raw `[d_raw, g_minmax]` (first attempt) = **0.779 → FAIL** (grasp min-max is the main
+  leaker at 0.773; raw contact distance 0.680).
+- Domain-label-free object-scale normalization = **0.667–0.946 → FAIL (worse)** (object
+  scale itself differs by domain, so dividing by it injects domain info).
+- **Per-domain z-score `[d_z, g_z]` (scalar mean/std per domain) = 0.561 → PASS**
+  (gap +0.041 over baseline, ≈ flow calib 0.542). This is the adopted normalization.
+
+The `cg_descriptor` used by the admission probe must standardize the same way the model
+feeds the signals (z-scored `d` and `g`), so the probe measures what actually enters the
+shared latent.
 
 ## 4. Contact-gated motion head (treats root cause #1: untouched drift)
 

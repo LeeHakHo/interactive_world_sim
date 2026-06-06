@@ -808,6 +808,116 @@ Append a thick-latent section to `FLOW_WM_REPORT.md` (drift fixed? human-helps p
 
 ---
 
+---
+
+## AMENDMENT (2026-06-06): Task 9 admission gate FAILED → z-score refactor
+
+Task 9's probe FAILED: raw `[d_raw, g_minmax]` separated domains at **0.779** (baseline
+0.519). Diagnosis (converged LogReg, N=4043, held-out 30%): grasp min-max is the main
+leaker (0.773); raw contact distance 0.680; domain-label-free object-scale normalization is
+worse (0.667–0.946). **Per-domain z-score (scalar mean/std per domain) of BOTH signals
+drops it to 0.561 (PASS, ≈ flow calib 0.542), with within-domain corr(g_raw,g_z)=1.000 (no
+signal loss).** Adopted. The model's `forward` must therefore take a per-sample domain id,
+used ONLY to standardize (removes, not exploits, domain identity).
+
+### Task 12: z-score re-normalization (supersedes the min-max bits of Tasks 2/3/8/9)
+
+**Files:** Modify `train_flow_wm_scarcity_v4.py`, `tests/flow_wm_v4/test_thick_helpers.py`.
+
+- [ ] **Step 1: Change grasp normalization from min-max to per-domain z-score.**
+Replace `fit_grasp_stats` / `normalize_grasp` so stats are per-domain `(mean, std)` and
+normalization is `(g - mean) / (std + 1e-6)` (no clamp):
+```python
+def fit_grasp_stats(g_raw, domain):
+    # per-domain (mean, std) scalar over flattened grasp values
+    g_flat = g_raw.reshape(len(g_raw), -1) if g_raw.dim() > 1 else g_raw[:, None]
+    stats = {}
+    for d in domain.unique().tolist():
+        v = g_flat[domain == d].reshape(-1)
+        stats[int(d)] = (v.mean().item(), v.std().item() + 1e-6)
+    return stats
+
+
+def normalize_grasp(g_raw, domain, stats):
+    out = torch.zeros_like(g_raw)
+    for d, (mu, sd) in stats.items():
+        m = domain == d
+        out[m] = (g_raw[m] - mu) / sd
+    return out
+```
+Update `test_normalize_grasp_per_domain_range_and_scale` → `test_normalize_grasp_per_domain_zscore`:
+each domain's standardized values should have mean ≈ 0 and std ≈ 1.
+```python
+def test_normalize_grasp_per_domain_zscore():
+    g_raw = torch.cat([torch.linspace(0, 0.08, 50), torch.linspace(0, 0.5, 50)])
+    dom = torch.cat([torch.ones(50, dtype=torch.long), torch.zeros(50, dtype=torch.long)])
+    stats = v4.fit_grasp_stats(g_raw, dom)
+    out = v4.normalize_grasp(g_raw, dom, stats)
+    for d in (0, 1):
+        assert abs(out[dom == d].mean().item()) < 1e-4
+        assert abs(out[dom == d].std().item() - 1.0) < 0.05
+```
+
+- [ ] **Step 2: Add per-domain contact-distance stats fitting.** Distances must be fit on
+the SAME quantity the gate uses (object-point anchor → 2 future tips). Add:
+```python
+def fit_dist_stats(tracks, eef3, domain):
+    # per-domain (mean,std) of contact distances (object pts at frame K-1 -> future tips)
+    anchor = tracks[:, K - 1]                                    # (N,P,2)
+    feat = _raw_contact_dist(anchor, eef3)                       # (N,P,F,2)
+    stats = {}
+    for d in domain.unique().tolist():
+        v = feat[domain == d].reshape(-1)
+        stats[int(d)] = (v.mean().item(), v.std().item() + 1e-6)
+    return stats
+
+
+def _raw_contact_dist(anchor, eef3):
+    B, Pn = anchor.shape[:2]
+    tips = eef3[:, K:, 1:3, :]                                   # (B,F,2,2)
+    return torch.linalg.norm(anchor[:, :, None, None, :] - tips[:, None], dim=-1)  # (B,P,F,2)
+```
+
+- [ ] **Step 3: Standardize distances inside `contact_gate_features`; thread `dom`+stats.**
+```python
+def contact_gate_features(anchor, eef3, g, dom, dist_stats):
+    # anchor (B,P,2), eef3 (B,L,3,2), g (B,L) already z-scored, dom (B,) -> (B,P,F,3)
+    B, Pn = anchor.shape[:2]
+    d = _raw_contact_dist(anchor, eef3)                          # (B,P,F,2)
+    mu = torch.tensor([dist_stats[int(x)][0] for x in dom.tolist()], device=d.device)
+    sd = torch.tensor([dist_stats[int(x)][1] for x in dom.tolist()], device=d.device)
+    d = (d - mu[:, None, None, None]) / sd[:, None, None, None]  # per-domain z-score
+    gf = g[:, K:][:, None, :].expand(B, Pn, F)                   # (B,P,F)
+    return torch.cat([d, gf[..., None]], -1)                     # (B,P,F,3)
+```
+Update `FlowWMThick.forward` signature to `forward(self, hist, eef3, g, dom)`; in the thick
+branch call `contact_gate_features(anchor, eef3, g, dom, self.dist_stats)`. Add
+`self.dist_stats = None` in `__init__` (set by `train_eval`). Thin path ignores `dom`.
+
+- [ ] **Step 4: Thread `dom` through `multi_step_consistency` and `train_eval`.**
+`multi_step_consistency(model, tr, eef3, g, dom)` passes `dom` to both `model(...)` calls.
+In `train_eval`: after building the model, `m.dist_stats = fit_dist_stats(tr, eef3, dom)`;
+pass `dom[b]` (moved to device) into every `m(...)` and `multi_step_consistency(...)` call.
+
+- [ ] **Step 5: Update the three forward-calling tests** to pass a `dom` argument
+(`dom = torch.ones(B, dtype=torch.long)`), and set `m.dist_stats = v4.fit_dist_stats(...)`
+before calling thick forward. The gate-static invariant test still holds (forcing the gate
+closed is independent of normalization).
+
+- [ ] **Step 6: Update `cg_descriptor` + `run_probe_cg`** so the probe measures the
+standardized signals the model actually consumes (z-scored `d` and z-scored `g`), using
+`fit_dist_stats`/`fit_grasp_stats`. Keep the same PASS/FAIL verdict logic.
+
+- [ ] **Step 7: Run full suite** `python -m pytest tests/flow_wm_v4/test_thick_helpers.py -q`
+(expect all pass) **then re-run the admission probe** `python train_flow_wm_scarcity_v4.py
+--probe-cg` (use the `iws` conda env python for sklearn). **Expect acc ≈ 0.56, verdict PASS.**
+Report the verbatim probe output + summary.txt path.
+
+- [ ] **Step 8: Commit** (only the 2 files; no Co-Authored-By):
+`git commit -m "fix(flow-v4): per-domain z-score normalization for [c,g] (admission gate)"`
+
+Only after this PASSES does Phase-1 (Task 10) proceed.
+
 ## Self-Review
 
 **1. Spec coverage:**
