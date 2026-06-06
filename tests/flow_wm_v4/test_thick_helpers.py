@@ -113,3 +113,19 @@ def test_rollout_drift_static():
     # a fully-static pred -> ~0 drift
     drift0, _ = v4.rollout_drift_static(torch.zeros_like(gt), gt, tau=v4.STATIC_TAU)
     assert drift0 < 1e-4
+
+
+def test_train_eval_smoke_tiny(tmp_path):
+    # tiny synthetic dataset -> train_eval runs and returns finite ADE/FDE/drift
+    torch.manual_seed(0)
+    N = 40
+    tr = torch.rand(N, v4.L, v4.P, 2) * 0.5 + 0.25
+    vis = torch.ones(N, v4.L, v4.P)
+    eef3 = torch.rand(N, v4.L, 3, 2)
+    dom = torch.ones(N, dtype=torch.long)            # robot-only smoke
+    gstats = v4.fit_grasp_stats(v4.grasp_openness(eef3), dom)
+    out = v4.train_eval(tr, vis, eef3, dom, gstats,
+                        train_idx=torch.arange(0, 30), test_idx=torch.arange(30, 40),
+                        thin=False, seed=0, epochs=2)
+    for k in ("ade", "fde", "drift"):
+        assert k in out and out[k] == out[k]         # finite (not NaN)

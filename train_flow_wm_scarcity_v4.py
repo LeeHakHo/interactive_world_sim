@@ -119,3 +119,64 @@ def rollout_drift_static(pred, gt, tau):
         return 0.0, 0
     drift = (_centroid_path_len(pred)[static].mean().item()) * 224.0
     return drift, n
+
+
+def load():
+    z = np.load(DS)
+    return (torch.from_numpy(z["tracks"]).float(), torch.from_numpy(z["vis"]).float(),
+            torch.from_numpy(z["eef3"]).float(), torch.from_numpy(z["domain"]).long(),
+            torch.from_numpy(z["vid"]).long())
+
+
+def _masked_mse(pred, fut, w):
+    return ((pred - fut) ** 2 * w).sum() / (w.sum() + 1e-6)
+
+
+def train_eval(tr, vis, eef3, dom, gstats, train_idx, test_idx, thin, seed, epochs=EPOCHS):
+    torch.manual_seed(seed)
+    g_all = normalize_grasp(grasp_openness(eef3), dom, gstats)          # (N,L)
+    m = FlowWMThick(P, thin=thin).to(device)
+    opt = torch.optim.AdamW(m.parameters(), lr=LR)
+    gen = torch.Generator().manual_seed(seed)
+    ngen = torch.Generator(device=device).manual_seed(seed + 777)
+
+    def batches(idx, train):
+        idx = idx[torch.randperm(len(idx), generator=gen)] if train else idx
+        for i in range(0, len(idx), BS):
+            yield idx[i:i + BS]
+
+    for ep in range(epochs):
+        m.train()
+        for b in batches(train_idx, True):
+            h = tr[b, :K].permute(0, 2, 1, 3).to(device)               # (B,P,K,2)
+            if not thin:
+                h = inject_state_noise(h, NOISE_STD, ngen)
+            fut = tr[b, K:].permute(0, 2, 1, 3).to(device)             # (B,P,F,2)
+            ef = eef3[b].to(device); gg = g_all[b].to(device)
+            hv = vis[b, :K].to(device); fv = vis[b, K:].to(device)
+            w = (fv.permute(0, 2, 1) * hv[:, -1:].permute(0, 2, 1))[..., None]
+            pred, alpha = m(h, ef, gg)
+            loss = _masked_mse(pred, fut, w)
+            if not thin:
+                loss = loss + LAMBDA_GATE * alpha.abs().mean()
+                cp, ct = multi_step_consistency(m, tr[b].to(device), ef, gg)
+                wc = fv[:, K:].permute(0, 2, 1)[..., None]             # (B,P,overlap,1)
+                loss = loss + LAMBDA_CONSIST * _masked_mse(cp, ct, wc)
+            opt.zero_grad(); loss.backward(); opt.step()
+
+    m.eval(); an = ad = fn = fd = 0.0; preds = []; futs = []
+    with torch.no_grad():
+        for b in batches(test_idx, False):
+            h = tr[b, :K].permute(0, 2, 1, 3).to(device)
+            fut = tr[b, K:].permute(0, 2, 1, 3).to(device)
+            ef = eef3[b].to(device); gg = g_all[b].to(device)
+            hv = vis[b, :K].to(device); fv = vis[b, K:].to(device)
+            w = fv.permute(0, 2, 1) * hv[:, -1:].permute(0, 2, 1)
+            pred, _ = m(h, ef, gg)
+            err = torch.linalg.norm(pred - fut, dim=-1) * 224.0
+            an += (err * w).sum().item(); ad += w.sum().item()
+            fn += (err[..., -1] * w[..., -1]).sum().item(); fd += w[..., -1].sum().item()
+            preds.append(pred.permute(0, 2, 1, 3).cpu()); futs.append(fut.permute(0, 2, 1, 3).cpu())
+    pred_all = torch.cat(preds); fut_all = torch.cat(futs)              # (Ntest,F,P,2)
+    drift, n_static = rollout_drift_static(pred_all, fut_all, STATIC_TAU)
+    return {"ade": an / ad, "fde": fn / fd, "drift": drift, "n_static": n_static}
