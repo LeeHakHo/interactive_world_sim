@@ -31,7 +31,7 @@ import train_flow_wm_scarcity_v4 as v4
 import gen_flow_dataset_v4 as g4
 
 SMOKE = os.environ.get("SMOKE", "0") == "1"
-OUT = "outputs/flow_wm_v4/viz_indist"; os.makedirs(OUT, exist_ok=True)
+OUT = "outputs/flow_wm_v4/REPORT/4_rollout_videos"; os.makedirs(OUT, exist_ok=True)
 DEC = "outputs/flow_wm/flow_cond_decoder__densev4e_robot__armmask_gmask/decoder_flowcond_gmask.pt"
 LAT, IMG = D.LAT_RES, D.IMG_RES
 device = v4.device
@@ -57,8 +57,10 @@ def train_v4_models():
     dom = torch.from_numpy(z["domain"]).long(); vid = torch.from_numpy(z["vid"]).long()
     gs = v4.fit_grasp_stats(v4.grasp_openness(eef3), dom)
     rob = torch.where((dom == 1) & (vid != v4.TEST_ROBOT_VID))[0]
+    # WINNER per 5-seed long-rollout: thick-antidrift (contact-gate ON, anti-drift OFF) =
+    # least cube hallucination. Contrast with plain thin baseline.
     _, m_thick = v4.train_eval(tr, vis, eef3, dom, gs, rob, rob[:2],
-                               thin=False, seed=0, antidrift=True, return_model=True)
+                               thin=False, seed=0, antidrift=False, return_model=True)
     _, m_thin = v4.train_eval(tr, vis, eef3, dom, gs, rob, rob[:2],
                               thin=True, seed=0, antidrift=False, return_model=True)
     m_thick.eval(); m_thin.eval()
@@ -131,8 +133,11 @@ def build_indist_seqs(m_dummy=None):
         q = np.stack([xs[sel], ys[sel]], 1).astype(np.float32)
         trk, vs = g4.track(ct, fr224, q, device)          # (Lseq,P,2),(Lseq,P)
         c = trk.mean(1)
-        motion = float(np.linalg.norm(np.diff(c, axis=0), axis=1).sum())  # px over Lseq
-        tag = "dynamic" if motion >= g4.MOVE_THRESH else "static"
+        motion = float(np.linalg.norm(np.diff(c, axis=0), axis=1).sum())  # px over full Lseq (display)
+        # classify by the ROLLOUT window (frames K..Lseq-1) so "static" = cube barely moves
+        # during the part we actually roll out (Lseq*6px-over-16 doesn't scale to 40 frames).
+        fut_motion = float(np.linalg.norm(np.diff(trk[K:].mean(1), axis=0), axis=1).sum())
+        tag = "static" if fut_motion < 18.0 else "dynamic"
         d = dict(
             idxs=idxs,
             frames128=np.stack([c128[i] for i in idxs]).astype(np.uint8),   # (Lseq,128,128,3)
@@ -264,7 +269,7 @@ def main():
 
     lines = [f"v4 IN-DISTRIBUTION (S=3) pixel rollout replay | NSEQ={NSEQ} Hroll={Hroll} hmax={hmax}",
              "data=flow_ds_v4.npz (static-inclusive, RETRAINED) | renderer=densev4e ③ (flow+g-mask)",
-             "② thick=full(contact-gate+grasp+antidrift) thin=baseline | held-out vid=12 (play_robot_3)",
+             "② thick=contact-gate (no anti-drift, WINNER: least hallucination) | thin=baseline | held-out vid=12",
              "GT cube motion = GT centroid path over Lseq (px) | ADE = rollout ADE px (visible pts)",
              f"{'seq':>3} | {'tag':>7} | {'GTmotion':>8} | {'ADE_thick':>9} | {'ADE_thin':>9} | {'drift_thick':>11} | {'drift_thin':>10}"]
     static_notes = []
