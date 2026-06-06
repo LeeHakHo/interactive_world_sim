@@ -6,7 +6,7 @@ docs/superpowers/specs/2026-06-06-thicken-flow-latent-design.md.
 """
 import argparse, os, numpy as np, torch, torch.nn as nn
 
-DS = "outputs/flow_dataset/flow_ds_v3.npz"
+DS = os.environ.get("FLOW_DS", "outputs/flow_dataset/flow_ds_v3.npz")
 K, F, L, Dm, P = 4, 12, 16, 128, 48
 EPOCHS, BS, LR = 60, 128, 3e-4
 TEST_ROBOT_VID = 12
