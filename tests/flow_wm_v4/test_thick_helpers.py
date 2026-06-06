@@ -18,3 +18,23 @@ def test_thin_forward_shape():
     pred, alpha = m(hist, eef3, g)
     assert pred.shape == (B, v4.P, v4.F, 2)
     assert alpha is None  # thin path has no gate
+
+
+def test_grasp_openness_known_distance():
+    eef3 = torch.zeros(2, v4.L, 3, 2)
+    eef3[:, :, 1, 0] = 0.3   # tip1 x
+    eef3[:, :, 2, 0] = -0.1  # tip2 x  -> distance 0.4
+    g = v4.grasp_openness(eef3)
+    assert g.shape == (2, v4.L)
+    assert torch.allclose(g, torch.full((2, v4.L), 0.4), atol=1e-5)
+
+
+def test_normalize_grasp_per_domain_range_and_scale():
+    # robot grasp ~[0,0.08], human pinch ~[0,0.5]; per-domain norm must map both to [0,1]
+    g_raw = torch.cat([torch.linspace(0, 0.08, 50), torch.linspace(0, 0.5, 50)])
+    dom = torch.cat([torch.ones(50, dtype=torch.long), torch.zeros(50, dtype=torch.long)])
+    stats = v4.fit_grasp_stats(g_raw, dom)
+    out = v4.normalize_grasp(g_raw, dom, stats)
+    assert out.min() >= 0.0 and out.max() <= 1.0
+    # both domains should span most of [0,1] after per-domain normalization
+    assert out[dom == 1].max() > 0.9 and out[dom == 0].max() > 0.9

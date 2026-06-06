@@ -54,3 +54,26 @@ class FlowWMThick(nn.Module):
 # --- pure helpers (filled in later tasks) ---
 def contact_gate_features(anchor, eef3, g):
     raise NotImplementedError  # Task 3
+
+
+def grasp_openness(eef3):
+    # eef3 (...,L,3,2) -> (...,L): distance between the two tips (points 1,2)
+    return torch.linalg.norm(eef3[..., 1, :] - eef3[..., 2, :], dim=-1)
+
+
+def fit_grasp_stats(g_raw, domain):
+    # per-domain p5/p95 over flattened grasp values
+    g_flat = g_raw.reshape(len(g_raw), -1) if g_raw.dim() > 1 else g_raw[:, None]
+    stats = {}
+    for d in domain.unique().tolist():
+        v = g_flat[domain == d].reshape(-1)
+        stats[int(d)] = (torch.quantile(v, 0.05).item(), torch.quantile(v, 0.95).item())
+    return stats
+
+
+def normalize_grasp(g_raw, domain, stats):
+    out = torch.zeros_like(g_raw)
+    for d, (lo, hi) in stats.items():
+        m = domain == d
+        out[m] = ((g_raw[m] - lo) / (hi - lo + 1e-6)).clamp(0.0, 1.0)
+    return out
