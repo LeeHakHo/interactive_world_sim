@@ -318,3 +318,31 @@ curve+gain `outputs/flow_wm/scheduled_sampling/scheduled_sampling.png`.
 - pixel rollout (§5): `eval_pixel_rollout.py` (densev3, superseded), `eval_pixel_rollout_v4e.py` (densev4e, current)
 - agent blur diagnostics: `outputs/flow_wm/{diag_blur_source,diag_sharpen_samples,diag_gmask_error_structure,diag_mask_sensitivity}/`
 - experiment log: `outputs/m0_runs/EXPERIMENT_LOG.md`
+
+---
+
+## §6. Thick dynamic latent vs anti-drift training (2026-06-06)
+
+**Question:** rollout 的 "cube 乱动" 是因为 ② 的 dynamic latent 太薄(只48物体点+3EEF点)吗?试了加厚 latent:
+contact-gate(EEF↔物体接触门控运动) + grasp token + 抗漂移训练(state-noise injection + multi-step
+consistency)。代码 `train_flow_wm_scarcity_v4.py`(`--thin`复现v3;`--phase 1/3/4`),spec/plan 在
+`docs/superpowers/{specs,plans}/2026-06-06-thicken-flow-latent*`,13个TDD单测 `tests/flow_wm_v4/`。
+
+**判决(robot-only,held-out vid=12,SEEDS=5,EPOCHS=60):**
+1. **准入闸门**:进共享latent的信号必须近域不变。contact/grasp 用 min-max[0,1] 归一化泄漏域
+   (LogReg acc 0.779 FAIL,grasp主泄漏)。改 **per-domain z-score** → 0.561 PASS(≈flow净位移校准0.542),
+   不损物理信息(within-domain corr=1.0)。需per-sample域标签做标准化。
+2. **开环单步drift指标失效**:thin 16.95 vs thick 17.04 无区别——数据被`MOVE_MIN`过滤成几乎无静止clip,
+   且开环测不到自回归症状。
+3. **链式自回归指标**:compounding ratio(ADE_chain/ADE_open) thin **1.506** → thick **1.085**。
+4. **2×2消融(架构×训练)归因**:抗漂移训练是compounding解药(thin→+antidrift 1.506→1.071);
+   **latent加厚对漂移几乎无用**(thin→thick-antidrift 1.506→1.549,链式ADE 5.89=5.89)。门退化成常数缩放
+   (α静止0.334≈运动0.349)——乘性门α·raw+自由head纯L1下退化。
+5. **更长horizon(2-hop,超训练1-hop)**:尾段ADE hop0/1/2 thin 4.36/7.14/8.84(ratio2.03);
+   thin+antidrift 4.78/5.21/7.06(1.476);thick 4.23/4.99/6.31(1.491)。抗漂移**泛化到训练外horizon**;
+   thick不改ratio但每跳绝对精度最好(价值=找回抗漂移牺牲的开环精度)。
+
+**结论:cube乱动根因是compounding,非latent太薄。** 最便宜稳健修复=抗漂移训练加在现有thin模型
+(不需contact/grasp/域标签/准入闸门)。thick latent对漂移无用,仅~10%绝对精度bonus(代价复杂度);去留取决于
+Phase-2跨域是否帮human-transfer(未做)。⚠️抗漂移牺牲开环精度(3.94→4.54),rollout场景可接受。
+结果文件:`outputs/flow_wm_v4/{probe_cg,phase1_robot_drift,phase1_ablation,phase1_horizon}/summary.txt`。
