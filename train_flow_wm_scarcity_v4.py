@@ -25,11 +25,12 @@ class FlowWMThick(nn.Module):
         self.thin = thin
         self.inp = nn.Linear(2 * K + 2, Dm)
         self.act = nn.Linear(L * 3 * 2, Dm)            # full-window EEF as action
-        self.gctx = nn.Linear(L, Dm)                   # grasp-sequence token (thick only)
         enc = nn.TransformerEncoderLayer(Dm, 4, Dm * 2, batch_first=True, dropout=0.0)
         self.tf = nn.TransformerEncoder(enc, 3)
         self.head = nn.Linear(Dm, F * 2)
-        self.gate = nn.Sequential(nn.Linear(3, 32), nn.ReLU(), nn.Linear(32, 1))
+        if not thin:
+            self.gctx = nn.Linear(L, Dm)               # grasp-sequence token (thick only)
+            self.gate = nn.Sequential(nn.Linear(3, 32), nn.ReLU(), nn.Linear(32, 1))
 
     def forward(self, hist, eef3, g):
         # hist (B,P,K,2), eef3 (B,L,3,2), g (B,L) normalized grasp
