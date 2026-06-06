@@ -145,3 +145,17 @@ def test_cg_descriptor_shape():
     dom = torch.zeros(N, dtype=torch.long)
     desc = v4.cg_descriptor(tr, eef3, g, dom)
     assert desc.shape == (N, v4.L * 2 + v4.L)        # 2 tip-distances per frame + grasp per frame
+
+
+def test_chained_rollout_shapes():
+    B = 4
+    tr = torch.randn(B, v4.L, v4.P, 2)
+    eef3 = torch.randn(B, v4.L, 3, 2)
+    g = torch.rand(B, v4.L)
+    dom = torch.zeros(B, dtype=torch.long)
+    m = v4.FlowWMThick(v4.P, thin=False)
+    m.dist_stats = {0: (0.0, 1.0)}
+    p_open, p_chain, gt = v4.chained_rollout(m, tr, eef3, g, dom)
+    overlap = v4.L - 2 * v4.K
+    for x in (p_open, p_chain, gt):
+        assert x.shape == (B, v4.P, overlap, 2)

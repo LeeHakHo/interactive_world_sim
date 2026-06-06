@@ -124,6 +124,21 @@ def multi_step_consistency(model, tr, eef3, g, dom):
     return cons_pred, cons_tgt
 
 
+def chained_rollout(model, tr, eef3, g, dom):
+    # tr (B,L,P,2) -> (p_open, p_chain, gt) each (B,P,overlap,2), overlap = L-2K.
+    # p_open: open-loop prediction of frames 2K..L-1 (teacher-forced history).
+    # p_chain: same frames but predicted from the model's OWN frames K..2K-1 (compounding).
+    overlap = L - 2 * K
+    hist1 = tr[:, :K].permute(0, 2, 1, 3)                       # (B,P,K,2)
+    pred0, _ = model(hist1, eef3, g, dom)                       # (B,P,F,2) frames K..L-1
+    p_open = pred0[:, :, K:, :]                                 # frames 2K..L-1
+    hist2 = pred0[:, :, :K, :]                                  # predicted frames K..2K-1
+    pred1, _ = model(hist2, eef3, g, dom)                       # frames 2K..
+    p_chain = pred1[:, :, :overlap, :]                          # frames 2K..L-1
+    gt = tr[:, 2 * K:].permute(0, 2, 1, 3)                      # (B,P,overlap,2)
+    return p_open, p_chain, gt
+
+
 def _centroid_path_len(seq):
     # seq (B,T,P,2) -> (B,) total centroid path length in normalized coords
     c = seq.mean(2)                                            # (B,T,2)
@@ -219,6 +234,8 @@ def train_eval(tr, vis, eef3, dom, gstats, train_idx, test_idx, thin, seed, epoc
             opt.zero_grad(); loss.backward(); opt.step()
 
     m.eval(); an = ad = fn = fd = 0.0; preds = []; futs = []
+    ao_n = ao_d = ac_n = ac_d = 0.0
+    OV = L - 2 * K
     with torch.no_grad():
         for b in batches(test_idx, False):
             h = tr[b, :K].permute(0, 2, 1, 3).to(device)
@@ -231,9 +248,18 @@ def train_eval(tr, vis, eef3, dom, gstats, train_idx, test_idx, thin, seed, epoc
             an += (err * w).sum().item(); ad += w.sum().item()
             fn += (err[..., -1] * w[..., -1]).sum().item(); fd += w[..., -1].sum().item()
             preds.append(pred.permute(0, 2, 1, 3).cpu()); futs.append(fut.permute(0, 2, 1, 3).cpu())
+            po, pc, gtov = chained_rollout(m, tr[b].to(device), ef, gg, dm)
+            wov = fv[:, K:].permute(0, 2, 1)                              # (B,P,OV)
+            eo = torch.linalg.norm(po - gtov, dim=-1) * 224.0
+            ec = torch.linalg.norm(pc - gtov, dim=-1) * 224.0
+            ao_n += (eo * wov).sum().item(); ao_d += wov.sum().item()
+            ac_n += (ec * wov).sum().item(); ac_d += wov.sum().item()
     pred_all = torch.cat(preds); fut_all = torch.cat(futs)              # (Ntest,F,P,2)
     drift, n_static = rollout_drift_static(pred_all, fut_all, STATIC_TAU)
-    return {"ade": an / ad, "fde": fn / fd, "drift": drift, "n_static": n_static}
+    ade_open = ao_n / (ao_d + 1e-6); ade_chain = ac_n / (ac_d + 1e-6)
+    return {"ade": an / ad, "fde": fn / fd, "drift": drift, "n_static": n_static,
+            "ade_open": ade_open, "ade_chain": ade_chain,
+            "compound_ratio": ade_chain / (ade_open + 1e-6)}
 
 
 def run_phase1(out_dir="outputs/flow_wm_v4/phase1_robot_drift"):
@@ -244,13 +270,15 @@ def run_phase1(out_dir="outputs/flow_wm_v4/phase1_robot_drift"):
     rob = torch.where((dom == 1) & (vid != TEST_ROBOT_VID))[0]
     lines = [f"Phase-1 robot-only | train={len(rob)} test(held-out vid={TEST_ROBOT_VID})={len(test)}",
              f"component versions: model=FlowWMThick (v4), data=flow_ds_v3.npz",
-             f"{'variant':>6} | {'ADE':>7} | {'FDE':>7} | {'drift_px':>8} | {'n_static':>8}"]
+             f"{'variant':>6} | {'ADE':>7} | {'FDE':>7} | {'drift_px':>8} | {'ADE_open':>9} | {'ADE_chain':>10} | {'cmp_ratio':>9} | {'n_static':>8}"]
     for thin in (True, False):
         accs = [train_eval(tr, vis, eef3, dom, gstats, rob, test, thin=thin, seed=s)
                 for s in range(SEEDS)]
         ade = np.mean([a["ade"] for a in accs]); fde = np.mean([a["fde"] for a in accs])
         drift = np.mean([a["drift"] for a in accs]); ns = accs[0]["n_static"]
-        lines.append(f"{'thin' if thin else 'thick':>6} | {ade:7.2f} | {fde:7.2f} | {drift:8.3f} | {ns:8d}")
+        aopen = np.mean([a["ade_open"] for a in accs]); achain = np.mean([a["ade_chain"] for a in accs])
+        ratio = np.mean([a["compound_ratio"] for a in accs])
+        lines.append(f"{'thin' if thin else 'thick':>6} | {ade:7.2f} | {fde:7.2f} | {drift:8.3f} | {aopen:9.2f} | {achain:10.2f} | {ratio:9.3f} | {ns:8d}")
     msg = "\n".join(lines) + "\n"
     print(msg, flush=True)
     open(os.path.join(out_dir, "summary.txt"), "w").write(msg)
