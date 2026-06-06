@@ -52,3 +52,25 @@ def test_contact_gate_features_shape_and_distance():
     assert torch.allclose(feat[..., 0], torch.full((B, v4.P, v4.F), 0.5), atol=1e-5)
     assert torch.allclose(feat[..., 1], torch.full((B, v4.P, v4.F), 0.5), atol=1e-5)
     assert torch.allclose(feat[..., 2], torch.full((B, v4.P, v4.F), 0.3), atol=1e-5)
+
+
+def test_thick_forward_shape_and_gate_static_invariant():
+    B = 4
+    hist = torch.randn(B, v4.P, v4.K, 2)
+    eef3 = torch.randn(B, v4.L, 3, 2)
+    g = torch.rand(B, v4.L)
+    m = v4.FlowWMThick(v4.P, thin=False)
+    pred, alpha = m(hist, eef3, g)
+    assert pred.shape == (B, v4.P, v4.F, 2)
+    assert alpha.shape == (B, v4.P, v4.F)
+
+    # Force the gate fully closed -> predicted future == anchor repeated (cube static)
+    with torch.no_grad():
+        for layer in m.gate:
+            if isinstance(layer, torch.nn.Linear):
+                layer.weight.zero_()
+        m.gate[-1].bias.fill_(-50.0)
+    pred0, alpha0 = m(hist, eef3, g)
+    anchor = hist[:, :, -1, :]
+    assert alpha0.max().item() < 1e-3
+    assert torch.allclose(pred0, anchor[:, :, None, :].expand(B, v4.P, v4.F, 2), atol=1e-4)
