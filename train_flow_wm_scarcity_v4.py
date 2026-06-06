@@ -23,6 +23,7 @@ class FlowWMThick(nn.Module):
     def __init__(self, P, thin=False):
         super().__init__()
         self.thin = thin
+        self.dist_stats = None
         self.inp = nn.Linear(2 * K + 2, Dm)
         self.act = nn.Linear(L * 3 * 2, Dm)            # full-window EEF as action
         enc = nn.TransformerEncoderLayer(Dm, 4, Dm * 2, batch_first=True, dropout=0.0)
@@ -32,8 +33,8 @@ class FlowWMThick(nn.Module):
             self.gctx = nn.Linear(L, Dm)               # grasp-sequence token (thick only)
             self.gate = nn.Sequential(nn.Linear(3, 32), nn.ReLU(), nn.Linear(32, 1))
 
-    def forward(self, hist, eef3, g):
-        # hist (B,P,K,2), eef3 (B,L,3,2), g (B,L) normalized grasp
+    def forward(self, hist, eef3, g, dom):
+        # hist (B,P,K,2), eef3 (B,L,3,2), g (B,L) normalized grasp, dom (B,)
         B, P = hist.shape[:2]
         anchor = hist[:, :, -1, :]                                       # (B,P,2)
         obj = self.inp(torch.cat([(hist - anchor[:, :, None]).reshape(B, P, 2 * K), anchor], -1))
@@ -46,17 +47,37 @@ class FlowWMThick(nn.Module):
         raw = self.head(x).reshape(B, P, F, 2)                           # displacement from anchor
         if self.thin:
             return anchor[:, :, None, :] + raw, None
-        feat = contact_gate_features(anchor, eef3, g)                    # (B,P,F,3)
+        feat = contact_gate_features(anchor, eef3, g, dom, self.dist_stats)  # (B,P,F,3)
         alpha = torch.sigmoid(self.gate(feat)).squeeze(-1)              # (B,P,F)
         return anchor[:, :, None, :] + alpha[..., None] * raw, alpha
 
 
 # --- pure helpers (filled in later tasks) ---
-def contact_gate_features(anchor, eef3, g):
-    # anchor (B,P,2), eef3 (B,L,3,2), g (B,L) -> (B,P,F,3): [dist to 2 future tips, grasp]
+def _raw_contact_dist(anchor, eef3):
+    # anchor (B,P,2), eef3 (B,L,3,2) -> (B,P,F,2): distance to the 2 future tips
     B, Pn = anchor.shape[:2]
-    tips = eef3[:, K:, 1:3, :]                                   # (B,F,2,2) future 2 tips
-    d = torch.linalg.norm(anchor[:, :, None, None, :] - tips[:, None], dim=-1)  # (B,P,F,2)
+    tips = eef3[:, K:, 1:3, :]                                   # (B,F,2,2)
+    return torch.linalg.norm(anchor[:, :, None, None, :] - tips[:, None], dim=-1)
+
+
+def fit_dist_stats(tracks, eef3, domain):
+    # per-domain (mean,std) of contact distances (object pts at frame K-1 -> future tips)
+    anchor = tracks[:, K - 1]                                    # (N,P,2)
+    feat = _raw_contact_dist(anchor, eef3)                       # (N,P,F,2)
+    stats = {}
+    for d in domain.unique().tolist():
+        v = feat[domain == d].reshape(-1)
+        stats[int(d)] = (v.mean().item(), v.std().item() + 1e-6)
+    return stats
+
+
+def contact_gate_features(anchor, eef3, g, dom, dist_stats):
+    # anchor (B,P,2), eef3 (B,L,3,2), g (B,L) already z-scored, dom (B,) -> (B,P,F,3)
+    B, Pn = anchor.shape[:2]
+    d = _raw_contact_dist(anchor, eef3)                          # (B,P,F,2)
+    mu = torch.tensor([dist_stats[int(x)][0] for x in dom.tolist()], device=d.device)
+    sd = torch.tensor([dist_stats[int(x)][1] for x in dom.tolist()], device=d.device)
+    d = (d - mu[:, None, None, None]) / sd[:, None, None, None]  # per-domain z-score
     gf = g[:, K:][:, None, :].expand(B, Pn, F)                   # (B,P,F)
     return torch.cat([d, gf[..., None]], -1)                     # (B,P,F,3)
 
@@ -67,20 +88,20 @@ def grasp_openness(eef3):
 
 
 def fit_grasp_stats(g_raw, domain):
-    # per-domain p5/p95 over flattened grasp values
+    # per-domain (mean, std) scalar over flattened grasp values
     g_flat = g_raw.reshape(len(g_raw), -1) if g_raw.dim() > 1 else g_raw[:, None]
     stats = {}
     for d in domain.unique().tolist():
         v = g_flat[domain == d].reshape(-1)
-        stats[int(d)] = (torch.quantile(v, 0.05).item(), torch.quantile(v, 0.95).item())
+        stats[int(d)] = (v.mean().item(), v.std().item() + 1e-6)
     return stats
 
 
 def normalize_grasp(g_raw, domain, stats):
     out = torch.zeros_like(g_raw)
-    for d, (lo, hi) in stats.items():
+    for d, (mu, sd) in stats.items():
         m = domain == d
-        out[m] = ((g_raw[m] - lo) / (hi - lo + 1e-6)).clamp(0.0, 1.0)
+        out[m] = (g_raw[m] - mu) / sd
     return out
 
 
@@ -90,13 +111,13 @@ def inject_state_noise(hist, std, generator):
     return hist + noise
 
 
-def multi_step_consistency(model, tr, eef3, g):
+def multi_step_consistency(model, tr, eef3, g, dom):
     # tr (B,L,P,2) -> (cons_pred, cons_tgt) each (B,P,overlap,2), overlap = L-2K
     B = tr.shape[0]
     hist1 = tr[:, :K].permute(0, 2, 1, 3)                       # (B,P,K,2)
-    pred1, _ = model(hist1, eef3, g)                            # (B,P,F,2) frames K..L-1
+    pred1, _ = model(hist1, eef3, g, dom)                       # (B,P,F,2) frames K..L-1
     hist2 = pred1[:, :, :K, :]                                  # predicted frames K..2K-1
-    pred2, _ = model(hist2, eef3, g)                            # frames 2K..2K+F-1 (own-feedback)
+    pred2, _ = model(hist2, eef3, g, dom)                       # frames 2K..2K+F-1 (own-feedback)
     overlap = L - 2 * K                                         # frames 2K..L-1 still have GT
     cons_pred = pred2[:, :, :overlap, :]
     cons_tgt = tr[:, 2 * K:].permute(0, 2, 1, 3)               # (B,P,overlap,2)
@@ -128,12 +149,16 @@ def load():
             torch.from_numpy(z["vid"]).long())
 
 
-def cg_descriptor(tracks, eef3, g_norm):
-    # tracks (N,L,P,2), eef3 (N,L,3,2), g_norm (N,L) -> (N, L*2 + L)
+def cg_descriptor(tracks, eef3, g_norm, dom):
+    # tracks (N,L,P,2), eef3 (N,L,3,2), g_norm (N,L) already z-scored, dom (N,) -> (N, L*2 + L)
     c = tracks.mean(2)                                          # (N,L,2) object centroid
     tips = eef3[:, :, 1:3, :]                                   # (N,L,2,2)
-    d = torch.linalg.norm(c[:, :, None, :] - tips, dim=-1)      # (N,L,2)
-    return torch.cat([d.reshape(len(d), -1), g_norm], -1)
+    d = torch.linalg.norm(c[:, :, None, :] - tips, dim=-1).reshape(len(tracks), -1)  # (N,L*2)
+    dz = torch.zeros_like(d)
+    for dd in dom.unique().tolist():
+        m = dom == dd
+        dz[m] = (d[m] - d[m].mean()) / (d[m].std() + 1e-6)
+    return torch.cat([dz, g_norm], -1)
 
 
 def run_probe_cg(out_dir="outputs/flow_wm_v4/probe_cg"):
@@ -143,7 +168,7 @@ def run_probe_cg(out_dir="outputs/flow_wm_v4/probe_cg"):
     tr, vis, eef3, dom, vid = load()
     gstats = fit_grasp_stats(grasp_openness(eef3), dom)
     g_norm = normalize_grasp(grasp_openness(eef3), dom, gstats)
-    X = cg_descriptor(tr, eef3, g_norm).numpy(); y = dom.numpy()
+    X = cg_descriptor(tr, eef3, g_norm, dom).numpy(); y = dom.numpy()
     Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0, stratify=y)
     clf = LogisticRegression(max_iter=2000).fit(Xtr, ytr)
     acc = clf.score(Xte, yte); base = max((yte == 0).mean(), (yte == 1).mean())
@@ -183,6 +208,7 @@ def train_eval(tr, vis, eef3, dom, gstats, train_idx, test_idx, thin, seed, epoc
     torch.manual_seed(seed)
     g_all = normalize_grasp(grasp_openness(eef3), dom, gstats)          # (N,L)
     m = FlowWMThick(P, thin=thin).to(device)
+    m.dist_stats = fit_dist_stats(tr, eef3, dom)
     opt = torch.optim.AdamW(m.parameters(), lr=LR)
     gen = torch.Generator().manual_seed(seed)
     ngen = torch.Generator(device=device).manual_seed(seed + 777)
@@ -199,14 +225,14 @@ def train_eval(tr, vis, eef3, dom, gstats, train_idx, test_idx, thin, seed, epoc
             if not thin:
                 h = inject_state_noise(h, NOISE_STD, ngen)
             fut = tr[b, K:].permute(0, 2, 1, 3).to(device)             # (B,P,F,2)
-            ef = eef3[b].to(device); gg = g_all[b].to(device)
+            ef = eef3[b].to(device); gg = g_all[b].to(device); dm = dom[b].to(device)
             hv = vis[b, :K].to(device); fv = vis[b, K:].to(device)
             w = (fv.permute(0, 2, 1) * hv[:, -1:].permute(0, 2, 1))[..., None]
-            pred, alpha = m(h, ef, gg)
+            pred, alpha = m(h, ef, gg, dm)
             loss = _masked_mse(pred, fut, w)
             if not thin:
                 loss = loss + LAMBDA_GATE * alpha.abs().mean()
-                cp, ct = multi_step_consistency(m, tr[b].to(device), ef, gg)
+                cp, ct = multi_step_consistency(m, tr[b].to(device), ef, gg, dm)
                 wc = fv[:, K:].permute(0, 2, 1)[..., None]             # (B,P,overlap,1)
                 loss = loss + LAMBDA_CONSIST * _masked_mse(cp, ct, wc)
             opt.zero_grad(); loss.backward(); opt.step()
@@ -216,10 +242,10 @@ def train_eval(tr, vis, eef3, dom, gstats, train_idx, test_idx, thin, seed, epoc
         for b in batches(test_idx, False):
             h = tr[b, :K].permute(0, 2, 1, 3).to(device)
             fut = tr[b, K:].permute(0, 2, 1, 3).to(device)
-            ef = eef3[b].to(device); gg = g_all[b].to(device)
+            ef = eef3[b].to(device); gg = g_all[b].to(device); dm = dom[b].to(device)
             hv = vis[b, :K].to(device); fv = vis[b, K:].to(device)
             w = fv.permute(0, 2, 1) * hv[:, -1:].permute(0, 2, 1)
-            pred, _ = m(h, ef, gg)
+            pred, _ = m(h, ef, gg, dm)
             err = torch.linalg.norm(pred - fut, dim=-1) * 224.0
             an += (err * w).sum().item(); ad += w.sum().item()
             fn += (err[..., -1] * w[..., -1]).sum().item(); fd += w[..., -1].sum().item()
