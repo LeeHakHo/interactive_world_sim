@@ -181,25 +181,6 @@ def run_probe_cg(out_dir="outputs/flow_wm_v4/probe_cg"):
     return acc
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--probe-cg", action="store_true")
-    ap.add_argument("--phase", type=int, default=0)
-    a = ap.parse_args()
-    if a.probe_cg:
-        run_probe_cg()
-    elif a.phase == 1:
-        run_phase1()
-    elif a.phase == 2:
-        run_phase2()
-    else:
-        print("specify --probe-cg | --phase 1 | --phase 2", flush=True)
-
-
-if __name__ == "__main__":
-    main()
-
-
 def _masked_mse(pred, fut, w):
     return ((pred - fut) ** 2 * w).sum() / (w.sum() + 1e-6)
 
@@ -253,3 +234,42 @@ def train_eval(tr, vis, eef3, dom, gstats, train_idx, test_idx, thin, seed, epoc
     pred_all = torch.cat(preds); fut_all = torch.cat(futs)              # (Ntest,F,P,2)
     drift, n_static = rollout_drift_static(pred_all, fut_all, STATIC_TAU)
     return {"ade": an / ad, "fde": fn / fd, "drift": drift, "n_static": n_static}
+
+
+def run_phase1(out_dir="outputs/flow_wm_v4/phase1_robot_drift"):
+    os.makedirs(out_dir, exist_ok=True)
+    tr, vis, eef3, dom, vid = load()
+    gstats = fit_grasp_stats(grasp_openness(eef3), dom)
+    test = torch.where((dom == 1) & (vid == TEST_ROBOT_VID))[0]
+    rob = torch.where((dom == 1) & (vid != TEST_ROBOT_VID))[0]
+    lines = [f"Phase-1 robot-only | train={len(rob)} test(held-out vid={TEST_ROBOT_VID})={len(test)}",
+             f"component versions: model=FlowWMThick (v4), data=flow_ds_v3.npz",
+             f"{'variant':>6} | {'ADE':>7} | {'FDE':>7} | {'drift_px':>8} | {'n_static':>8}"]
+    for thin in (True, False):
+        accs = [train_eval(tr, vis, eef3, dom, gstats, rob, test, thin=thin, seed=s)
+                for s in range(SEEDS)]
+        ade = np.mean([a["ade"] for a in accs]); fde = np.mean([a["fde"] for a in accs])
+        drift = np.mean([a["drift"] for a in accs]); ns = accs[0]["n_static"]
+        lines.append(f"{'thin' if thin else 'thick':>6} | {ade:7.2f} | {fde:7.2f} | {drift:8.3f} | {ns:8d}")
+    msg = "\n".join(lines) + "\n"
+    print(msg, flush=True)
+    open(os.path.join(out_dir, "summary.txt"), "w").write(msg)
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--probe-cg", action="store_true")
+    ap.add_argument("--phase", type=int, default=0)
+    a = ap.parse_args()
+    if a.probe_cg:
+        run_probe_cg()
+    elif a.phase == 1:
+        run_phase1()
+    elif a.phase == 2:
+        run_phase2()
+    else:
+        print("specify --probe-cg | --phase 1 | --phase 2", flush=True)
+
+
+if __name__ == "__main__":
+    main()
