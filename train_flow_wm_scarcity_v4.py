@@ -82,3 +82,9 @@ def normalize_grasp(g_raw, domain, stats):
         m = domain == d
         out[m] = ((g_raw[m] - lo) / (hi - lo + 1e-6)).clamp(0.0, 1.0)
     return out
+
+
+def inject_state_noise(hist, std, generator):
+    # additive Gaussian noise on history object points (normalized coords); cheap DAgger
+    noise = torch.randn(hist.shape, generator=generator, device=hist.device) * std
+    return hist + noise

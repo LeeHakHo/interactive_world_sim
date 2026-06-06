@@ -74,3 +74,16 @@ def test_thick_forward_shape_and_gate_static_invariant():
     anchor = hist[:, :, -1, :]
     assert alpha0.max().item() < 1e-3
     assert torch.allclose(pred0, anchor[:, :, None, :].expand(B, v4.P, v4.F, 2), atol=1e-4)
+
+
+def test_inject_state_noise_shape_and_determinism():
+    hist = torch.zeros(6, v4.P, v4.K, 2)
+    g1 = torch.Generator().manual_seed(0)
+    g2 = torch.Generator().manual_seed(0)
+    a = v4.inject_state_noise(hist, v4.NOISE_STD, g1)
+    b = v4.inject_state_noise(hist, v4.NOISE_STD, g2)
+    assert a.shape == hist.shape
+    assert torch.allclose(a, b)                       # same seed -> same noise
+    assert a.abs().mean() > 0                          # noise actually added
+    # std in the right ballpark (normalized coords)
+    assert 0.3 * v4.NOISE_STD < a.std().item() < 3 * v4.NOISE_STD
