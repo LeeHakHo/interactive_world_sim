@@ -365,6 +365,36 @@ def run_horizon(out_dir="outputs/flow_wm_v4/phase1_horizon"):
     print("\n" + msg, flush=True)
 
 
+def run_phase2(out_dir="outputs/flow_wm_v4/phase2_crossdomain"):
+    os.makedirs(out_dir, exist_ok=True)
+    tr, vis, eef3, dom, vid = load()
+    gstats = fit_grasp_stats(grasp_openness(eef3), dom)
+    test = torch.where((dom == 1) & (vid == TEST_ROBOT_VID))[0]
+    rob = torch.where((dom == 1) & (vid != TEST_ROBOT_VID))[0]
+    hum = torch.where(dom == 0)[0]
+    NL = [400, 200, 100, 50]
+    variants = [("thin+ad", True, True), ("thick+ad", False, True)]
+    lines = [f"Phase-2 cross-domain scarcity | robot-pool={len(rob)} human={len(hum)} test={len(test)} seeds={SEEDS}",
+             "both variants trained with anti-drift; isolates latent-thickening effect on human-transfer",
+             "component versions: model=FlowWMThick (v4), data=flow_ds_v3.npz",
+             f"{'variant':>9} | {'N_rob':>5} | {'robot-only':>10} | {'robot+human':>11} | {'helps(d+)':>9}"]
+    for name, thin, ad in variants:
+        for N in NL:
+            ro, rh = [], []
+            for s in range(SEEDS):
+                rng = np.random.default_rng(100 + s)
+                sub = rob[torch.from_numpy(rng.choice(len(rob), min(N, len(rob)), replace=False))]
+                ro.append(train_eval(tr, vis, eef3, dom, gstats, sub, test, thin=thin, seed=s, antidrift=ad)["ade"])
+                rh.append(train_eval(tr, vis, eef3, dom, gstats, torch.cat([sub, hum]), test, thin=thin, seed=s, antidrift=ad)["ade"])
+            ro, rh = np.array(ro), np.array(rh)
+            d = ro.mean() - rh.mean()
+            lines.append(f"{name:>9} | {N:>5} | {ro.mean():6.2f}±{ro.std():4.2f} | {rh.mean():6.2f}±{rh.std():4.2f} | {d:+9.2f}")
+            print(lines[-1], flush=True)
+    msg = "\n".join(lines) + "\n(v3 thin baseline human-helps for reference: 50->+6.76, 100->+6.70, 200->+3.50)\n"
+    open(os.path.join(out_dir, "summary.txt"), "w").write(msg)
+    print("\n" + msg, flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe-cg", action="store_true")
