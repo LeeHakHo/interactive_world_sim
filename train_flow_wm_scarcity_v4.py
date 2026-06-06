@@ -53,7 +53,12 @@ class FlowWMThick(nn.Module):
 
 # --- pure helpers (filled in later tasks) ---
 def contact_gate_features(anchor, eef3, g):
-    raise NotImplementedError  # Task 3
+    # anchor (B,P,2), eef3 (B,L,3,2), g (B,L) -> (B,P,F,3): [dist to 2 future tips, grasp]
+    B, Pn = anchor.shape[:2]
+    tips = eef3[:, K:, 1:3, :]                                   # (B,F,2,2) future 2 tips
+    d = torch.linalg.norm(anchor[:, :, None, None, :] - tips[:, None], dim=-1)  # (B,P,F,2)
+    gf = g[:, K:][:, None, :].expand(B, Pn, F)                   # (B,P,F)
+    return torch.cat([d, gf[..., None]], -1)                     # (B,P,F,3)
 
 
 def grasp_openness(eef3):

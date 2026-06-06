@@ -38,3 +38,17 @@ def test_normalize_grasp_per_domain_range_and_scale():
     assert out.min() >= 0.0 and out.max() <= 1.0
     # both domains should span most of [0,1] after per-domain normalization
     assert out[dom == 1].max() > 0.9 and out[dom == 0].max() > 0.9
+
+
+def test_contact_gate_features_shape_and_distance():
+    B = 3
+    anchor = torch.zeros(B, v4.P, 2)            # object at origin
+    eef3 = torch.zeros(B, v4.L, 3, 2)
+    eef3[:, :, 1, 0] = 0.5                       # future tip1 at distance 0.5
+    eef3[:, :, 2, 1] = 0.5                       # future tip2 at distance 0.5
+    g = torch.full((B, v4.L), 0.3)
+    feat = v4.contact_gate_features(anchor, eef3, g)
+    assert feat.shape == (B, v4.P, v4.F, 3)     # [d_tip1, d_tip2, grasp]
+    assert torch.allclose(feat[..., 0], torch.full((B, v4.P, v4.F), 0.5), atol=1e-5)
+    assert torch.allclose(feat[..., 1], torch.full((B, v4.P, v4.F), 0.5), atol=1e-5)
+    assert torch.allclose(feat[..., 2], torch.full((B, v4.P, v4.F), 0.3), atol=1e-5)
