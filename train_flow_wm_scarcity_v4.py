@@ -200,7 +200,9 @@ def _masked_mse(pred, fut, w):
     return ((pred - fut) ** 2 * w).sum() / (w.sum() + 1e-6)
 
 
-def train_eval(tr, vis, eef3, dom, gstats, train_idx, test_idx, thin, seed, epochs=EPOCHS):
+def train_eval(tr, vis, eef3, dom, gstats, train_idx, test_idx, thin, seed, epochs=EPOCHS, antidrift=None):
+    if antidrift is None:
+        antidrift = not thin
     torch.manual_seed(seed)
     g_all = normalize_grasp(grasp_openness(eef3), dom, gstats)          # (N,L)
     m = FlowWMThick(P, thin=thin).to(device)
@@ -218,7 +220,7 @@ def train_eval(tr, vis, eef3, dom, gstats, train_idx, test_idx, thin, seed, epoc
         m.train()
         for b in batches(train_idx, True):
             h = tr[b, :K].permute(0, 2, 1, 3).to(device)               # (B,P,K,2)
-            if not thin:
+            if antidrift:
                 h = inject_state_noise(h, NOISE_STD, ngen)
             fut = tr[b, K:].permute(0, 2, 1, 3).to(device)             # (B,P,F,2)
             ef = eef3[b].to(device); gg = g_all[b].to(device); dm = dom[b].to(device)
@@ -228,6 +230,7 @@ def train_eval(tr, vis, eef3, dom, gstats, train_idx, test_idx, thin, seed, epoc
             loss = _masked_mse(pred, fut, w)
             if not thin:
                 loss = loss + LAMBDA_GATE * alpha.abs().mean()
+            if antidrift:
                 cp, ct = multi_step_consistency(m, tr[b].to(device), ef, gg, dm)
                 wc = fv[:, K:].permute(0, 2, 1)[..., None]             # (B,P,overlap,1)
                 loss = loss + LAMBDA_CONSIST * _masked_mse(cp, ct, wc)
@@ -284,6 +287,31 @@ def run_phase1(out_dir="outputs/flow_wm_v4/phase1_robot_drift"):
     open(os.path.join(out_dir, "summary.txt"), "w").write(msg)
 
 
+def run_ablation(out_dir="outputs/flow_wm_v4/phase1_ablation"):
+    os.makedirs(out_dir, exist_ok=True)
+    tr, vis, eef3, dom, vid = load()
+    gstats = fit_grasp_stats(grasp_openness(eef3), dom)
+    test = torch.where((dom == 1) & (vid == TEST_ROBOT_VID))[0]
+    rob = torch.where((dom == 1) & (vid != TEST_ROBOT_VID))[0]
+    variants = [("thin",            True,  False),
+                ("thin+antidrift",  True,  True),
+                ("thick-antidrift", False, False),
+                ("thick(full)",     False, True)]
+    lines = [f"Phase-1 ablation (2x2 arch x training) | train={len(rob)} test={len(test)} seeds={SEEDS}",
+             "component versions: model=FlowWMThick (v4), data=flow_ds_v3.npz",
+             f"{'variant':>16} | {'ADE':>6} | {'ADE_open':>9} | {'ADE_chain':>10} | {'cmp_ratio':>9}"]
+    for name, thin, ad in variants:
+        accs = [train_eval(tr, vis, eef3, dom, gstats, rob, test, thin=thin, seed=s, antidrift=ad)
+                for s in range(SEEDS)]
+        ade = np.mean([a["ade"] for a in accs]); aopen = np.mean([a["ade_open"] for a in accs])
+        achain = np.mean([a["ade_chain"] for a in accs]); ratio = np.mean([a["compound_ratio"] for a in accs])
+        lines.append(f"{name:>16} | {ade:6.2f} | {aopen:9.2f} | {achain:10.2f} | {ratio:9.3f}")
+        print(lines[-1], flush=True)
+    msg = "\n".join(lines) + "\n"
+    open(os.path.join(out_dir, "summary.txt"), "w").write(msg)
+    print("\n" + msg, flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe-cg", action="store_true")
@@ -295,8 +323,10 @@ def main():
         run_phase1()
     elif a.phase == 2:
         run_phase2()
+    elif a.phase == 3:
+        run_ablation()
     else:
-        print("specify --probe-cg | --phase 1 | --phase 2", flush=True)
+        print("specify --probe-cg | --phase 1 | --phase 2 | --phase 3", flush=True)
 
 
 if __name__ == "__main__":
