@@ -83,42 +83,45 @@ def main():
     rob = torch.where((dom == 1) & (vid != v4.TEST_ROBOT_VID))[0]
     variants = [("thin", True, False), ("thin+antidrift", True, True),
                 ("thick-antidrift", False, False), ("thick+antidrift", False, True)]
-    models = {}
-    for name, thin, ad in variants:
-        _, m = v4.train_eval(tr, vis, eef3, dom, gstats, rob, rob[:2],
-                             thin=thin, seed=0, antidrift=ad, return_model=True)
-        m.eval(); models[name] = m
-        print(f"trained {name}", flush=True)
+    NSEED = 5
 
+    # build eval sequences ONCE (shared across seeds). classify static over the FUTURE
+    # rollout window (Hroll) with a length-appropriate threshold (15px over 36 frames).
     seqs = build_seqs()
-    statc = [s for s in seqs if s["gt_motion"] < STATIC_PX]
-    dynm = [s for s in seqs if s["gt_motion"] >= STATIC_PX]
-    print(f"built {len(seqs)} seqs: {len(statc)} static + {len(dynm)} dynamic", flush=True)
+    def futmotion(s): return cpath(s["trk_n"][K:K + HROLL])
+    STAT_T = 15.0
+    statc = [s for s in seqs if futmotion(s) < STAT_T]
+    dynm = [s for s in seqs if futmotion(s) >= STAT_T]
+    print(f"built {len(seqs)} seqs: {len(statc)} static + {len(dynm)} dynamic (future-window thr={STAT_T}px)", flush=True)
 
-    lines = [f"4-way LONG rollout (S=3 in-dist, Hroll={HROLL}) | vid=12 | seqs={len(seqs)} "
-             f"({len(statc)} static / {len(dynm)} dynamic) | data=flow_ds_v4",
-             "ADE = rollout ADE px vs GT (visible pts) | hallu = predicted cube cpath on STATIC clips "
-             f"(GT static cpath mean={np.mean([s['gt_motion'] for s in statc]) if statc else 0:.1f}px, should match)",
-             f"{'variant':>16} | {'dyn_ADE':>8} | {'stat_ADE':>8} | {'stat_hallu_cpath':>16} | {'dyn_hallu_cpath':>15}"]
-    for name, _, _ in variants:
-        m = models[name]
-        def rolladE(group):
-            if not group: return float('nan'), float('nan')
-            ades, halls = [], []
-            for s in group:
-                pr = v4_rollout(m, s["trk_n"], s["eseq_n"], gstats, HROLL)   # (Hroll,P,2)
-                gt = s["trk_n"][K:K + HROLL]                                  # (Hroll,P,2)
-                w = s["vis"][K:K + HROLL]                                     # (Hroll,P)
-                err = np.linalg.norm(pr - gt, axis=-1) * RES                  # (Hroll,P)
-                ades.append((err * w).sum() / (w.sum() + 1e-6))
-                halls.append(cpath(pr))
-            return float(np.mean(ades)), float(np.mean(halls))
-        d_ade, d_hall = rolladE(dynm)
-        s_ade, s_hall = rolladE(statc)
-        lines.append(f"{name:>16} | {d_ade:8.2f} | {s_ade:8.2f} | {s_hall:16.2f} | {d_hall:15.2f}")
+    def rolladE(m, group):
+        if not group: return float('nan'), float('nan')
+        ades, halls = [], []
+        for s in group:
+            pr = v4_rollout(m, s["trk_n"], s["eseq_n"], gstats, HROLL)
+            gt = s["trk_n"][K:K + HROLL]; w = s["vis"][K:K + HROLL]
+            err = np.linalg.norm(pr - gt, axis=-1) * RES
+            ades.append((err * w).sum() / (w.sum() + 1e-6)); halls.append(cpath(pr))
+        return float(np.mean(ades)), float(np.mean(halls))
+
+    gtd = np.mean([futmotion(s) for s in dynm]) if dynm else 0
+    gts = np.mean([futmotion(s) for s in statc]) if statc else 0
+    lines = [f"4-way LONG rollout (S=3 in-dist, Hroll={HROLL}, {NSEED} seeds) | vid=12 | "
+             f"seqs={len(seqs)} ({len(statc)} static / {len(dynm)} dynamic) | data=flow_ds_v4",
+             f"GT cube future cpath: dynamic={gtd:.1f}px  static={gts:.1f}px  | hallu=predicted cube cpath (vs GT)",
+             f"{'variant':>16} | {'dyn_ADE':>13} | {'dyn_hallu':>13} | {'stat_ADE':>13} | {'stat_hallu':>13}"]
+    for name, thin, ad in variants:
+        da, dh, sa, sh = [], [], [], []
+        for seed in range(NSEED):
+            _, m = v4.train_eval(tr, vis, eef3, dom, gstats, rob, rob[:2],
+                                 thin=thin, seed=seed, antidrift=ad, return_model=True)
+            m.eval()
+            a, h = rolladE(m, dynm); da.append(a); dh.append(h)
+            a2, h2 = rolladE(m, statc); sa.append(a2); sh.append(h2)
+        da, dh, sa, sh = map(np.array, (da, dh, sa, sh))
+        lines.append(f"{name:>16} | {da.mean():5.2f}±{da.std():4.2f} | {dh.mean():5.1f}±{dh.std():4.1f} | "
+                     f"{sa.mean():5.2f}±{sa.std():4.2f} | {sh.mean():5.1f}±{sh.std():4.1f}")
         print(lines[-1], flush=True)
-    gtdyn = np.mean([cpath(s['trk_n'][K:K+HROLL]) for s in dynm]) if dynm else 0
-    lines.append(f"\nREF GT cube cpath: static={np.mean([cpath(s['trk_n'][K:K+HROLL]) for s in statc]) if statc else 0:.2f}px  dynamic={gtdyn:.2f}px")
     msg = "\n".join(lines) + "\n"
     open(os.path.join(OUT, "summary.txt"), "w").write(msg)
     print("\n" + msg, flush=True)
