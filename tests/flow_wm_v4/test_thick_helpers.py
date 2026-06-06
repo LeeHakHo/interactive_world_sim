@@ -129,3 +129,12 @@ def test_train_eval_smoke_tiny(tmp_path):
                         thin=False, seed=0, epochs=2)
     for k in ("ade", "fde", "drift"):
         assert k in out and out[k] == out[k]         # finite (not NaN)
+
+
+def test_cg_descriptor_shape():
+    N = 7
+    tr = torch.rand(N, v4.L, v4.P, 2)
+    eef3 = torch.rand(N, v4.L, 3, 2)
+    g = torch.rand(N, v4.L)
+    desc = v4.cg_descriptor(tr, eef3, g)
+    assert desc.shape == (N, v4.L * 2 + v4.L)        # 2 tip-distances per frame + grasp per frame

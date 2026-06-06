@@ -128,6 +128,53 @@ def load():
             torch.from_numpy(z["vid"]).long())
 
 
+def cg_descriptor(tracks, eef3, g_norm):
+    # tracks (N,L,P,2), eef3 (N,L,3,2), g_norm (N,L) -> (N, L*2 + L)
+    c = tracks.mean(2)                                          # (N,L,2) object centroid
+    tips = eef3[:, :, 1:3, :]                                   # (N,L,2,2)
+    d = torch.linalg.norm(c[:, :, None, :] - tips, dim=-1)      # (N,L,2)
+    return torch.cat([d.reshape(len(d), -1), g_norm], -1)
+
+
+def run_probe_cg(out_dir="outputs/flow_wm_v4/probe_cg"):
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import train_test_split
+    os.makedirs(out_dir, exist_ok=True)
+    tr, vis, eef3, dom, vid = load()
+    gstats = fit_grasp_stats(grasp_openness(eef3), dom)
+    g_norm = normalize_grasp(grasp_openness(eef3), dom, gstats)
+    X = cg_descriptor(tr, eef3, g_norm).numpy(); y = dom.numpy()
+    Xtr, Xte, ytr, yte = train_test_split(X, y, test_size=0.3, random_state=0, stratify=y)
+    clf = LogisticRegression(max_iter=2000).fit(Xtr, ytr)
+    acc = clf.score(Xte, yte); base = max((yte == 0).mean(), (yte == 1).mean())
+    msg = (f"[c,g] admission probe (converged LogReg, held-out)\n"
+           f"  test acc = {acc:.3f}  (majority baseline = {base:.3f})\n"
+           f"  verdict  = {'PASS ~0.5, admissible' if acc < base + 0.10 else 'FAIL leaks domain -> re-normalize/drop'}\n"
+           f"  N={len(X)} dim={X.shape[1]}\n")
+    print(msg, flush=True)
+    open(os.path.join(out_dir, "summary.txt"), "w").write(msg)
+    return acc
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--probe-cg", action="store_true")
+    ap.add_argument("--phase", type=int, default=0)
+    a = ap.parse_args()
+    if a.probe_cg:
+        run_probe_cg()
+    elif a.phase == 1:
+        run_phase1()
+    elif a.phase == 2:
+        run_phase2()
+    else:
+        print("specify --probe-cg | --phase 1 | --phase 2", flush=True)
+
+
+if __name__ == "__main__":
+    main()
+
+
 def _masked_mse(pred, fut, w):
     return ((pred - fut) ** 2 * w).sum() / (w.sum() + 1e-6)
 
