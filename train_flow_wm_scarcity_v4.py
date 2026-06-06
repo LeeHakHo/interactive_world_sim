@@ -124,6 +124,24 @@ def multi_step_consistency(model, tr, eef3, g, dom):
     return cons_pred, cons_tgt
 
 
+def multihop_tail_ade(model, tr, vis, eef3, g, dom, hops=2):
+    # ADE (px) on the common tail frames [L-K:L] vs hop depth 0..hops.
+    # hop h: history has been predicted h times (h=0 open-loop, h=1 trained horizon,
+    # h>=2 beyond trained horizon -> generalization test).
+    tailw = vis[:, L - K:].permute(0, 2, 1)            # (B,P,K) visibility on tail
+    gt = tr[:, L - K:].permute(0, 2, 1, 3)             # (B,P,K,2) tail GT
+    hist = tr[:, :K].permute(0, 2, 1, 3)               # start from GT history
+    ades = []
+    for h in range(hops + 1):
+        pred, _ = model(hist, eef3, g, dom)            # (B,P,F,2)
+        s = L - K - (h + 1) * K                         # tail slice within this prediction
+        tail_pred = pred[:, :, s:s + K, :]             # (B,P,K,2) prediction of frames L-K..L-1
+        err = torch.linalg.norm(tail_pred - gt, dim=-1) * 224.0
+        ades.append(((err * tailw).sum() / (tailw.sum() + 1e-6)).item())
+        hist = pred[:, :, :K, :]                        # next history = own first-K predictions
+    return ades
+
+
 def chained_rollout(model, tr, eef3, g, dom):
     # tr (B,L,P,2) -> (p_open, p_chain, gt) each (B,P,overlap,2), overlap = L-2K.
     # p_open: open-loop prediction of frames 2K..L-1 (teacher-forced history).
@@ -200,7 +218,7 @@ def _masked_mse(pred, fut, w):
     return ((pred - fut) ** 2 * w).sum() / (w.sum() + 1e-6)
 
 
-def train_eval(tr, vis, eef3, dom, gstats, train_idx, test_idx, thin, seed, epochs=EPOCHS, antidrift=None):
+def train_eval(tr, vis, eef3, dom, gstats, train_idx, test_idx, thin, seed, epochs=EPOCHS, antidrift=None, return_model=False):
     if antidrift is None:
         antidrift = not thin
     torch.manual_seed(seed)
@@ -260,9 +278,12 @@ def train_eval(tr, vis, eef3, dom, gstats, train_idx, test_idx, thin, seed, epoc
     pred_all = torch.cat(preds); fut_all = torch.cat(futs)              # (Ntest,F,P,2)
     drift, n_static = rollout_drift_static(pred_all, fut_all, STATIC_TAU)
     ade_open = ao_n / (ao_d + 1e-6); ade_chain = ac_n / (ac_d + 1e-6)
-    return {"ade": an / ad, "fde": fn / fd, "drift": drift, "n_static": n_static,
-            "ade_open": ade_open, "ade_chain": ade_chain,
-            "compound_ratio": ade_chain / (ade_open + 1e-6)}
+    metrics = {"ade": an / ad, "fde": fn / fd, "drift": drift, "n_static": n_static,
+               "ade_open": ade_open, "ade_chain": ade_chain,
+               "compound_ratio": ade_chain / (ade_open + 1e-6)}
+    if return_model:
+        return metrics, m
+    return metrics
 
 
 def run_phase1(out_dir="outputs/flow_wm_v4/phase1_robot_drift"):
@@ -312,6 +333,38 @@ def run_ablation(out_dir="outputs/flow_wm_v4/phase1_ablation"):
     print("\n" + msg, flush=True)
 
 
+def run_horizon(out_dir="outputs/flow_wm_v4/phase1_horizon"):
+    os.makedirs(out_dir, exist_ok=True)
+    tr, vis, eef3, dom, vid = load()
+    gstats = fit_grasp_stats(grasp_openness(eef3), dom)
+    g_all = normalize_grasp(grasp_openness(eef3), dom, gstats)
+    test = torch.where((dom == 1) & (vid == TEST_ROBOT_VID))[0]
+    rob = torch.where((dom == 1) & (vid != TEST_ROBOT_VID))[0]
+    variants = [("thin", True, False), ("thin+antidrift", True, True), ("thick(full)", False, True)]
+    lines = [f"Phase-1 longer-horizon rollout | train={len(rob)} test={len(test)}",
+             "tail frames = [L-K:L]; hop0=open-loop, hop1=trained(1-hop), hop2=beyond(2-hop)",
+             "component versions: model=FlowWMThick (v4), data=flow_ds_v3.npz",
+             f"{'variant':>16} | {'hop0_ADE':>9} | {'hop1_ADE':>9} | {'hop2_ADE':>9} | {'hop2/hop0':>9}"]
+    for name, thin, ad in variants:
+        curves = []
+        for s in range(SEEDS):
+            _, m = train_eval(tr, vis, eef3, dom, gstats, rob, test, thin=thin, seed=s,
+                              antidrift=ad, return_model=True)
+            m.eval()
+            with torch.no_grad():
+                c = multihop_tail_ade(m, tr[test].to(device), vis[test].to(device),
+                                      eef3[test].to(device), g_all[test].to(device),
+                                      dom[test].to(device), hops=2)
+            curves.append(c)
+        curves = np.array(curves)                       # (SEEDS,3)
+        mu = curves.mean(0)
+        lines.append(f"{name:>16} | {mu[0]:9.2f} | {mu[1]:9.2f} | {mu[2]:9.2f} | {mu[2]/(mu[0]+1e-6):9.3f}")
+        print(lines[-1], flush=True)
+    msg = "\n".join(lines) + "\n"
+    open(os.path.join(out_dir, "summary.txt"), "w").write(msg)
+    print("\n" + msg, flush=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--probe-cg", action="store_true")
@@ -325,8 +378,10 @@ def main():
         run_phase2()
     elif a.phase == 3:
         run_ablation()
+    elif a.phase == 4:
+        run_horizon()
     else:
-        print("specify --probe-cg | --phase 1 | --phase 2 | --phase 3", flush=True)
+        print("specify --probe-cg | --phase 1 | --phase 2 | --phase 3 | --phase 4", flush=True)
 
 
 if __name__ == "__main__":

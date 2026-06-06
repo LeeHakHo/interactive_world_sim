@@ -159,3 +159,17 @@ def test_chained_rollout_shapes():
     overlap = v4.L - 2 * v4.K
     for x in (p_open, p_chain, gt):
         assert x.shape == (B, v4.P, overlap, 2)
+
+
+def test_multihop_tail_ade_returns_curve():
+    B = 4
+    tr = torch.randn(B, v4.L, v4.P, 2)
+    vis = torch.ones(B, v4.L, v4.P)
+    eef3 = torch.randn(B, v4.L, 3, 2)
+    g = torch.rand(B, v4.L)
+    dom = torch.zeros(B, dtype=torch.long)
+    m = v4.FlowWMThick(v4.P, thin=False)
+    m.dist_stats = {0: (0.0, 1.0)}
+    ades = v4.multihop_tail_ade(m, tr, vis, eef3, g, dom, hops=2)
+    assert len(ades) == 3                       # hop 0,1,2
+    assert all(a == a and a >= 0 for a in ades) # finite, non-negative
