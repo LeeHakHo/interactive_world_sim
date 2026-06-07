@@ -45,7 +45,9 @@
 
 ## 3. 核心算法：plane-pin（human eef → robot-world 平面）
 
-`z_plane`（全局单一常数）= 18 个 robot v3 数据集 `action_right_ee_position[:,2]` 的总均值（build 时实算，≈0.0996m）。
+`z_plane`（全局单一常数）= 18 个 robot v3 数据集 **`action_right_ee_position[:,2]`**（指令端，真·锁定平面）的总均值（build 时实算，≈**0.100m**）。
+
+**为什么用 action 而非 obs**（已实测 `play_robot_v3_1_eef`）：`action[t]` 是下一步指令位姿（`action[t]≈obs[t+1]`，dist 0.0166<0.0180m），其 z 锁定 = mean 0.1002 / std 0.00033；`obs_right_ee_position` z = mean 0.0866 / std 0.00584（实际 EE 因柔顺下沉~1.4cm 且抖 17×）。用户说的"锁住 z"= 指令端的锁，故取 action z。注：本流水线只需此单一常数，action 的"下一步"偏移对常数无影响；下游若逐帧比 robot↔human eef 再单独决定 obs vs action。
 
 对每个**检测帧**，输入 = phantom 全 ep smooth 后的 `ee_pts`（cam 系 3D，p_cam）：
 
