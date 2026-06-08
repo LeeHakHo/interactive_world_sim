@@ -127,6 +127,19 @@ phantom 本来就自动存：
 
 ---
 
+## 8b. 修订（2026-06-08，bbox-gate 后）
+
+### bbox 漏检根因 + crop 修复
+v3 首跑 bbox 右手检出仅 ~76%（vs v1 85.5%），最长连续漏 16.7s。诊断（`derisk_bbox_dino_sweep.py` / `derisk_bbox_crop_fullfilter.py`）证：**不是 DINO 检测力/阈值**（"a hand"@0.20 对漏检帧都能检到手），而是**手从画面侧缘伸入带裸前臂 → DINO 返回 hand+arm 细长框 → 被 phantom 单臂 filter `aspect<1.8` 拒（该 filter 是有意保留，只留手框避免拖垮 eef）→ 判漏检**。
+**修复**：在 `phantom/phantom/processors/bbox_processor.py` 加 `DETECT_CROP_XYWH=(190,225,210,205)` + `_detect_hand()`：检测前 crop 到工作区 → DINO → 框**偏移映射回全帧坐标** → 裸臂被裁掉、框变方过原 filter。下游 HaMeR/eef 全用全帧不变。实测 chunk1000/1001 检出 75/77% → **85.5/87.5%**，框 aspect p95 1.77、整臂框 0%。filter 一行未改。（phantom 是独立 git 仓且工作树本就含用户未提交 patch，此改动同样留作工作树修改不 commit。）
+
+### 下游 eef 表示：3 点 2D@crop128 + 3D 保留
+下游 flow-WM 训练用 **crop(190,225,210,205)→resize 128** 的图像。eef 数据集除存 §3 的 3D robot-world pose 外，**新增 3 个手关键点（wrist=kpt0 / thumb=kpt4 / index=kpt8，取自 `hand_processor/hand_data_right.npz` 的 `kpts_2d`，全帧像素）投影到 crop128 的 2D 像素**列，与 robot 的 base+两爪尖三点同构。
+- 投影：`u' = (u-190)*(128/210)`，`v' = (v-225)*(128/205)`。
+- **腕（kpt0）常落在 crop 外**（手从右缘进，u≈414>400）→ 原样存（可能 <0 或 >128），配 detected 标志，下游自行 clip/mask。
+- eef 的 3D robot-world 值与 crop/分辨率无关、不随下游用 crop 图而变；2D 只是其投影。
+- 新增列（每点各一）：`observation.eef.kpt2d_crop128_{wrist,thumb,index}` float32 (2,)（NaN if 未检测）。
+
 ## 9. 风险
 
 - **R1（最高）bbox 检测错** → hand2d/eef 全废。缓解 = §4 BBOX GATE，pilot 先核 `video_bboxes.mkv` 再铺开。
