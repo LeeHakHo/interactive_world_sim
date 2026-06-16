@@ -71,3 +71,13 @@ def test_vel_normalize_roundtrip():
     stats = S.fit_vel_stats(v, dom)
     back = S.denormalize_vel(S.normalize_vel(v, dom, stats), dom, stats)
     assert np.allclose(back, v, atol=1e-5)
+
+
+def test_transform_tracks_roundtrip():
+    import exp_scel_agentframe as X
+    rng = np.random.default_rng(2)
+    tr = rng.random((3, 24, 48, 2)).astype(np.float32)
+    ef = rng.random((3, 24, 3, 2)).astype(np.float32)
+    rel = X.transform_tracks(tr, ef, fwd=True)
+    back = X.transform_tracks(rel, ef, fwd=False)
+    assert np.allclose(back, tr, atol=1e-5)
