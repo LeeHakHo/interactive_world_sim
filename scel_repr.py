@@ -61,6 +61,7 @@ def fit_vel_stats(vel, dom):
     vel = np.asarray(vel); dom = np.asarray(dom)
     D = vel.shape[-1]
     flat = vel.reshape(-1, D)
+    assert flat.shape[0] % len(dom) == 0, f"vel leading dim {flat.shape[0]} not divisible by dom len {len(dom)}"
     dflat = np.repeat(dom, flat.shape[0] // len(dom)) if flat.shape[0] != len(dom) else dom
     stats = {}
     for d in (0, 1):
