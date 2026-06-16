@@ -39,6 +39,17 @@ def draw_frame(frame, gtc, wc, ac, h):
     return im
 
 
+def draw_fp(frame, gtp, wp, ap):
+    """convex-hull footprint outlines (what ③ fills as the cube): GT green / world red / agentframe blue.
+    *p are (48,2) normalized predicted/GT cube points at one frame."""
+    im = np.ascontiguousarray(frame)
+    for pts, col in [(gtp, GT_C), (wp, W_C), (ap, A_C)]:
+        p = np.clip(pts * IMG, 0, IMG - 1).astype(np.int32).reshape(-1, 1, 2)
+        if len(p) >= 3:
+            cv2.polylines(im, [cv2.convexHull(p)], True, col, 1)
+    return im
+
+
 def main():
     zr = np.load(f"{X.DS}/clips_robot.npz"); zh = np.load(f"{X.DS}/clips_human.npz")
     r_tr, r_ef, r_vs = zr["tracks"].astype(np.float32), zr["eef"].astype(np.float32), zr["vis"].astype(np.float32)
@@ -79,6 +90,19 @@ def main():
         lines.append(f"{s:>4} | {ade_w[si]:9.2f} | {ade_a[si]:14.2f}")
     fig.suptitle("GT(green) / world-pred(red) / agent-frame-pred(blue) cube centroid+trajectory", fontsize=11)
     fig.tight_layout(); fig.savefig(f"{OUT}/flow_grid.png", dpi=115); plt.close(fig)
+
+    # footprint (convex-hull) viz — closer to what ③ actually renders (cube = filled hull of 48 pred pts)
+    fig2, ax2 = plt.subplots(NSEQ, len(cols), figsize=(2 * len(cols), 2 * NSEQ), squeeze=False)
+    for si, s in enumerate(chosen):
+        for ci, h in enumerate(cols):
+            im = draw_fp(r_fr[idx[si], K + h], gt[chosen][si, h], pw[si, h], pa[si, h])
+            ax2[si, ci].imshow(im); ax2[si, ci].axis("off")
+            if ci == 0: ax2[si, ci].set_title(f"seq{s}", fontsize=7, loc="left")
+        gif2 = [Image.fromarray(draw_fp(r_fr[idx[si], K + h], gt[chosen][si, h], pw[si, h], pa[si, h])) for h in range(H)]
+        gif2[0].save(f"{OUT}/fp_seq{s}.gif", save_all=True, append_images=gif2[1:], duration=180, loop=0)
+    fig2.suptitle("footprint convex-hull: GT(green) / world-pred(red) / agent-frame-pred(blue) — what ③ fills", fontsize=11)
+    fig2.tight_layout(); fig2.savefig(f"{OUT}/footprint_grid.png", dpi=115); plt.close(fig2)
+
     lines.append(f"\nMEAN | world {ade_w.mean():.2f} | agentframe {ade_a.mean():.2f}")
     open(f"{OUT}/summary.txt", "w").write("\n".join(lines) + "\n")
     print("\n".join(lines) + f"\nsaved {OUT}/\n=== DONE ===", flush=True)
