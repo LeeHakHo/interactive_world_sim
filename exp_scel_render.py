@@ -17,7 +17,8 @@ from amplify_wm import K, device
 
 SMOKE = os.environ.get("SMOKE", "0") == "1"
 DS = X.DS
-OUT = "outputs/cross_embodiment_wm/scel_m1_render" + ("_gmask" if PX.USE_GMASK else ""); os.makedirs(f"{OUT}/gifs", exist_ok=True)
+OUT = ("outputs/cross_embodiment_wm/scel_m1_render" + ("_gmask" if PX.USE_GMASK else "")
+       + (f"_lpips{PX.LAMBDA_LPIPS:g}" if PX.LAMBDA_LPIPS > 0 else "")); os.makedirs(f"{OUT}/gifs", exist_ok=True)
 H = 16; HELDOUT = 150; N_ROB = 100; NSEQ = 2 if SMOKE else 6; IMG = 128
 
 
