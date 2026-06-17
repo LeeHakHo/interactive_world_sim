@@ -14,7 +14,8 @@ SMOKE = os.environ.get("SMOKE", "0") == "1"
 DS_TRAIN = "outputs/flow_render_dataset_v3"; DS_LONG = "outputs/flow_render_dataset_v3_long"
 H = 40; NSEQ = 12; HELDOUT = 150; IMG = 128; VEL_HALF = 0.06
 RENDERER = os.environ.get("RENDERER", "outputs/cross_embodiment_wm/renderer_long_fp_novis/renderer.pt")
-OUT = "outputs/cross_embodiment_wm/scel_render_ss_H40"; os.makedirs(f"{OUT}/gifs", exist_ok=True)
+ABLATE = os.environ.get("ABLATE", "0") == "1"     # True: teacher-forced vs SS (both long); False: short vs long data
+OUT = "outputs/cross_embodiment_wm/scel_render_ss" + ("_ablation" if ABLATE else "") + "_H40"; os.makedirs(f"{OUT}/gifs", exist_ok=True)
 
 
 def metric(rseq, gt_s):
@@ -32,16 +33,22 @@ def main():
     st, se, sv = zt["tracks"].astype(np.float32), zt["eef"].astype(np.float32), zt["vis"].astype(np.float32)
     spool = np.random.default_rng(0).permutation(len(st))[HELDOUT:]
     if SMOKE: spool = spool[:200]
-    print("=== train short-clip ② ===", flush=True)
-    wm_s = train_lwc_ss(st, sv, se, torch.from_numpy(spool), W=15, vel_half=VEL_HALF, seed=0)
-    # long-data ② (Route 1, drifts to ~2px)
     zl = np.load(f"{DS_LONG}/clips_robot.npz")
     lt, le, lv, lf = (zl["tracks"].astype(np.float32), zl["eef"].astype(np.float32),
                       zl["vis"].astype(np.float32), zl["frames"]); ljt = zl["joint"].astype(np.float32)
     perm = np.random.default_rng(0).permutation(len(lt)); ho, lpool = perm[:HELDOUT], perm[HELDOUT:]
     if SMOKE: lpool = lpool[:200]
-    print("=== train long-data ② (Route 1) ===", flush=True)
-    wm_l = SL.train_long(lt, lv, le, torch.from_numpy(lpool), 32 if not SMOKE else 8)
+    R = 8 if SMOKE else 32
+    if ABLATE:                                                  # SS protocol on/off (both long data, isolate SS)
+        print("=== train long teacher-forced ② (SS OFF) / long SS ② (SS ON) ===", flush=True)
+        wm_s = SL.train_long(lt, lv, le, torch.from_numpy(lpool), R, p_fixed=1.0)
+        wm_l = SL.train_long(lt, lv, le, torch.from_numpy(lpool), R)
+        lab_s, lab_l = "teacher(SSoff)", "SS(on)"
+    else:                                                       # training data length: short vs long
+        print("=== train short-clip ② / long-data ② ===", flush=True)
+        wm_s = train_lwc_ss(st, sv, se, torch.from_numpy(spool), W=15, vel_half=VEL_HALF, seed=0)
+        wm_l = SL.train_long(lt, lv, le, torch.from_numpy(lpool), R)
+        lab_s, lab_l = "short-clip", "long-data"
 
     gt = lt[ho][:, K:K + H]
     tt = torch.from_numpy(lt[ho]).float().to(device); ee = torch.from_numpy(le[ho]).float().to(device)
@@ -50,8 +57,8 @@ def main():
     mot = np.linalg.norm(np.diff(gt.mean(2), axis=1), axis=-1).sum(1)
     order = list(np.argsort(-mot)); pick = sorted(set(int(x) for x in np.linspace(0, len(order) - 1, NSEQ)))
     chosen = [order[i] for i in pick][:NSEQ]
-    lines = [f"Route1 viz IN PIXELS: short-clip② vs long-data② rendered H={H} | renderer_long | robot held-out",
-             f"{'seq':>4} | {'GTflow':>11} | {'short②':>11} | {'long②':>11}  (px/det)"]
+    lines = [f"viz IN PIXELS: {lab_s}② vs {lab_l}② rendered H={H} | renderer_long | robot held-out",
+             f"{'seq':>4} | {'GTflow':>11} | {lab_s:>13} | {lab_l:>13}  (px/det)"]
     gp, gd, sp, sd, lp, ld = [], [], [], [], [], []
     u8 = lambda x: (np.clip(x, 0, 1) * 255).astype(np.uint8)
     for s in chosen:
@@ -66,10 +73,9 @@ def main():
         render4 = np.stack([bg, u8(rg), u8(rs), u8(rl)])
         flow4 = build_flow_cols(bg, gt[s], [None, None, pr_s[s], pr_l[s]], ef_seq)
         save_combined_gif(f"{OUT}/gifs/seq{s}.gif", render4, flow4,
-                          ["GT", "GTflow3", "short-clip2", "long-data2"], [None, pg, ps, pl], K)
+                          ["GT", "GTflow3", lab_s, lab_l], [None, pg, ps, pl], K)
     f = lambda a: float(np.mean(a))
-    lines += ["", f"MEAN GTflow {f(gp):.1f}/det{f(gd):.2f} | short-clip② {f(sp):.1f}/det{f(sd):.2f} | long-data② {f(lp):.1f}/det{f(ld):.2f}  (n={len(chosen)} H={H})",
-              "long-data② should render cube more stably (lower px) than short-clip② at long horizon."]
+    lines += ["", f"MEAN GTflow {f(gp):.1f}/det{f(gd):.2f} | {lab_s}② {f(sp):.1f}/det{f(sd):.2f} | {lab_l}② {f(lp):.1f}/det{f(ld):.2f}  (n={len(chosen)} H={H})"]
     open(f"{OUT}/summary.txt", "w").write("\n".join(lines) + "\n")
     print("\n" + "\n".join(lines) + f"\nsaved {OUT}/\n=== DONE ===", flush=True)
 

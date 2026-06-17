@@ -16,15 +16,16 @@ R_SS_LIST = [int(x) for x in os.environ.get("R_SS_LIST", "16,24,32,40").split(",
 OUT = "outputs/cross_embodiment_wm/scel_ss_long"; os.makedirs(OUT, exist_ok=True)
 
 
-def train_long(tracks, vis, eef, idx, R_SS, seed=0):
-    """SS training on long clips with SLIDING eef window (K+F=24), R_SS up to L-K steps."""
+def train_long(tracks, vis, eef, idx, R_SS, seed=0, p_fixed=None):
+    """SS training on long clips with SLIDING eef window (K+F=24), R_SS up to L-K steps.
+    p_fixed=1.0 -> teacher-forced (SS OFF, always feed GT); None -> scheduled sampling (anneal 1.0->0.3)."""
     torch.manual_seed(seed); P = tracks.shape[2]
     m = A.FlowWM_LWC(P, Dm=384, layers=3, W=15, vel_half=VEL_HALF).to(device)
     opt = torch.optim.AdamW(m.parameters(), lr=SSm.WM_LR)
     g = torch.Generator().manual_seed(seed)
     tr = torch.from_numpy(tracks).float(); vs = torch.from_numpy(vis).float(); ef = torch.from_numpy(eef).float()
     for ep in range(SSm.WM_EPOCHS):
-        pteach = 1.0 + (0.3 - 1.0) * ep / max(SSm.WM_EPOCHS - 1, 1)
+        pteach = p_fixed if p_fixed is not None else 1.0 + (0.3 - 1.0) * ep / max(SSm.WM_EPOCHS - 1, 1)
         m.train(); pe = idx[torch.randperm(len(idx), generator=g)]
         for i in range(0, len(pe), SSm.WM_BS):
             b = pe[i:i + SSm.WM_BS]
