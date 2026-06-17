@@ -16,7 +16,8 @@ import eval_scheduled_sampling as SSm
 from amplify_wm import K, device
 
 SMOKE = os.environ.get("SMOKE", "0") == "1"
-DS = X.DS; OUT = "outputs/cross_embodiment_wm/scel_m1_render"; os.makedirs(f"{OUT}/gifs", exist_ok=True)
+DS = X.DS
+OUT = "outputs/cross_embodiment_wm/scel_m1_render" + ("_gmask" if PX.USE_GMASK else ""); os.makedirs(f"{OUT}/gifs", exist_ok=True)
 H = 16; HELDOUT = 150; N_ROB = 100; NSEQ = 2 if SMOKE else 6; IMG = 128
 
 
@@ -52,7 +53,8 @@ def main():
     Nr = len(r_tr); perm = np.random.default_rng(0).permutation(Nr); ho, pool = perm[:HELDOUT], perm[HELDOUT:]
     X.tracks_world, X.vis_all = r_tr, r_vs
 
-    print("=== train ③ renderer (footprint+novis, robot pool) ===", flush=True)
+    if PX.USE_GMASK: PX.load_gmask()
+    print(f"=== train ③ renderer (footprint+novis, robot pool, USE_GMASK={PX.USE_GMASK}) ===", flush=True)
     ren = PX.train_renderer(r_fr, r_tr, r_ef, r_vs, r_jt, pool if not SMOKE else pool[:120])
 
     mtr = np.concatenate([r_tr, h_tr]); mef = np.concatenate([r_ef, h_ef]); mvs = np.concatenate([r_vs, h_vs])
@@ -77,9 +79,10 @@ def main():
     G, W_, Aa = [], [], []
     for si, s in enumerate(chosen):
         I0 = r_fr[idx[si], 0]; ef_seq = r_ef[idx[si], K:K + H]; vis_seq = r_vs[idx[si], K:K + H]
-        rn_g = PX.render_seq(ren, I0, r_tr[idx[si], 0], r_ef[idx[si], 0], gt_obj[si], ef_seq, vis_seq)
-        rn_w = PX.render_seq(ren, I0, r_tr[idx[si], 0], r_ef[idx[si], 0], pw[si], ef_seq, vis_seq)
-        rn_a = PX.render_seq(ren, I0, r_tr[idx[si], 0], r_ef[idx[si], 0], pa[si], ef_seq, vis_seq)
+        jt_seq = r_jt[idx[si], K:K + H]
+        rn_g = PX.render_seq(ren, I0, r_tr[idx[si], 0], r_ef[idx[si], 0], gt_obj[si], ef_seq, vis_seq, jt_seq)
+        rn_w = PX.render_seq(ren, I0, r_tr[idx[si], 0], r_ef[idx[si], 0], pw[si], ef_seq, vis_seq, jt_seq)
+        rn_a = PX.render_seq(ren, I0, r_tr[idx[si], 0], r_ef[idx[si], 0], pa[si], ef_seq, vis_seq, jt_seq)
         gc = gt_obj[si].mean(1)
         eg, dg = agg(rn_g, gc); ew, dw = agg(rn_w, gc); ea, da = agg(rn_a, gc)
         G.append(eg); W_.append(ew); Aa.append(ea)
