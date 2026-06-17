@@ -16,11 +16,30 @@ R_SS_LIST = [int(x) for x in os.environ.get("R_SS_LIST", "16,24,32,40").split(",
 OUT = "outputs/cross_embodiment_wm/scel_ss_long"; os.makedirs(OUT, exist_ok=True)
 
 
-def train_long(tracks, vis, eef, idx, R_SS, seed=0, p_fixed=None):
+class ActThickLWC(A.FlowWM_LWC):
+    """action-thickened ②: act input = eef [rel-pos, velocity, acceleration] vs position-only.
+    Pure action condition (eef both domains, known input) -> safe to thicken; targets OOD-action."""
+    def __init__(s, P, **kw):
+        super().__init__(P, **kw)
+        s.act = nn.Linear((K + F) * 3 * 2 * 3, s.Dm)
+
+    def trunk(s, hist, eef3):
+        B, P = hist.shape[:2]
+        anchor = hist[:, :, -1, :]
+        obj = s.inp(torch.cat([(hist - anchor[:, :, None]).reshape(B, P, 2 * K), anchor], -1))
+        objc = anchor.mean(1, keepdim=True)
+        ef_rel = eef3 - objc[:, :, None]
+        ev = torch.zeros_like(eef3); ev[:, 1:] = eef3[:, 1:] - eef3[:, :-1]
+        ea = torch.zeros_like(eef3); ea[:, 2:] = ev[:, 2:] - ev[:, 1:-1]
+        act = s.act(torch.cat([ef_rel, ev, ea], -1).reshape(B, -1))[:, None, :]
+        return s.tf(torch.cat([obj, act], 1))[:, :P], anchor
+
+
+def train_long(tracks, vis, eef, idx, R_SS, seed=0, p_fixed=None, model_cls=None):
     """SS training on long clips with SLIDING eef window (K+F=24), R_SS up to L-K steps.
-    p_fixed=1.0 -> teacher-forced (SS OFF, always feed GT); None -> scheduled sampling (anneal 1.0->0.3)."""
+    p_fixed=1.0 -> teacher-forced (SS OFF); None -> scheduled sampling. model_cls -> custom ② (ActThickLWC)."""
     torch.manual_seed(seed); P = tracks.shape[2]
-    m = A.FlowWM_LWC(P, Dm=384, layers=3, W=15, vel_half=VEL_HALF).to(device)
+    m = (model_cls or A.FlowWM_LWC)(P, Dm=384, layers=3, W=15, vel_half=VEL_HALF).to(device)
     opt = torch.optim.AdamW(m.parameters(), lr=SSm.WM_LR)
     g = torch.Generator().manual_seed(seed)
     tr = torch.from_numpy(tracks).float(); vs = torch.from_numpy(vis).float(); ef = torch.from_numpy(eef).float()
@@ -81,18 +100,21 @@ def main():
     tr, ef, vs = zl["tracks"].astype(np.float32), zl["eef"].astype(np.float32), zl["vis"].astype(np.float32)
     perm = np.random.default_rng(0).permutation(len(tr)); ho, pool = perm[:HELDOUT], perm[HELDOUT:]
     if SMOKE: pool = pool[:200]
-    lines = [f"Route1 longer-SS rollout training | LONG data (L={tr.shape[1]}) robot-only | eval H={H} centroid drift px@128",
-             f"{'R_SS':>5} | {'s0':>6} {'s10':>6} {'s20':>6} {'s39':>6} {'overall':>8} | {'gain':>6}"]
+    actthick = os.environ.get("ACTTHICK", "0") == "1"
+    configs = ([("baseline-eef3", None), ("action-thick", ActThickLWC)] if actthick
+               else [(f"R_SS={r}", r) for r in R_SS_LIST])
+    lines = [f"{'ACTTHICK (in-dist drift)' if actthick else 'Route1 longer-SS'} | LONG data robot-only | eval H={H} px@128",
+             f"{'config':>14} | {'s0':>6} {'s10':>6} {'s20':>6} {'s39':>6} {'overall':>8} | {'gain':>6}"]
     print("\n".join(lines), flush=True)
-    for r in R_SS_LIST:
-        wm = train_long(tr, vs, ef, torch.from_numpy(pool), r)
-        e = drift(wm, tr, ef, ho)                                            # (HO,H)
-        g = per_step_gain(wm, tr, ef, ho)
+    for name, cfg in configs:
+        wm = (train_long(tr, vs, ef, torch.from_numpy(pool), 8 if SMOKE else 32, model_cls=cfg) if actthick
+              else train_long(tr, vs, ef, torch.from_numpy(pool), cfg))
+        e = drift(wm, tr, ef, ho); g = per_step_gain(wm, tr, ef, ho)
         s = lambda k: e[:, min(k, H - 1)].mean()
-        lines.append(f"{r:>5} | {s(0):6.1f} {s(10):6.1f} {s(20):6.1f} {s(39):6.1f} {e.mean():8.1f} | {g:6.3f}")
+        lines.append(f"{name:>14} | {s(0):6.1f} {s(10):6.1f} {s(20):6.1f} {s(39):6.1f} {e.mean():8.1f} | {g:6.3f}")
         print(lines[-1], flush=True)
-    lines += ["", "flat/saturating curve + gain<1 = bounded for ARBITRARY horizon (true criterion)"]
-    open(f"{OUT}/summary.txt", "w").write("\n".join(lines) + "\n")
+    lines += ["", "in-dist drift (action REPLAY = in-dist). OOD-action (synthetic) eval is separate."]
+    open(f"{OUT}/{'summary_actthick' if actthick else 'summary'}.txt", "w").write("\n".join(lines) + "\n")
     print("\n".join(lines) + f"\nsaved {OUT}/\n=== DONE ===", flush=True)
 
 
