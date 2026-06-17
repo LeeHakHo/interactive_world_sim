@@ -300,6 +300,9 @@ def main():
     parser.add_argument("--src-human", default=None, help="Human source directory (e.g. data/play_v2/human_train). Episodes included with action/wrist masked.")
     parser.add_argument("--src-human-eef", default=None, help="Human EEF source directory (e.g. data/play_v2/human_eef_train). EEF converted from camera frame to robot base frame; per-frame action_mask based on detection.")
     parser.add_argument("--dst", required=True, help="Output directory for HDF5 dataset")
+    parser.add_argument("--val-stems", nargs="+", default=None,
+                        help="Episode stems from --src-robot to use as val (e.g. episode_000000). "
+                             "Remaining robot episodes go to train. Ignored if --src-robot-val is set.")
     parser.add_argument("--val-human", action="store_true", help="Use last human episode as val (only applies when --src-robot-val is not set)")
     parser.add_argument("--crop", type=int, nargs=4, metavar=("X", "Y", "W", "H"),
                         default=None, help="Crop region for cam_high: x y w h (pixels)")
@@ -328,12 +331,19 @@ def main():
         robot_val_stems = collect_episode_stems(robot_val_dir)
         print(f"Found {len(robot_val_stems)} val episodes in {robot_val_dir}")
         robot_train = robot_stems  # all train-source episodes → train
-        robot_val   = []
+    elif args.val_stems:
+        val_set = set(args.val_stems)
+        missing = val_set - set(robot_stems)
+        if missing:
+            print(f"WARNING: --val-stems not found in {robot_dir}: {sorted(missing)}")
+        robot_val_dir = robot_dir
+        robot_val_stems = [s for s in robot_stems if s in val_set]
+        robot_train     = [s for s in robot_stems if s not in val_set]
+        print(f"Split by --val-stems: {len(robot_train)} train, {len(robot_val_stems)} val")
     else:
         robot_val_dir = robot_dir
         robot_val_stems = [robot_stems[-1]] if robot_stems else []
         robot_train = robot_stems[:-1]
-        robot_val   = []
 
     human_val   = [human_stems[-1]] if (human_stems and args.val_human) else []
     human_train = human_stems[:-1] if (human_stems and args.val_human) else human_stems

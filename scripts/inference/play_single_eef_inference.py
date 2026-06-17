@@ -156,6 +156,8 @@ def main():
     parser.add_argument("--episode", type=int, default=0)
     parser.add_argument("--resolution", type=int, default=128)
     parser.add_argument("--dec_infer_steps", type=int, default=3)
+    parser.add_argument("--start_frame", type=int, default=0,
+                        help="Frame index within the episode to start inference from (initial frame)")
     parser.add_argument("--step_size", type=float, default=STEP, help="EEF delta per keypress")
     parser.add_argument("--output_dir", default="outputs/inference")
     parser.add_argument("--device", default="cuda:0")
@@ -201,12 +203,18 @@ def main():
     print(f"Loading episode {args.episode}...")
     cam0_frames, cam1_frames, gt_actions = load_episode(args.dataset_dir, args.episode)
 
-    # Initialize EEF state from first GT action
-    eef_state = gt_actions[0].copy()  # [x, y, z, roll, pitch, yaw, gripper]
+    # Clamp start frame to valid range
+    start = max(0, min(args.start_frame, len(gt_actions) - 1))
+    if start != args.start_frame:
+        print(f"  start_frame {args.start_frame} out of range, clamped to {start}")
+    print(f"  starting from frame {start} (episode length {len(gt_actions)})")
+
+    # Initialize EEF state from the start-frame GT action
+    eef_state = gt_actions[start].copy()  # [x, y, z, roll, pitch, yaw, gripper]
     init_eef = eef_state.copy()
 
     # Encode initial frame
-    z0 = encode_frame(model, normalizer, cam0_frames[0], cam1_frames[0], device, dtype)
+    z0 = encode_frame(model, normalizer, cam0_frames[start], cam1_frames[start], device, dtype)
     curr_latent = z0.unsqueeze(1)  # (1, 1, C, H_lat, W_lat)
 
     action_tensor = torch.from_numpy(eef_state).to(device=device, dtype=dtype)
@@ -224,7 +232,7 @@ def main():
 
     try:
         while True:
-            gt_idx = min(step, len(cam0_frames) - 1)
+            gt_idx = min(start + step, len(cam0_frames) - 1)
             frame = make_video_frame(
                 cam0_frames[gt_idx], cam1_frames[gt_idx],
                 pred_frames[0], pred_frames[1], h, w,

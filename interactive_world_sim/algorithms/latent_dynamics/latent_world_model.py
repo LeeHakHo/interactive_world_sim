@@ -1098,7 +1098,7 @@ class LatentWorldModel(BasePytorchAlgo):
                 namespace=f"{namespace}_probe",
                 prefix="sequential",
                 context_frames=0,
-                captions=list(self._PROBE_ACTIONS.keys()),
+                captions=self._PROBE_KEY_SEQUENCE,
                 logger=self.logger.experiment,
             )
         self.probe_step_outputs.clear()
