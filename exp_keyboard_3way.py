@@ -17,6 +17,11 @@ OmegaConf.register_new_resolver("torch", lambda x: getattr(torch, x), replace=Tr
 
 from interactive_world_sim.algorithms.latent_dynamics.latent_world_model import LatentWorldModel
 from interactive_world_sim.algorithms.common.diffusion_helper import render_img_cm
+# ours ③/②/IK unpickle 类必须在 __main__ namespace 才能 torch.load (见 feedback)
+os.environ.setdefault("GRIP", "1"); os.environ.setdefault("REN_KIND", "detmem"); os.environ.setdefault("IK", "1")
+from exp_scel_latent_detmem import DetMemRenderer, render_detmem        # noqa: F401
+from exp_scel_grip_wm import GripLWC, rollout_grip                      # noqa: F401
+from exp_scel_ik_adapter import IKAdapter                              # noqa: F401
 
 DEVICE = "cuda"
 IMG = 128
@@ -119,6 +124,128 @@ def iws_rollout(model, cam_high0_u8, wrist0_u8, actions_raw, device=DEVICE):
     return (cam_high * 255).astype(np.uint8)
 
 
+# ── ours (object-flow ②③ detmem) replay ────────────────────────────────────
+def load_ours(device=DEVICE):
+    """复用 exp_scel_keyboard 的 grip② + detmem③ + IK adapter (GRIP/detmem 模式)."""
+    os.environ.setdefault("GRIP", "1"); os.environ.setdefault("REN_KIND", "detmem")
+    os.environ.setdefault("IK", "1")
+    import exp_scel_keyboard as KB
+    KB.load_gmask()
+    ren = torch.load(KB.DETMEM_PT, map_location=device, weights_only=False).to(device).eval()
+    wm = torch.load(KB.WM, map_location=device, weights_only=False).to(device).eval()
+    adapter = (torch.load(KB.ADAPTER_PT, map_location=device, weights_only=False).to(device).eval()
+               if os.path.exists(KB.ADAPTER_PT) else None)
+    return KB, ren, wm, adapter
+
+
+@torch.no_grad()
+def ours_replay(KB, ren, wm, adapter, z, si, Hd, device=DEVICE):
+    """真实 eef/grip → grip② cube flow → detmem③ → cam_high frames (Hd,128,128,3) u8, frame K..K+Hd."""
+    K = KB.K
+    lt = z["tracks"].astype(np.float32); le = z["eef"].astype(np.float32)
+    lv = z["vis"].astype(np.float32); lf = z["frames"]; lg = z["grip"].astype(np.float32)
+    ef_full = le[si, :K + Hd][None]; grip_full = lg[si, :K + Hd][None]
+    pr = KB.rollout_grip(wm, torch.from_numpy(lt[si:si + 1, :K]).float().to(device),
+                         torch.from_numpy(ef_full).float().to(device),
+                         torch.from_numpy(grip_full).float().to(device), Hd).cpu().numpy()[0]
+    ef_render = le[si, K:K + Hd]; vis_seq = lv[si, K:K + Hd]
+    if adapter is not None:
+        jt_use = adapter(torch.from_numpy(ef_render).float().to(device)).cpu().numpy()
+    else:
+        jt_use = z["joint"].astype(np.float32)[si, K:K + Hd]
+    rseq = np.asarray(KB.render_detmem(ren, lf[si, 0], lt[si], ef_render, vis_seq, jt_use, pr))
+    if rseq.dtype != np.uint8:
+        rseq = (np.clip(rseq, 0, 1) * 255).astype(np.uint8)
+    return rseq
+
+
+# ── metric ──────────────────────────────────────────────────────────────────
+def detect_cube(frame_u8):
+    hsv = cv2.cvtColor(frame_u8, cv2.COLOR_RGB2HSV)
+    h, s, v = hsv[..., 0], hsv[..., 1], hsv[..., 2]
+    mask = (((h > 163) | (h < 10)) & (s > 90) & (v > 35) & (v < 210)).astype(np.uint8)
+    if mask.sum() < 8:
+        return None
+    ys, xs = np.nonzero(mask)
+    return (float(xs.mean()), float(ys.mean()))
+
+
+def cube_pos_err(pred, gt):
+    """vs GT cube 位置误差; 必报检测率 + 消失率 (防 nan trap)."""
+    errs = []; det = 0; vanish = 0; n = 0
+    for pf, gf in zip(pred, gt):
+        gc = detect_cube(gf)
+        if gc is None:
+            continue
+        n += 1; pc = detect_cube(pf)
+        if pc is None:
+            vanish += 1; continue
+        det += 1; errs.append(float(np.hypot(pc[0] - gc[0], pc[1] - gc[1])))
+    return dict(cube_px=float(np.mean(errs)) if errs else float("nan"),
+                det_rate=det / max(n, 1), vanish=vanish / max(n, 1))
+
+
+def psnr(pred, gt):
+    mse = np.mean((pred.astype(np.float32) / 255 - gt.astype(np.float32) / 255) ** 2)
+    return float(10 * np.log10(1.0 / (mse + 1e-10)))
+
+
+def run_replay_3way(seq_idxs, out=OUT):
+    """三列 GT | IWS-naive | ours, 对齐 frame K..L-1, 出 gif + 质量 metric (summary.txt)."""
+    import imageio
+    z = np.load(NPZ)
+    iws_model = load_iws_wm()
+    KB, ren, wm, adapter = load_ours()
+    K = KB.K
+    try:
+        import lpips as _lp; lpfn = _lp.LPIPS(net="alex").to(DEVICE).eval()
+    except Exception as e:
+        print(f"[lpips skip] {e}"); lpfn = None
+
+    def lpips_seq(pred, gt):
+        if lpfn is None:
+            return float("nan")
+        with torch.no_grad():
+            def t(x): return (torch.from_numpy(x).float().permute(0, 3, 1, 2) / 127.5 - 1).to(DEVICE)
+            return float(lpfn(t(pred), t(gt)).mean())
+
+    os.makedirs(f"{out}/gifs", exist_ok=True); cache = {}
+    rows = []
+    for si in seq_idxs:
+        gt = z["frames"][si]; L = len(gt); Hd = L - K
+        act, wrist_clip, s = clip_world_action(z, si, cache)
+        iws = iws_rollout(iws_model, gt[K], wrist_clip[K], act[K:L])
+        ours = ours_replay(KB, ren, wm, adapter, z, si, Hd)
+        gt_win = gt[K:L]
+        T = min(len(gt_win), len(iws), len(ours))
+        gt_win, iws, ours = gt_win[:T], iws[:T], ours[:T]
+        frames = [np.concatenate([gt_win[t], iws[t], ours[t]], 1) for t in range(T)]
+        imageio.mimsave(f"{out}/gifs/seq{si}_replay3.gif", frames, fps=6)
+        m = dict(si=si,
+                 iws=dict(psnr=psnr(iws, gt_win), lpips=lpips_seq(iws, gt_win), **cube_pos_err(iws, gt_win)),
+                 ours=dict(psnr=psnr(ours, gt_win), lpips=lpips_seq(ours, gt_win), **cube_pos_err(ours, gt_win)))
+        rows.append(m)
+        print(f"[seq{si}] gif saved | IWS psnr={m['iws']['psnr']:.1f} cube={m['iws']['cube_px']:.1f}px det={m['iws']['det_rate']:.2f}"
+              f" | ours psnr={m['ours']['psnr']:.1f} cube={m['ours']['cube_px']:.1f}px det={m['ours']['det_rate']:.2f}", flush=True)
+
+    # summary.txt
+    def agg(side, key):
+        vals = [r[side][key] for r in rows if not np.isnan(r[side][key])]
+        return float(np.mean(vals)) if vals else float("nan")
+    with open(f"{out}/summary.txt", "w") as f:
+        f.write("Keyboard 三列 replay 质量对比 (GT | IWS-naive co-train | ours object-flow)\n")
+        f.write(f"seqs={[r['si'] for r in rows]}  对齐 frame K..L-1, cam_high only\n")
+        f.write("组件: IWS=checkpoints/epoch=3-step=250000.ckpt(hyeonhoo 2view H+R co-train) | ours=grip②+detmem③\n\n")
+        f.write(f"{'metric':<12}{'IWS-naive':>12}{'ours':>12}   (PSNR↑ LPIPS↓ cube_px↓ det_rate↑ vanish↓)\n")
+        for key in ["psnr", "lpips", "cube_px", "det_rate", "vanish"]:
+            f.write(f"{key:<12}{agg('iws',key):>12.3f}{agg('ours',key):>12.3f}\n")
+        f.write("\nper-seq:\n")
+        for r in rows:
+            f.write(f"  seq{r['si']:<4} IWS psnr={r['iws']['psnr']:.1f} lpips={r['iws']['lpips']:.3f} cube={r['iws']['cube_px']:.1f} det={r['iws']['det_rate']:.2f}"
+                    f" | ours psnr={r['ours']['psnr']:.1f} lpips={r['ours']['lpips']:.3f} cube={r['ours']['cube_px']:.1f} det={r['ours']['det_rate']:.2f}\n")
+    print(f"=> {out}/summary.txt + {len(rows)} gifs", flush=True)
+
+
 def _sanity(seq_idx=0, wrist_zero=False):
     z = np.load(NPZ)
     gt = z["frames"][seq_idx]                                  # (L,128,128,3) cam_high GT
@@ -141,4 +268,9 @@ def _sanity(seq_idx=0, wrist_zero=False):
 
 
 if __name__ == "__main__":
-    _sanity(int(os.environ.get("SEQ", 0)), wrist_zero=bool(int(os.environ.get("WZ", "0"))))
+    mode = os.environ.get("MODE", "replay3")
+    if mode == "sanity":
+        _sanity(int(os.environ.get("SEQ", 0)), wrist_zero=bool(int(os.environ.get("WZ", "0"))))
+    else:
+        seqs = [int(x) for x in os.environ.get("SEQS", "0,1,2").split(",")]
+        run_replay_3way(seqs)
