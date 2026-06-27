@@ -190,6 +190,15 @@ def psnr(pred, gt):
     return float(10 * np.log10(1.0 / (mse + 1e-10)))
 
 
+def label_cols(frame, names, w=IMG):
+    """在拼好的多列帧每列左上角写列名 (RGB, 黄字)."""
+    f = np.ascontiguousarray(frame)
+    for i, nm in enumerate(names):
+        cv2.putText(f, nm, (i * w + 3, 13), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 3, cv2.LINE_AA)
+        cv2.putText(f, nm, (i * w + 3, 13), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1, cv2.LINE_AA)
+    return f
+
+
 def run_replay_3way(seq_idxs, out=OUT):
     """三列 GT | IWS-naive | ours, 对齐 frame K..L-1, 出 gif + 质量 metric (summary.txt)."""
     import imageio
@@ -219,7 +228,8 @@ def run_replay_3way(seq_idxs, out=OUT):
         gt_win = gt[K:L]
         T = min(len(gt_win), len(iws), len(ours))
         gt_win, iws, ours = gt_win[:T], iws[:T], ours[:T]
-        frames = [np.concatenate([gt_win[t], iws[t], ours[t]], 1) for t in range(T)]
+        frames = [label_cols(np.concatenate([gt_win[t], iws[t], ours[t]], 1),
+                             ["GT", "IWS-naive", "ours"]) for t in range(T)]
         imageio.mimsave(f"{out}/gifs/seq{si}_replay3.gif", frames, fps=6)
         m = dict(si=si,
                  iws=dict(psnr=psnr(iws, gt_win), lpips=lpips_seq(iws, gt_win), **cube_pos_err(iws, gt_win)),
@@ -246,6 +256,135 @@ def run_replay_3way(seq_idxs, out=OUT):
     print(f"=> {out}/summary.txt + {len(rows)} gifs", flush=True)
 
 
+# ── keyboard 合成可控 demo (IWS-naive | ours) ───────────────────────────────
+def calib_world_to_img(world_xy, img_uv):
+    """从同一 eef 的 (world xy, 图像 uv) 拟合 world→image 2x2 (两表示同源,见对话)."""
+    X = np.c_[world_xy, np.ones(len(world_xy))]
+    A = np.linalg.lstsq(X, img_uv, rcond=None)[0]      # (3,2)
+    return A[:2].T                                       # (2img,2world): img_delta = A2 @ world_delta
+
+
+_IMG_DIRS = {"right": (1, 0), "left": (-1, 0), "up": (0, -1), "down": (0, 1)}   # image du,dv
+
+
+def synth_iws_action(start7, script, Jinv, step_px=4.0, repeat=5, grip_open=0.040, grip_close=0.0):
+    """keyboard 指令 → IWS world action (T,7). 平移经 Jinv 把图像方向转 world dim0/1; open/close ramp dim6."""
+    cur = start7.astype(np.float32).copy(); out = [cur.copy()]
+    for name, cnt in script:
+        n = cnt * repeat
+        for _ in range(n):
+            cur = cur.copy()
+            if name in _IMG_DIRS:
+                du, dv = _IMG_DIRS[name]
+                dxy = Jinv @ np.array([du * step_px, dv * step_px])
+                cur[0] += dxy[0]; cur[1] += dxy[1]
+            elif name == "open":
+                cur[6] = min(grip_open, cur[6] + grip_open / n)
+            elif name == "close":
+                cur[6] = max(grip_close, cur[6] - grip_open / n)
+            out.append(cur)
+    return np.stack(out)
+
+
+def ours_synth_eef(KB, ef_last3, script, step_img, g_start, g_close, g_open, repeat):
+    """ours 合成 eef(图像空间, 用 _IMG_DIRS 与 IWS 同方向同量) + grip. 复用 KB 指尖开合."""
+    base_c = ef_last3.mean(0); off0 = ef_last3 - base_c
+    c = base_c.astype(np.float32).copy(); g = float(g_start); efs = []; grips = []
+    for name, cnt in script:
+        n = cnt * repeat
+        for _ in range(n):
+            if name in _IMG_DIRS:
+                du, dv = _IMG_DIRS[name]; c = c + np.array([du, dv], np.float32) * step_img
+            elif name == "open":
+                g = min(g_open, g + (g_open - g_close) / n)
+            elif name == "close":
+                g = max(g_close, g - (g_open - g_close) / n)
+            off = KB._fingertip_offset(off0, g, g_close, g_open)
+            efs.append(c[None] + off); grips.append(g)
+    return np.stack(efs).astype(np.float32), np.array(grips, np.float32)
+
+
+@torch.no_grad()
+def ours_drive(KB, ren, wm, adapter, z, si, ef_fut, grip_fut, device=DEVICE):
+    """ours 合成: 真实 K 帧 history + 合成 ef_fut/grip_fut → grip② → detmem③ cam_high (Hd,128,128,3)."""
+    K = KB.K
+    lt = z["tracks"].astype(np.float32); le = z["eef"].astype(np.float32)
+    lv = z["vis"].astype(np.float32); lf = z["frames"]; lg = z["grip"].astype(np.float32)
+    Hd = len(ef_fut)
+    ef_full = np.concatenate([le[si, :K], ef_fut], 0)[None]
+    grip_full = np.concatenate([lg[si, :K], grip_fut], 0)[None]
+    pr = KB.rollout_grip(wm, torch.from_numpy(lt[si:si + 1, :K]).float().to(device),
+                         torch.from_numpy(ef_full).float().to(device),
+                         torch.from_numpy(grip_full).float().to(device), Hd).cpu().numpy()[0]
+    ef_render = ef_full[0, K:K + Hd]
+    vis_seq = lv[si, K:K + Hd] if K + Hd <= lv.shape[1] else np.ones((Hd, lt.shape[2]), np.float32)
+    jt = (adapter(torch.from_numpy(ef_render).float().to(device)).cpu().numpy()
+          if adapter is not None else np.repeat(z["joint"].astype(np.float32)[si, K:K + 1], Hd, 0))
+    rseq = np.asarray(KB.render_detmem(ren, lf[si, 0], lt[si], ef_render, vis_seq, jt, pr))
+    if rseq.dtype != np.uint8:
+        rseq = (np.clip(rseq, 0, 1) * 255).astype(np.uint8)
+    return rseq, pr
+
+
+SYNTH_SCRIPTS = {
+    "right_drag": [("right", 4)],
+    "left_drag": [("left", 4)],
+    "grab_drag_release": [("close", 1), ("right", 3), ("open", 1)],
+    "pump": [("close", 1), ("open", 1), ("close", 1), ("open", 1)],
+}
+
+
+def _dir_follow(cube_uv, script):
+    """cube 实际位移方向 vs 第一个移动指令方向的一致性 (cos)."""
+    move = next((nm for nm, _ in script if nm in _IMG_DIRS), None)
+    if move is None or len(cube_uv) < 2:
+        return float("nan")
+    d = cube_uv[-1] - cube_uv[0]
+    if np.linalg.norm(d) < 1:
+        return 0.0
+    tgt = np.array(_IMG_DIRS[move], float)
+    return float(np.dot(d, tgt) / (np.linalg.norm(d) * np.linalg.norm(tgt) + 1e-8))
+
+
+def run_synth_2way(seq_idxs, out=OUT, step_px=4.0):
+    """同键盘指令驱动 IWS-naive vs ours, 两列 gif + 可控 metric (cube travel + 方向跟随)."""
+    import imageio
+    z = np.load(NPZ)
+    iws_model = load_iws_wm(); KB, ren, wm, adapter = load_ours()
+    K = KB.K; lg = z["grip"].astype(np.float32); le = z["eef"].astype(np.float32)
+    g_close = float(np.percentile(lg, 5)); g_open = float(np.percentile(lg, 95))
+    os.makedirs(f"{out}/gifs", exist_ok=True); cache = {}; lines = []
+    for si in seq_idxs:
+        act, wrist_clip, s = clip_world_action(z, si, cache)
+        L = len(act)
+        Jinv = np.linalg.inv(calib_world_to_img(act[:L, :2], le[si, :L].mean(1) * IMG))
+        g_start = float(lg[si, K - 1])
+        step_img = float(KB.DELTA)            # ours 图像归一步长; IWS 用同等像素量
+        for sname, script in SYNTH_SCRIPTS.items():
+            # IWS: init frame K + 合成 world action (图像位移 step_img*IMG px 经 Jinv 转 world)
+            iws_act = synth_iws_action(act[K], script, Jinv, step_img * IMG, KB.REPEAT, g_open, g_close)
+            iws = iws_rollout(iws_model, z["frames"][si][K], wrist_clip[K], iws_act)
+            # ours: 合成 eef + grip (图像空间, 同 _IMG_DIRS 方向同量)
+            ef_fut, grip_fut = ours_synth_eef(KB, le[si, K - 1], script, step_img, g_start, g_close, g_open, KB.REPEAT)
+            ours, pr = ours_drive(KB, ren, wm, adapter, z, si, ef_fut, grip_fut)
+            T = min(len(iws), len(ours))
+            frames = [label_cols(np.concatenate([iws[t], ours[t]], 1), ["IWS-naive", "ours"]) for t in range(T)]
+            imageio.mimsave(f"{out}/gifs/seq{si}_{sname}.gif", frames, fps=6)
+            # 可控 metric: cube travel + 方向跟随 (IWS 从像素检测, ours 从 ② flow)
+            iws_uv = np.array([detect_cube(f) for f in iws], dtype=object)
+            iws_uv = np.array([p if p is not None else [np.nan, np.nan] for p in iws_uv], float)
+            ours_uv = pr.mean(1)[:T] * IMG
+            iws_tr = float(np.nanmax(np.linalg.norm(iws_uv - iws_uv[0], axis=1))) if np.isfinite(iws_uv).any() else float("nan")
+            ours_tr = float(np.linalg.norm(ours_uv[-1] - ours_uv[0]))
+            lines.append(f"seq{si} {sname:<18} IWS travel={iws_tr:5.1f}px follow={_dir_follow(iws_uv,script):+.2f}"
+                         f" | ours travel={ours_tr:5.1f}px follow={_dir_follow(ours_uv,script):+.2f}")
+            print(lines[-1], flush=True)
+    with open(f"{out}/summary_synth.txt", "w") as f:
+        f.write("keyboard 合成可控 demo (IWS-naive | ours, 同指令). travel=cube首末像素位移; follow=cube方向 vs 指令方向 cos\n")
+        f.write("IWS cube 从渲染像素 HSV 检测; ours cube 从 ② flow.\n\n" + "\n".join(lines) + "\n")
+    print(f"=> {out}/summary_synth.txt + synth gifs", flush=True)
+
+
 def _sanity(seq_idx=0, wrist_zero=False):
     z = np.load(NPZ)
     gt = z["frames"][seq_idx]                                  # (L,128,128,3) cam_high GT
@@ -269,8 +408,10 @@ def _sanity(seq_idx=0, wrist_zero=False):
 
 if __name__ == "__main__":
     mode = os.environ.get("MODE", "replay3")
+    seqs = [int(x) for x in os.environ.get("SEQS", "0,1,2").split(",")]
     if mode == "sanity":
         _sanity(int(os.environ.get("SEQ", 0)), wrist_zero=bool(int(os.environ.get("WZ", "0"))))
+    elif mode == "synth":
+        run_synth_2way(seqs)
     else:
-        seqs = [int(x) for x in os.environ.get("SEQS", "0,1,2").split(",")]
         run_replay_3way(seqs)
