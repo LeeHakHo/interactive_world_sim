@@ -22,6 +22,8 @@ os.environ.setdefault("GRIP", "1"); os.environ.setdefault("REN_KIND", "detmem");
 from exp_scel_latent_detmem import DetMemRenderer, render_detmem        # noqa: F401
 from exp_scel_grip_wm import GripLWC, rollout_grip                      # noqa: F401
 from exp_scel_ik_adapter import IKAdapter                              # noqa: F401
+from exp_detmem_eef_cotrain import render_eef as render_noflow, eef_splat  # 第三列: ours 架构去flow co-train
+NOFLOW_PT = os.environ.get("NOFLOW_PT", "outputs/cross_embodiment_wm/detmem_eef_cotrain_rh/detmem_eef.pt")
 
 DEVICE = "cuda"
 IMG = 128
@@ -206,6 +208,9 @@ def run_replay_3way(seq_idxs, out=OUT):
     iws_model = load_iws_wm()
     KB, ren, wm, adapter = load_ours()
     K = KB.K
+    noflow_m = (torch.load(NOFLOW_PT, map_location=DEVICE, weights_only=False).to(DEVICE).eval()
+                if os.path.exists(NOFLOW_PT) else None)
+    print(f"[noflow third column] {'loaded '+NOFLOW_PT if noflow_m is not None else 'NOT FOUND, skip'}", flush=True)
     try:
         import lpips as _lp; lpfn = _lp.LPIPS(net="alex").to(DEVICE).eval()
     except Exception as e:
@@ -225,34 +230,44 @@ def run_replay_3way(seq_idxs, out=OUT):
         act, wrist_clip, s = clip_world_action(z, si, cache)
         iws = iws_rollout(iws_model, gt[K], wrist_clip[K], act[K:L])
         ours = ours_replay(KB, ren, wm, adapter, z, si, Hd)
-        gt_win = gt[K:L]
-        T = min(len(gt_win), len(iws), len(ours))
-        gt_win, iws, ours = gt_win[:T], iws[:T], ours[:T]
-        frames = [label_cols(np.concatenate([gt_win[t], iws[t], ours[t]], 1),
-                             ["GT", "IWS-naive", "ours"]) for t in range(T)]
+        le_si = z["eef"].astype(np.float32)[si]
+        cols = {"GT": gt[K:L], "IWS-naive": iws}
+        if noflow_m is not None:
+            cols["ours-noflow"] = (np.clip(render_noflow(noflow_m, gt[0], le_si[K:L]), 0, 1) * 255).astype(np.uint8)
+        cols["ours"] = ours
+        T = min(len(v) for v in cols.values())
+        cols = {k: v[:T] for k, v in cols.items()}; names = list(cols.keys())
+        frames = [label_cols(np.concatenate([cols[k][t] for k in names], 1), names) for t in range(T)]
         imageio.mimsave(f"{out}/gifs/seq{si}_replay3.gif", frames, fps=6)
-        m = dict(si=si,
-                 iws=dict(psnr=psnr(iws, gt_win), lpips=lpips_seq(iws, gt_win), **cube_pos_err(iws, gt_win)),
-                 ours=dict(psnr=psnr(ours, gt_win), lpips=lpips_seq(ours, gt_win), **cube_pos_err(ours, gt_win)))
+        gtw = cols["GT"]
+        md = lambda p: dict(psnr=psnr(p, gtw), lpips=lpips_seq(p, gtw), **cube_pos_err(p, gtw))
+        m = {"si": si, "iws": md(cols["IWS-naive"]), "ours": md(cols["ours"])}
+        if "ours-noflow" in cols: m["noflow"] = md(cols["ours-noflow"])
         rows.append(m)
-        print(f"[seq{si}] gif saved | IWS psnr={m['iws']['psnr']:.1f} cube={m['iws']['cube_px']:.1f}px det={m['iws']['det_rate']:.2f}"
-              f" | ours psnr={m['ours']['psnr']:.1f} cube={m['ours']['cube_px']:.1f}px det={m['ours']['det_rate']:.2f}", flush=True)
+        print(f"[seq{si}] IWS psnr={m['iws']['psnr']:.1f} cube={m['iws']['cube_px']:.1f}"
+              + (f" | noflow psnr={m['noflow']['psnr']:.1f} cube={m['noflow']['cube_px']:.1f}" if "noflow" in m else "")
+              + f" | ours psnr={m['ours']['psnr']:.1f} cube={m['ours']['cube_px']:.1f}", flush=True)
 
     # summary.txt
     def agg(side, key):
         vals = [r[side][key] for r in rows if not np.isnan(r[side][key])]
         return float(np.mean(vals)) if vals else float("nan")
+    sides = ["iws"] + (["noflow"] if any("noflow" in r for r in rows) else []) + ["ours"]
+    sname = {"iws": "IWS-naive", "noflow": "ours-noflow", "ours": "ours"}
     with open(f"{out}/summary.txt", "w") as f:
-        f.write("Keyboard 三列 replay 质量对比 (GT | IWS-naive co-train | ours object-flow)\n")
-        f.write(f"seqs={[r['si'] for r in rows]}  对齐 frame K..L-1, cam_high only\n")
-        f.write("组件: IWS=checkpoints/epoch=3-step=250000.ckpt(hyeonhoo 2view H+R co-train) | ours=grip②+detmem③\n\n")
-        f.write(f"{'metric':<12}{'IWS-naive':>12}{'ours':>12}   (PSNR↑ LPIPS↓ cube_px↓ det_rate↑ vanish↓)\n")
+        f.write("Keyboard 四列 replay 质量对比 (GT | IWS-naive | ours-noflow | ours)\n")
+        f.write(f"seqs={[r['si'] for r in rows]}  对齐 frame K..L-1, cam_high\n")
+        f.write("IWS-naive = hyeonhoo 2view VAE+latent eef naive co-train | "
+                "ours-noflow = 同 VAE+latent transition(detmem) eef 条件 NO flow, robot+human co-train | "
+                "ours = object-flow ②③(detmem + flow)\n")
+        f.write("★ ablation: ours vs ours-noflow 隔离 object-flow; ours-noflow vs IWS 同(无flow eef co-train)不同实现\n\n")
+        f.write(f"{'metric':<12}" + "".join(f"{sname[s]:>14}" for s in sides) + "   (PSNR↑ LPIPS↓ cube_px↓ det↑ vanish↓)\n")
         for key in ["psnr", "lpips", "cube_px", "det_rate", "vanish"]:
-            f.write(f"{key:<12}{agg('iws',key):>12.3f}{agg('ours',key):>12.3f}\n")
+            f.write(f"{key:<12}" + "".join(f"{agg(s,key):>14.3f}" for s in sides) + "\n")
         f.write("\nper-seq:\n")
         for r in rows:
-            f.write(f"  seq{r['si']:<4} IWS psnr={r['iws']['psnr']:.1f} lpips={r['iws']['lpips']:.3f} cube={r['iws']['cube_px']:.1f} det={r['iws']['det_rate']:.2f}"
-                    f" | ours psnr={r['ours']['psnr']:.1f} lpips={r['ours']['lpips']:.3f} cube={r['ours']['cube_px']:.1f} det={r['ours']['det_rate']:.2f}\n")
+            f.write(f"  seq{r['si']:<5}" + " | ".join(
+                f"{sname[s]} psnr={r[s]['psnr']:.1f} lpips={r[s]['lpips']:.3f} cube={r[s]['cube_px']:.1f}" for s in sides if s in r) + "\n")
     print(f"=> {out}/summary.txt + {len(rows)} gifs", flush=True)
 
 
@@ -326,11 +341,9 @@ def ours_drive(KB, ren, wm, adapter, z, si, ef_fut, grip_fut, device=DEVICE):
     return rseq, pr
 
 
-SYNTH_SCRIPTS = {
-    "right_drag": [("right", 4)],
-    "left_drag": [("left", 4)],
-    "grab_drag_release": [("close", 1), ("right", 3), ("open", 1)],
-    "pump": [("close", 1), ("open", 1), ("close", 1), ("open", 1)],
+SYNTH_SCRIPTS = {                                    # box 绕圈回原点 = 分布内 (避静止 OOD 自漂移, 见 memory)
+    "box": [("right", 2), ("down", 2), ("left", 2), ("up", 2)],
+    "box_grip": [("close", 1), ("right", 2), ("down", 2), ("left", 2), ("up", 2), ("open", 1)],
 }
 
 
@@ -351,6 +364,8 @@ def run_synth_2way(seq_idxs, out=OUT, step_px=4.0):
     import imageio
     z = np.load(NPZ)
     iws_model = load_iws_wm(); KB, ren, wm, adapter = load_ours()
+    noflow_m = (torch.load(NOFLOW_PT, map_location=DEVICE, weights_only=False).to(DEVICE).eval()
+                if os.path.exists(NOFLOW_PT) else None)
     K = KB.K; lg = z["grip"].astype(np.float32); le = z["eef"].astype(np.float32)
     g_close = float(np.percentile(lg, 5)); g_open = float(np.percentile(lg, 95))
     os.makedirs(f"{out}/gifs", exist_ok=True); cache = {}; lines = []
@@ -367,17 +382,23 @@ def run_synth_2way(seq_idxs, out=OUT, step_px=4.0):
             # ours: 合成 eef + grip (图像空间, 同 _IMG_DIRS 方向同量)
             ef_fut, grip_fut = ours_synth_eef(KB, le[si, K - 1], script, step_img, g_start, g_close, g_open, KB.REPEAT)
             ours, pr = ours_drive(KB, ren, wm, adapter, z, si, ef_fut, grip_fut)
-            T = min(len(iws), len(ours))
-            frames = [label_cols(np.concatenate([iws[t], ours[t]], 1), ["IWS-naive", "ours"]) for t in range(T)]
+            cols = {"IWS-naive": iws}
+            if noflow_m is not None:
+                cols["ours-noflow"] = (np.clip(render_noflow(noflow_m, z["frames"][si][0], ef_fut), 0, 1) * 255).astype(np.uint8)
+            cols["ours"] = ours
+            T = min(len(v) for v in cols.values())
+            cols = {k: v[:T] for k, v in cols.items()}; names = list(cols.keys())
+            frames = [label_cols(np.concatenate([cols[k][t] for k in names], 1), names) for t in range(T)]
             imageio.mimsave(f"{out}/gifs/seq{si}_{sname}.gif", frames, fps=6)
-            # 可控 metric: cube travel + 方向跟随 (IWS 从像素检测, ours 从 ② flow)
-            iws_uv = np.array([detect_cube(f) for f in iws], dtype=object)
-            iws_uv = np.array([p if p is not None else [np.nan, np.nan] for p in iws_uv], float)
-            ours_uv = pr.mean(1)[:T] * IMG
-            iws_tr = float(np.nanmax(np.linalg.norm(iws_uv - iws_uv[0], axis=1))) if np.isfinite(iws_uv).any() else float("nan")
-            ours_tr = float(np.linalg.norm(ours_uv[-1] - ours_uv[0]))
-            lines.append(f"seq{si} {sname:<18} IWS travel={iws_tr:5.1f}px follow={_dir_follow(iws_uv,script):+.2f}"
-                         f" | ours travel={ours_tr:5.1f}px follow={_dir_follow(ours_uv,script):+.2f}")
+            # 可控 metric: box 绕圈→ net(回原点,小=跟手) + path(路程,大=动过) (IWS 像素检测 cube, ours ② flow)
+            uvof = lambda imgs: np.array([detect_cube(f) if detect_cube(f) is not None else [np.nan, np.nan] for f in imgs], float)
+            iws_uv = uvof(cols["IWS-naive"]); ours_uv = pr.mean(1)[:T] * IMG
+            net = lambda uv: float(np.linalg.norm(uv[np.isfinite(uv).all(1)][-1] - uv[np.isfinite(uv).all(1)][0])) if np.isfinite(uv).all(1).sum() > 1 else float("nan")
+            path = lambda uv: float(np.nansum(np.linalg.norm(np.diff(uv, axis=0), axis=1)))
+            nf_str = (f" | noflow net={net(uvof(cols['ours-noflow'])):5.1f} path={path(uvof(cols['ours-noflow'])):5.1f}"
+                      if "ours-noflow" in cols else "")
+            lines.append(f"seq{si} {sname:<8} IWS net={net(iws_uv):5.1f} path={path(iws_uv):5.1f}{nf_str}"
+                         f" | ours net={net(ours_uv):5.1f} path={path(ours_uv):5.1f}px  (box: net小+path大=跟手回原点)")
             print(lines[-1], flush=True)
     with open(f"{out}/summary_synth.txt", "w") as f:
         f.write("keyboard 合成可控 demo (IWS-naive | ours, 同指令). travel=cube首末像素位移; follow=cube方向 vs 指令方向 cos\n")
@@ -408,7 +429,15 @@ def _sanity(seq_idx=0, wrist_zero=False):
 
 if __name__ == "__main__":
     mode = os.environ.get("MODE", "replay3")
-    seqs = [int(x) for x in os.environ.get("SEQS", "0,1,2").split(",")]
+    if "SEQS" in os.environ:
+        seqs = [int(x) for x in os.environ["SEQS"].split(",")]
+    else:                                            # 默认: 复用 ours keyboard demo 的 seq (固定 layout)
+        import exp_scel_keyboard as KB
+        _z = np.load(NPZ); _lt = _z["tracks"].astype(np.float32); _le = _z["eef"].astype(np.float32)
+        _ho = np.random.default_rng(0).permutation(len(_lt))[:KB.HELDOUT]
+        _hi = sorted(set(KB.HO_IDX) | set(KB.pick_central(_lt, _ho, KB.NAUTO, _le)))
+        seqs = [int(_ho[h]) for h in _hi]
+        print(f"seqs (ours 选择 HO_IDX{KB.HO_IDX}+pick_central×{KB.NAUTO}) = {seqs}", flush=True)
     if mode == "sanity":
         _sanity(int(os.environ.get("SEQ", 0)), wrist_zero=bool(int(os.environ.get("WZ", "0"))))
     elif mode == "synth":
