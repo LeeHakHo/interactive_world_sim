@@ -23,6 +23,7 @@ from exp_scel_latent_detmem import DetMemRenderer, render_detmem        # noqa: 
 from exp_scel_grip_wm import GripLWC, rollout_grip                      # noqa: F401
 from exp_scel_ik_adapter import IKAdapter                              # noqa: F401
 from exp_detmem_eef_cotrain import render_eef as render_noflow, eef_splat  # 第三列: ours 架构去flow co-train
+from viz_combined import build_flow_cols, save_combined_gif              # ours 之前 gif layout (render行+flow overlay行+标题)
 NOFLOW_PT = os.environ.get("NOFLOW_PT", "outputs/cross_embodiment_wm/detmem_eef_cotrain_rh/detmem_eef.pt")
 
 DEVICE = "cuda"
@@ -237,8 +238,10 @@ def run_replay_3way(seq_idxs, out=OUT):
         cols["ours"] = ours
         T = min(len(v) for v in cols.values())
         cols = {k: v[:T] for k, v in cols.items()}; names = list(cols.keys())
-        frames = [label_cols(np.concatenate([cols[k][t] for k in names], 1), names) for t in range(T)]
-        imageio.mimsave(f"{out}/gifs/seq{si}_replay3.gif", frames, fps=6)
+        render_seq = np.stack([cols[k] for k in names])                 # (N,T,128,128,3)
+        gt_obj = z["tracks"].astype(np.float32)[si, K:K + T]; eef_seq = z["eef"].astype(np.float32)[si, K:K + T]
+        flow_seq = build_flow_cols(cols["GT"], gt_obj, [None] * len(names), eef_seq)   # 下行: GT cube(green)+eef(yellow) 参照
+        save_combined_gif(f"{out}/gifs/seq{si}_replay3.gif", render_seq, flow_seq, names, [None] * len(names), K)
         gtw = cols["GT"]
         md = lambda p: dict(psnr=psnr(p, gtw), lpips=lpips_seq(p, gtw), **cube_pos_err(p, gtw))
         m = {"si": si, "iws": md(cols["IWS-naive"]), "ours": md(cols["ours"])}
@@ -382,14 +385,18 @@ def run_synth_2way(seq_idxs, out=OUT, step_px=4.0):
             # ours: 合成 eef + grip (图像空间, 同 _IMG_DIRS 方向同量)
             ef_fut, grip_fut = ours_synth_eef(KB, le[si, K - 1], script, step_img, g_start, g_close, g_open, KB.REPEAT)
             ours, pr = ours_drive(KB, ren, wm, adapter, z, si, ef_fut, grip_fut)
-            cols = {"IWS-naive": iws}
+            mc = {"IWS-naive": iws}
             if noflow_m is not None:
-                cols["ours-noflow"] = (np.clip(render_noflow(noflow_m, z["frames"][si][0], ef_fut), 0, 1) * 255).astype(np.uint8)
-            cols["ours"] = ours
-            T = min(len(v) for v in cols.values())
-            cols = {k: v[:T] for k, v in cols.items()}; names = list(cols.keys())
-            frames = [label_cols(np.concatenate([cols[k][t] for k in names], 1), names) for t in range(T)]
-            imageio.mimsave(f"{out}/gifs/seq{si}_{sname}.gif", frames, fps=6)
+                mc["ours-noflow"] = (np.clip(render_noflow(noflow_m, z["frames"][si][0], ef_fut), 0, 1) * 255).astype(np.uint8)
+            mc["ours"] = ours
+            T = min(len(v) for v in mc.values())
+            gt_col = np.repeat(z["frames"][si][K][None].astype(np.uint8), T, 0)          # 合成无真实未来 → GT列=起始帧静态参照
+            cols = {"GT(start)": gt_col, **{k: v[:T] for k, v in mc.items()}}; names = list(cols.keys())
+            render_seq = np.stack([cols[k] for k in names])
+            flow_seq = build_flow_cols(gt_col, pr[:T], [None] * len(names), ef_fut[:T])   # 下行: ours ② 预测 cube + 合成 eef
+            _ar = {"right": "R", "left": "L", "up": "U", "down": "D", "open": "OPEN", "close": "CLOSE"}
+            cap = f"keyboard [{sname}]: " + " ".join(f"{cnt}{_ar.get(nm, nm)}" for nm, cnt in script)
+            save_combined_gif(f"{out}/gifs/seq{si}_{sname}.gif", render_seq, flow_seq, names, [None] * len(names), K, caption=cap)
             # 可控 metric: box 绕圈→ net(回原点,小=跟手) + path(路程,大=动过) (IWS 像素检测 cube, ours ② flow)
             uvof = lambda imgs: np.array([detect_cube(f) if detect_cube(f) is not None else [np.nan, np.nan] for f in imgs], float)
             iws_uv = uvof(cols["IWS-naive"]); ours_uv = pr.mean(1)[:T] * IMG
