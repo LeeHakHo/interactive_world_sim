@@ -81,3 +81,49 @@ class CombLWC(A.FlowWM_LWC):
         B, P = x.shape[:2]
         logits = s.head(x).reshape(B, P, F, s.W * s.W)
         return logits, anchor
+
+
+def _run_stage(m, tracks, vis, eef, idx, Nr, stage, epochs, seed):
+    m.warm_stage = stage
+    params = [p for p in m.parameters() if p.requires_grad]
+    opt = torch.optim.AdamW(params, lr=SSm.WM_LR)
+    g = torch.Generator().manual_seed(seed)
+    tr = torch.from_numpy(tracks).float(); vs = torch.from_numpy(vis).float(); ef = torch.from_numpy(eef).float()
+    for ep in range(epochs):
+        p = 1.0 + (0.3 - 1.0) * ep / max(epochs - 1, 1)
+        m.train(); pe = idx[torch.randperm(len(idx), generator=g)]
+        for i in range(0, len(pe), SSm.WM_BS):
+            b = pe[i:i + SSm.WM_BS]
+            is_h = (b >= Nr).to(device)
+            G = tr[b].to(device); Vv = vs[b].to(device); Ef = ef[b].to(device)
+            buf = G[:, :K].clone(); losses = []; regs = []
+            for h in range(SSm.R_SS):
+                logits, anchor = m(buf[:, -K:].permute(0, 2, 1, 3), Ef, is_h)
+                lg0 = logits[:, :, 0, :]
+                gt_vel = G[:, K + h] - buf[:, -1]
+                cls = vel_to_class(gt_vel, m.W, m.vel_half)
+                w = (Vv[:, K + h] * Vv[:, K - 1])
+                ce = nn.functional.cross_entropy(lg0.reshape(-1, m.W * m.W), cls.reshape(-1), reduction="none")
+                losses.append((ce * w.reshape(-1)).sum() / (w.sum() + 1e-6))
+                if m.combine in ("a1", "warm"): regs.append(m.aux["res_sq"] * m.lam_res)
+                elif m.combine == "align": regs.append(m.aux["align"] * m.lam_align)
+                nxt = buf[:, -1] + m.expected_vel(lg0)
+                use_gt = (torch.rand(len(b), 1, 1, device=device) < p)
+                buf = torch.cat([buf, torch.where(use_gt, G[:, K + h], nxt.detach())[:, None]], 1)
+            loss = torch.stack(losses).mean() + torch.stack(regs).mean()
+            opt.zero_grad(); loss.backward(); opt.step()
+
+
+def train_comb(tracks, vis, eef, idx, combine, Nr, seed=0, alpha=0.5, lam_res=1e-3, lam_align=0.3):
+    torch.manual_seed(seed); P = tracks.shape[2]
+    m = CombLWC(P, combine=combine, alpha=alpha, lam_res=lam_res, lam_align=lam_align,
+               Dm=384, layers=3, W=15, vel_half=V.VEL_HALF).to(device)
+    if combine == "warm":
+        _run_stage(m, tracks, vis, eef, idx, Nr, 1, SSm.WM_EPOCHS, seed)   # stage1: shared, robot+human
+        for pm in list(m.inp.parameters()) + list(m.tf.parameters()) + list(m.act_shared.parameters()):
+            pm.requires_grad_(False)                                       # freeze backbone
+        r_idx = idx[idx < Nr]                                             # robot-only for精度
+        _run_stage(m, tracks, vis, eef, r_idx, Nr, 2, SSm.WM_EPOCHS, seed)
+    else:
+        _run_stage(m, tracks, vis, eef, idx, Nr, 1, SSm.WM_EPOCHS, seed)
+    return m.eval()
