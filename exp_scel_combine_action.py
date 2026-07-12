@@ -127,3 +127,97 @@ def train_comb(tracks, vis, eef, idx, combine, Nr, seed=0, alpha=0.5, lam_res=1e
     else:
         _run_stage(m, tracks, vis, eef, idx, Nr, 1, SSm.WM_EPOCHS, seed)
     return m.eval()
+
+
+OUT = os.environ.get("OUT", "outputs/cross_embodiment_wm/combine_action"); os.makedirs(OUT, exist_ok=True)
+DS = os.environ.get("DS", X.DS)
+N_ROB_LIST = [int(x) for x in os.environ.get("N_ROB_LIST", "20,50,100,400").split(",")]
+SEEDS = [int(x) for x in os.environ.get("SEEDS", "0,1,2").split(",")]
+ANCHORS = ["world", "skel"]                                   # 上下界锚,走 V.train_feat
+COMBINES = os.environ.get("COMBINES", "a1,align,warm").split(",")
+METHODS = ANCHORS + COMBINES
+
+
+def _agg(res, meth, N):
+    arr = np.array(res[meth][N])
+    if len(arr) == 0: return None
+    ro, rh = arr[:, 0], arr[:, 1]; d = ro - rh
+    return ro.mean(), rh.mean(), d.mean(), d.std()
+
+
+def _save(res, header):
+    lines = [header, f"{'method':>10} {'N':>5} | {'ro':>7} {'rh':>7} | {'Δ(help)':>8} {'±std':>6}"]
+    for meth in METHODS:
+        for N in N_ROB_LIST:
+            a = _agg(res, meth, N)
+            if a is None: continue
+            lines.append(f"{meth:>10} {N:>5} | {a[0]:7.2f} {a[1]:7.2f} | {a[2]:+8.2f} {a[3]:6.2f}")
+        lines.append("")
+    lines.append("BREAKTHROUGH check (判据1: rh <= world.rh AND Δ >> world.Δ):")
+    for N in N_ROB_LIST:
+        w = _agg(res, "world", N)
+        if w is None: continue
+        for meth in COMBINES:
+            a = _agg(res, meth, N)
+            if a is None: continue
+            hit = "★BREAK" if (a[1] <= w[1] + 1e-6 and a[2] > w[2] + 0.3) else ""
+            lines.append(f"  N={N:>4} {meth:>6}: rh {a[1]:.2f} (world {w[1]:.2f})  Δ {a[2]:+.2f} (world {w[2]:+.2f}) {hit}")
+    open(f"{OUT}/summary.txt", "w").write("\n".join(lines) + "\n")
+
+
+def _plot(res):
+    fig, ax = plt.subplots(figsize=(7, 6))
+    N = max([n for n in N_ROB_LIST if _agg(res, "world", n)], default=N_ROB_LIST[0])
+    for meth in METHODS:
+        a = _agg(res, meth, N)
+        if a is None: continue
+        ax.scatter(a[1], a[2], s=90); ax.annotate(meth, (a[1], a[2]), fontsize=10,
+                   xytext=(4, 4), textcoords="offset points")
+    w = _agg(res, "world", N)
+    if w:                                                     # 目标区 = world 左上方
+        ax.axvline(w[1], color="gray", ls="--", lw=.8); ax.axhline(w[2], color="gray", ls="--", lw=.8)
+        ax.annotate("目标区\n(rh≤world, Δ大)", (w[1] - .3, w[2] + .5), fontsize=9, color="green")
+    ax.set_xlabel("最终精度 rh (px@224, ↓好)"); ax.set_ylabel("human-helps Δ=ro-rh (↑好)")
+    ax.set_title(f"结合机制 vs Pareto 锚 (N={N})"); ax.grid(alpha=.3); ax.invert_xaxis()
+    fig.tight_layout(); fig.savefig(f"{OUT}/pareto.png", dpi=130); plt.close(fig)
+
+
+def main():
+    if os.environ.get("SMOKE", "0") == "1":
+        SSm.WM_EPOCHS, SSm.R_SS = 2, 4
+        N_ROB_LIST[:] = [20, 100]; SEEDS[:] = [0]
+    zr = np.load(f"{DS}/clips_robot.npz"); zh = np.load(f"{DS}/clips_human.npz")
+    r_tr, r_ef, r_vs = (zr["tracks"].astype(np.float32), zr["eef"].astype(np.float32), zr["vis"].astype(np.float32))
+    h_tr, h_ef, h_vs = (zh["tracks"].astype(np.float32), zh["eef"].astype(np.float32), zh["vis"].astype(np.float32))
+    Nr = len(r_tr); perm = np.random.default_rng(0).permutation(Nr)
+    ho, pool = perm[:X.HELDOUT], perm[X.HELDOUT:]
+    X.tracks_world, X.vis_all = r_tr, r_vs                    # ade_world reads these globals
+    mtr = np.concatenate([r_tr, h_tr]); mef = np.concatenate([r_ef, h_ef]); mvs = np.concatenate([r_vs, h_vs])
+    hi = torch.arange(Nr, Nr + len(h_tr))
+    res = {m: {N: [] for N in N_ROB_LIST} for m in METHODS}
+    header = (f"COMBINE action-featurization | held-out robot ADE px@224 (H={X.H}) | data={DS} | seeds={SEEDS}\n"
+              f"methods={METHODS}  (world/skel=Pareto 锚; a1/align/warm=结合机制)\n"
+              "Δ = ro - rh (>0 human helps); 判据1: rh<=world.rh 且 Δ 明显>world\n")
+    print(header, flush=True)
+    for N in N_ROB_LIST:
+        for seed in SEEDS:
+            sub = pool[np.random.default_rng(100 + seed).choice(len(pool), min(N, len(pool)), replace=False)]
+            ri = torch.from_numpy(sub); rih = torch.cat([ri, hi])
+            for meth in METHODS:
+                if meth in ANCHORS:
+                    wm_ro = V.train_feat(mtr, mvs, mef, ri, meth, seed=seed)
+                    wm_rh = V.train_feat(mtr, mvs, mef, rih, meth, seed=seed)
+                else:
+                    wm_ro = train_comb(mtr, mvs, mef, ri, meth, Nr, seed=seed)
+                    wm_rh = train_comb(mtr, mvs, mef, rih, meth, Nr, seed=seed)
+                a_ro = X.ade_world(wm_ro, r_tr, r_ef, ho, False)
+                a_rh = X.ade_world(wm_rh, r_tr, r_ef, ho, False)
+                res[meth][N].append((a_ro, a_rh))
+                print(f"  N={N:>4} seed={seed} {meth:>8} | ro {a_ro:6.2f}  rh {a_rh:6.2f}  Δ {a_ro-a_rh:+6.2f}", flush=True)
+        _save(res, header)
+    _save(res, header); _plot(res)
+    print(f"\nsaved {OUT}/\n=== DONE ===", flush=True)
+
+
+if __name__ == "__main__":
+    main()
