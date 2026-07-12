@@ -274,6 +274,9 @@ def run_e2e():
     from viz_combined import save_combined_gif, build_flow_cols
     import exp_scel_dualview_wm as DW
     R, _ = load_dual()
+    # ② 须吃 raw view1 tracks(带 NaN)填 0.5, 匹配 wm_dual 训练口径 (exp_scel_dualview_wm.main);
+    # load_dual 的 R["tr"][1] 已被 nan_to_num 填 0.0, 直接喂 ② = train/inference 分布错配.
+    trB_raw = np.load(f"{dv.DS}/clips_robot.npz")["tracks_low"].astype(np.float32)
     okr = np.where(R["ok"])[0]; perm = np.random.default_rng(0).permutation(okr); ho = perm[:150]
     chosen = eval_seqs(R, ho)
     wm = torch.load("outputs/cross_embodiment_wm/dualview_wm/wm_dual.pt",
@@ -287,12 +290,12 @@ def run_e2e():
     cols_lp = {c: {0: [], 1: []} for c in ["gtflow", "e2e", "eef"]}; ades = []
     vname = {0: "high", 1: "low"}
     for gi, si in enumerate(chosen):
-        trD = np.concatenate([R["tr"][0][si], np.nan_to_num(R["tr"][1][si], nan=0.5)], 1)[None]  # (1,L,2P,2)
+        trD = np.concatenate([R["tr"][0][si], np.nan_to_num(trB_raw[si], nan=0.5)], 1)[None]  # (1,L,2P,2)
         pr = DW.rollout_dual(wm, torch.from_numpy(trD).float().to(device),
                              torch.from_numpy(R["ef"][0][si][None]).float().to(device),
                              torch.from_numpy(R["ef"][1][si][None]).float().to(device), H).cpu().numpy()[0]
         pred_tr = np.stack([pr[:, :P], pr[:, P:]])                                    # (2,H,P,2)
-        gt_tr = np.stack([R["tr"][v][si, K:K + H] for v in range(2)])
+        gt_tr = np.stack([R["tr"][0][si, K:K + H], trB_raw[si, K:K + H]])  # view1 raw NaN, ade_px 内填 0.5 同 ② eval 口径
         ades.append(ade_px(pred_tr, gt_tr))
         rr = {"gtflow": render_formal(mf, R, si, "flow"),
               "e2e": render_formal(mf, R, si, "flow", pred_tr=pred_tr),
