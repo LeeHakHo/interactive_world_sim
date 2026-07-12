@@ -19,7 +19,7 @@
 - **gif protocol**(用户 2026-07-12 重申):一律 `save_combined_gif`(Rendered 行 + Flow overlay 行 + 列标题 + legend + 顶部 caption),replay 有 GT 列,eval seq 固定不每次变;重要 gif 最后统一 `upload_evals_gdrive.sh` 传 drive(OAuth 可能需用户重授权);比较 metric 全部存盘保留([[feedback_gif_eval_layout]] / [[feedback_upload_gifs_gdrive]])。
 - 每份 summary/report 声明用的组件版本(哪个 ② ckpt、哪个 VAE、哪个 ③ 变体)([[feedback_declare_component_versions]])。
 - 训练超参不动探索版配方(BS=8, LR=2e-4, PREV_DF=0.3, LAM_LPIPS=1.0, DIM=384/DEPTH=8/HEADS=6, co-train robot latent-MSE+decode-LPIPS / human obj-region pixel MSE),唯一变量 = 条件注入 / crossview / seed / EPOCHS=60。
-- heldout split 固定 `rng(0)` 且**独立于训练 seed**;eval seqs = heldout 中 motion 最大的 24 条,持久化 `eval_seqs.json`,所有 run assert 一致。
+- heldout split 固定 `rng(0)` 且**独立于训练 seed**;eval seqs = heldout 中 motion 最大的 24 条,持久化 `eval_seqs_n{N}.json`(按 n 分文件),所有 run assert 一致。
 
 **关键常量(已核实 ground truth):**
 - `K=4, F=20`(amplify_wm);`H=20`(渲染 horizon);`GRID=16`;`IMG=128`;`FLOW_SCALE=10.0`。
@@ -392,7 +392,7 @@ def eval_seqs(R, ho, n=NEVAL):
     """heldout 中 motion top-n, 固定持久化; 所有 run assert 同一集合 (gif protocol: seq 固定)."""
     mot = np.array([np.linalg.norm(np.diff(R["tr"][0][si, K:K + H].mean(1), axis=0), axis=-1).sum() for si in ho])
     chosen = sorted(int(x) for x in ho[np.argsort(-mot)[:n]])
-    p = f"{ROOT}/eval_seqs.json"; os.makedirs(ROOT, exist_ok=True)
+    p = f"{ROOT}/eval_seqs_n{n}.json"; os.makedirs(ROOT, exist_ok=True)   # 按 n 分文件, SMOKE(n=4)不污染全量(n=24)
     if os.path.exists(p):
         prev = json.load(open(p))
         assert prev == chosen, f"eval seq set drifted: {prev[:5]} vs {chosen[:5]}"
