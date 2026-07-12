@@ -94,3 +94,19 @@ def test_eefsp_cond_shape():
     ef0 = np.random.rand(3, 2).astype(np.float32); eft = ef0 + 0.05
     c = eefsp_cond(ef0, eft)
     assert c.shape == (3, 128, 128) and np.isfinite(c).all() and c[2].max() > 0
+
+
+def test_obj_lpips_audit_counts_invalid():
+    """footprint<5 点的帧记无效计入分母, 不悄悄跳 (cube-nan trap)."""
+    import numpy as np
+    from exp_scel_dualview_dit_formal import obj_lpips_audit
+
+    class FakeLP:
+        def __call__(self, a, b): return torch.tensor(0.5)
+
+    T = 4
+    pred = np.random.rand(T, 128, 128, 3).astype(np.float32); gt = pred.copy()
+    objm = np.zeros((T, 128, 128), np.float32)
+    objm[0, 60:70, 60:70] = 1.0; objm[1, 60:70, 60:70] = 1.0      # 只有 2 帧有效
+    mean, n_valid, n_total = obj_lpips_audit(FakeLP(), pred, gt, objm)
+    assert n_valid == 2 and n_total == 4 and abs(mean - 0.5) < 1e-6

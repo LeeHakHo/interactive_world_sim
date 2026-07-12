@@ -98,3 +98,147 @@ class DualViewDiTFormal(DualViewDiT):
             f = s.norm(x[:, v * 2 * GRID * GRID: v * 2 * GRID * GRID + GRID * GRID])
             zs.append(s.out(f).transpose(1, 2).reshape(B, s.zdim, GRID, GRID))
         return torch.stack(zs, 1)
+
+
+def obj_lpips_audit(lp, pred, gt, objm):
+    """单一权威 obj-region LPIPS: footprint 质心 64x64 crop; <5 点帧记无效并计数 (det-rate)."""
+    outs = []; n_total = len(pred)
+    for h in range(n_total):
+        ys, xs = np.where(objm[h] > 0.5)
+        if len(xs) < 5: continue
+        cx, cy = int(xs.mean()), int(ys.mean())
+        x1 = min(max(cx - 32, 0) + 64, IMG); y1 = min(max(cy - 32, 0) + 64, IMG)
+        x0, y0 = x1 - 64, y1 - 64
+        a = torch.from_numpy(pred[h, y0:y1, x0:x1]).permute(2, 0, 1)[None].float().to(device) * 2 - 1
+        b = torch.from_numpy(gt[h, y0:y1, x0:x1]).permute(2, 0, 1)[None].float().to(device) * 2 - 1
+        outs.append(float(lp(a, b)))
+    return (float(np.mean(outs)) if outs else float("nan")), len(outs), n_total
+
+
+def eval_seqs(R, ho, n=NEVAL):
+    """heldout 中 motion top-n, 固定持久化; 所有 run assert 同一集合 (gif protocol: seq 固定)."""
+    mot = np.array([np.linalg.norm(np.diff(R["tr"][0][si, K:K + H].mean(1), axis=0), axis=-1).sum() for si in ho])
+    chosen = sorted(int(x) for x in ho[np.argsort(-mot)[:n]])
+    p = f"{ROOT}/eval_seqs_n{n}.json"; os.makedirs(ROOT, exist_ok=True)   # 按 n 分文件, SMOKE(n=4)不污染全量(n=24)
+    if os.path.exists(p):
+        prev = json.load(open(p))
+        assert prev == chosen, f"eval seq set drifted: {prev[:5]} vs {chosen[:5]}"
+    else:
+        json.dump(chosen, open(p, "w"))
+    return chosen
+
+
+def train_formal(R, Hh, idx_r, idx_h, latR, latH, mode, crossview, seed, epochs):
+    """探索版 train() 配方原样, 唯一变化: seed 线程化 + DualViewDiTFormal + build_conds_formal."""
+    torch.manual_seed(seed)
+    m = DualViewDiTFormal(mode=mode, crossview=crossview).to(device)
+    opt = torch.optim.AdamW(m.parameters(), lr=LR)
+    print(f"formal {RUN} params={sum(p.numel() for p in m.parameters())/1e6:.1f}M", flush=True)
+    from interactive_world_sim.algorithms.common.metrics.lpips import LearnedPerceptualImagePatchSimilarity
+    from exp_scel_latent_lpips import _decode_grad
+    lp = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False).to(device).eval()
+    for p in lp.parameters(): p.requires_grad_(False)
+    rng = np.random.default_rng(seed)
+    samples = np.array([("r", int(j)) for j in idx_r] + [("h", int(j)) for j in idx_h], dtype=object)
+    fr01 = lambda a: a.astype(np.float32).transpose(2, 0, 1) / 255.0
+    for ep in range(epochs):
+        m.train(); order = rng.permutation(len(samples)); tot = 0; nb = 0
+        for i in range(0, len(order), BS):
+            bidx = order[i:i + BS]
+            z0i, z1i, pvi, gti, cdi, mki, doms = [], [], [], [], [], [], []
+            for si in bidx:
+                dom, j = samples[si]; D = R if dom == "r" else Hh; lc = latR if dom == "r" else latH
+                t = int(rng.integers(9, D["fr"][0].shape[1]))
+                cond, mask = build_conds_formal(D, j, t, mode)
+                pt = 0 if rng.random() < 0.15 else t - 1
+                z0i.append(lc[j, 0].astype(np.float32)); z1i.append(lc[j, t].astype(np.float32)); pvi.append(lc[j, pt].astype(np.float32))
+                gti.append([fr01(D["fr"][v][j, t]) for v in range(2)])
+                cdi.append(cond); mki.append(mask); doms.append(0 if dom == "r" else 1)
+            f2 = lambda a: torch.from_numpy(np.stack(a).astype(np.float32)).to(device)
+            z0 = f2(z0i); z1 = f2(z1i); pv = f2(pvi); GT = f2(gti)
+            cond = f2(cdi); mask = f2(mki)[:, :, None]; dom = torch.tensor(doms, device=device)
+            a = torch.rand(len(bidx), 1, 1, 1, 1, device=device) * PREV_DF; pv = (1 - a) * pv + a * torch.randn_like(pv)
+            pred = m(z0, pv, cond)
+            img = _decode_grad(pred.reshape(-1, latent_ch(), GRID, GRID)).clamp(0, 1).reshape(len(bidx), 2, 3, IMG, IMG)
+            rs = (dom == 0); hs = (dom == 1)
+            loss = 0.0 * pred.sum()
+            if rs.any():
+                loss = loss + ((pred[rs] - z1[rs]) ** 2).mean()
+                loss = loss + LAM * lp(img[rs].reshape(-1, 3, IMG, IMG) * 2 - 1, GT[rs].reshape(-1, 3, IMG, IMG) * 2 - 1)
+            if hs.any():
+                om = mask[hs]; loss = loss + (((img[hs] - GT[hs]) ** 2) * om).sum() / (om.sum() * 3 + 1e-6)
+            opt.zero_grad(); loss.backward(); opt.step(); tot += float(loss); nb += 1
+        if ep % 10 == 0 or ep == epochs - 1: print(f"  {RUN} ep{ep} loss={tot/nb:.4f}", flush=True)
+    return m.eval()
+
+
+@torch.no_grad()
+def render_formal(m, R, si, mode, pred_tr=None):
+    """render H 帧双视角. pred_tr=None: replay GT 条件; 否则 (2,H,P,2) 用 ② 预测 tracks 建 flow cond
+    (vis 用最后观测帧 K-1, 可部署口径)."""
+    fr01 = lambda a: torch.from_numpy(a.astype(np.float32).transpose(2, 0, 1)[None] / 255.0).to(device)
+    z0 = torch.stack([enc(fr01(R["fr"][v][si, 0]))[0] for v in range(2)])[None]
+    prev = z0.clone(); outs = [[], []]
+    for h in range(H):
+        t = K + h
+        if pred_tr is None:
+            cond, _ = build_conds_formal(R, si, t, mode)
+        else:
+            assert mode == "flow"
+            cs = [flow_cond(R["tr"][v][si, 0], pred_tr[v][h], R["ef"][v][si, 0], R["ef"][v][si, t],
+                            R["vs"][v][si, K - 1]) for v in range(2)]
+            cond = np.stack(cs)
+        cond = torch.from_numpy(cond[None].astype(np.float32)).to(device)
+        pred = m(z0, prev, cond); prev = pred
+        for v in range(2): outs[v].append(dec(pred[:, v])[0].cpu().numpy())
+    return np.stack([np.stack(outs[v]).transpose(0, 2, 3, 1) for v in range(2)])
+
+
+def run_eval(m, R, chosen, mode, out=None, pred_tr_fn=None):
+    """单一权威 eval: 每 seq render + per-view PSNR/obj-LPIPS/det-rate. -> res dict"""
+    from interactive_world_sim.algorithms.common.metrics.lpips import LearnedPerceptualImagePatchSimilarity
+    lp = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False).to(device).eval()
+    agg = {f"v{v}_{k}": [] for v in range(2) for k in ["ps", "lp"]}; det = {0: [0, 0], 1: [0, 0]}
+    for si in chosen:
+        rr = render_formal(m, R, si, mode, pred_tr=None if pred_tr_fn is None else pred_tr_fn(si))
+        if out is not None: np.save(f"{out}/gifs/seq{si}_render.npy", u8(rr))
+        for v in range(2):
+            gtf = R["fr"][v][si, K:K + H].astype(np.float32) / 255.0
+            objm = np.stack([_fp(R["tr"][v][si, K + h]) for h in range(H)])
+            agg[f"v{v}_ps"].append(np.mean([psnr(rr[v, h], gtf[h]) for h in range(H)]))
+            lpv, nv, nt = obj_lpips_audit(lp, rr[v].astype(np.float32), gtf, objm)
+            agg[f"v{v}_lp"].append(lpv); det[v][0] += nv; det[v][1] += nt
+    res = {f"v{v}_{k}": float(np.nanmean(agg[f"v{v}_{k}"])) for v in range(2) for k in ["ps", "lp"]}
+    for v in range(2): res[f"det_rate_v{v}"] = det[v][0] / max(det[v][1], 1)
+    return res
+
+
+def main():
+    import time
+    t0 = time.time()
+    R, Hh = load_dual()
+    okr = np.where(R["ok"])[0]; okh = np.where(Hh["ok"])[0]
+    perm = np.random.default_rng(0).permutation(okr)                # split 固定, 独立于 SEED
+    ho, pool = perm[:150], perm[150:]
+    if MIX == "r": okh = okh[:0]                                    # M1c robot-only 臂 (human-helps 消融)
+    if SMOKE: pool = pool[:80]; okh = okh[:80]
+    chosen = eval_seqs(R, ho, n=(4 if SMOKE else NEVAL))
+    print(f"=== formal {RUN} | robot {len(pool)} + human {len(okh)} | eval n={len(chosen)} ===", flush=True)
+    latR = latcache(R, "robot"); latH = latcache(Hh, "human")       # 复用探索版 cache
+    m = train_formal(R, Hh, pool, okh, latR, latH, CONDM, CROSSVIEW, SEED, EPOCHS)
+    torch.save(m, f"{OUT}/dvdit.pt")
+    res = run_eval(m, R, chosen, CONDM, out=OUT)
+    res.update({"cond": CONDM, "crossview": int(CROSSVIEW), "mix": MIX, "seed": SEED, "epochs": EPOCHS,
+                "wall_min": round((time.time() - t0) / 60, 1), "n_eval": len(chosen)})
+    json.dump(res, open(f"{OUT}/metrics.json", "w"), indent=2)
+    lines = [f"DUAL-VIEW DiT FORMAL {RUN} | {VERSIONS}",
+             f"cam_high: PSNR {res['v0_ps']:.2f} | obj-LPIPS {res['v0_lp']:.3f} | det {res['det_rate_v0']:.2f}",
+             f"cam_low : PSNR {res['v1_ps']:.2f} | obj-LPIPS {res['v1_lp']:.3f} | det {res['det_rate_v1']:.2f}",
+             f"epochs={EPOCHS} seed={SEED} wall={res['wall_min']}min"]
+    open(f"{OUT}/summary.txt", "w").write("\n".join(lines) + "\n"); print("\n".join(lines) + "\n=== DONE ===", flush=True)
+
+
+if __name__ == "__main__":
+    if MODE == "train": main()
+    elif MODE == "e2e": run_e2e()                                   # Task 5
+    elif MODE == "gif": run_gif()                                   # Task 4 Step 5
