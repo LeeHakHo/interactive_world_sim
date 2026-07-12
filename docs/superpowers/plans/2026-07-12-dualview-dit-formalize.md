@@ -11,7 +11,8 @@
 ## Global Constraints
 
 - 分支 `phantom_dynamo`,**就地工作不开 worktree**(仓库大量未提交代码);`git add` 只加自己的文件;commit 不加 Co-Authored-By([[feedback_iws_untracked_working_tree]])。
-- 一律 iws env:`PY=/scr/yusenluo/anaconda3/envs/iws/bin/python`,从仓库根运行;跑 GPU 前 `nvidia-smi` 选空卡(现在 0,2-7 空,每张 49GB)。
+- 一律 iws env:`PY=/scr/yusenluo/anaconda3/envs/iws/bin/python`,从仓库根运行。
+- **GPU 任务一律走 SLURM(用户 2026-07-12 夜指示)**:长训练 `sbatch`(通用模板 `sbatch/dualview_formal_train.sbatch`,partition-1 单节点 gpu:8,`--gres=gpu:1`);SMOKE/短 eval 用 `srun --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=1:00:00 env VARS... $PY <script>`。不要手选 `CUDA_VISIBLE_DEVICES`;队列里另一 session 的 job(53157/53158 comb_*)勿动。
 - 输出树:`outputs/cross_embodiment_wm/dualview_dit_formal/`,每 run 独立子目录 `{cond}_cv{0|1}_s{seed}[_ronly]/`,**不覆盖**;每 run 落 `metrics.json` + `summary.txt`([[feedback_per_experiment_output_dir]])。
 - **human-helps 消融纳入(用户 2026-07-12 推翻 spec 旧固定项)**:MIX ∈ {rh(co-train 默认), r(robot-only)},M1c = {flow, eeffilm} × {rh, r} × seed{0,1,2}(cv 固定 1);对比各臂 human 增益 Δ=LPIPS(r)−LPIPS(rh),诚实报(③ 层先验判过 +0.03 天花板,不帮也是结果)。
 - **单一权威 eval**:`obj_lpips_audit`(footprint<5 点的帧记无效并计入 det-rate,不悄悄跳过)+ PSNR;所有臂(含 IWS baseline)同一函数同一 eval seq 集([[feedback_cube_metric_nan_trap]] / [[feedback_unify_code_no_script_sprawl]])。
@@ -521,10 +522,10 @@ if __name__ == "__main__":
 Run: `/scr/yusenluo/anaconda3/envs/iws/bin/python -m pytest tests/test_dualview_formal.py -v`
 Expected: 全 PASS。
 
-Run(选空卡,如 GPU2): `cd /scr2/yusenluo/interactive_world_sim && CUDA_VISIBLE_DEVICES=2 SMOKE=1 COND=flow /scr/yusenluo/anaconda3/envs/iws/bin/python exp_scel_dualview_dit_formal.py 2>&1 | tail -20`
+Run(SLURM srun 拿 1 卡): `cd /scr2/yusenluo/interactive_world_sim && srun --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=1:00:00 env SMOKE=1 COND=flow /scr/yusenluo/anaconda3/envs/iws/bin/python exp_scel_dualview_dit_formal.py 2>&1 | tail -20`
 Expected: 打印 params、2 个 epoch loss、summary 三行;`outputs/cross_embodiment_wm/dualview_dit_formal/flow_cv1_s0_smoke/{metrics.json,summary.txt,dvdit.pt}` 存在;`det_rate_v*` ∈ (0,1]。
 
-同样 SMOKE 跑 `COND=eefsp` 和 `COND=eeffilm CROSSVIEW=0` 各一遍确认三臂+mask 路径都走通。
+同样 srun SMOKE 跑 `COND=eefsp` 和 `COND=eeffilm CROSSVIEW=0` 各一遍确认三臂+mask 路径都走通(env 变量照替)。
 
 - [ ] **Step 5: 记录每 epoch 耗时,推算全量成本**
 
@@ -542,7 +543,8 @@ git commit -m "feat(dualview-formal): seeded trainer + authoritative eval (obj-L
 ### Task 4: M1b sweep(variance-first 门控)+ 聚合分析 + replay 对比 gif
 
 **Files:**
-- Create: `run_dualview_formal_sweep.sh`
+- Create: `sbatch/dualview_formal_train.sbatch`(通用 SLURM 模板,SCRIPT/env 由 `--export` 传入)
+- Create: `run_dualview_formal_sweep.sh`(逐格 `sbatch` 提交,不再 nohup 手管 GPU)
 - Create: `agg_dualview_formal.py`
 - Modify: `exp_scel_dualview_dit_formal.py`(追加 `run_gif()`)
 
@@ -550,18 +552,36 @@ git commit -m "feat(dualview-formal): seeded trainer + authoritative eval (obj-L
 - Consumes: Task 3 的每 run `metrics.json`;`viz_combined.save_combined_gif / build_flow_cols`。
 - Produces: `{ROOT}/ablation_table.md`(mean±std 表 + 门控判定);`{ROOT}/compare/gifs/seq{si}_cam{high,low}.gif`。
 
-- [ ] **Step 1: sweep 脚本**
+- [ ] **Step 1a: 通用 SLURM 模板**
+
+```bash
+#!/bin/bash
+#SBATCH --job-name=dvf
+#SBATCH --ntasks=1
+#SBATCH --gres=gpu:1
+#SBATCH --cpus-per-task=8
+#SBATCH --time=24:00:00
+#SBATCH --mem=64G
+# sbatch/dualview_formal_train.sbatch — 通用单卡模板. 用 --export 传 SCRIPT + 实验 env
+# (COND/CROSSVIEW/SEED/MIX/EPOCHS/SMOKE/MODE...), --job-name/--output 由提交方覆盖.
+source /scr/yusenluo/anaconda3/etc/profile.d/conda.sh
+conda activate iws
+cd /scr2/yusenluo/interactive_world_sim
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+python "${SCRIPT:-exp_scel_dualview_dit_formal.py}"
+```
+
+- [ ] **Step 1b: sweep 提交脚本(sbatch,用户指示 GPU 任务走 SLURM)**
 
 ```bash
 #!/bin/bash
 # run_dualview_formal_sweep.sh — STAGE=A: variance-first (flow/eeffilm cv1 rh x seed0-2, 6 runs)
 #                                STAGE=B: 其余 controlled 格子 (eefsp cv1 + 三臂 cv0, 12 runs)
 #                                STAGE=C: M1c human-helps (flow/eeffilm cv1 robot-only x seed0-2, 6 runs)
-# 格子编码 cond:cv:seed:mix   用法: GPUS="2 3 4 5 6 7" STAGE=A bash run_dualview_formal_sweep.sh
+# 格子编码 cond:cv:seed:mix   用法: STAGE=A bash run_dualview_formal_sweep.sh
 set -e
 cd /scr2/yusenluo/interactive_world_sim
-PY=/scr/yusenluo/anaconda3/envs/iws/bin/python
-GPUS=(${GPUS:-2 3 4 5 6 7}); STAGE=${STAGE:-A}
+STAGE=${STAGE:-A}
 if [ "$STAGE" = "A" ]; then
   GRID_RUNS=(flow:1:0:rh flow:1:1:rh flow:1:2:rh eeffilm:1:0:rh eeffilm:1:1:rh eeffilm:1:2:rh)
 elif [ "$STAGE" = "B" ]; then
@@ -570,22 +590,18 @@ elif [ "$STAGE" = "B" ]; then
 else  # C: M1c human-helps 消融 (robot-only 对照, cv1)
   GRID_RUNS=(flow:1:0:r flow:1:1:r flow:1:2:r eeffilm:1:0:r eeffilm:1:1:r eeffilm:1:2:r)
 fi
-mkdir -p outputs/cross_embodiment_wm/dualview_dit_formal/logs
-i=0
+LOGD=outputs/cross_embodiment_wm/dualview_dit_formal/logs
+mkdir -p "$LOGD"
 for r in "${GRID_RUNS[@]}"; do
   IFS=: read -r cond cv seed mix <<< "$r"
-  gpu=${GPUS[$((i % ${#GPUS[@]}))]}
   suf=$([ "$mix" = "r" ] && echo "_ronly" || echo "")
-  log=outputs/cross_embodiment_wm/dualview_dit_formal/logs/${cond}_cv${cv}_s${seed}${suf}.log
-  echo "launch $cond cv$cv s$seed mix=$mix -> GPU$gpu ($log)"
-  CUDA_VISIBLE_DEVICES=$gpu COND=$cond CROSSVIEW=$cv SEED=$seed MIX=$mix \
-    nohup $PY exp_scel_dualview_dit_formal.py > "$log" 2>&1 &
-  i=$((i + 1))
-  # 每张卡同时只放一个 run: 塞满一轮就等
-  if [ $((i % ${#GPUS[@]})) -eq 0 ]; then wait; fi
+  name=dvf_${cond}_cv${cv}_s${seed}${suf}
+  sbatch --job-name="$name" --output="$LOGD/${name}_%j.log" \
+    --export=ALL,SCRIPT=exp_scel_dualview_dit_formal.py,COND=$cond,CROSSVIEW=$cv,SEED=$seed,MIX=$mix \
+    sbatch/dualview_formal_train.sbatch
 done
-wait
-echo "STAGE $STAGE done"
+squeue -u "$USER" -o "%.10i %.24j %.2t %.10M" | tail -n +1
+echo "STAGE $STAGE submitted"
 ```
 
 - [ ] **Step 2: 聚合/门控脚本**
@@ -672,7 +688,7 @@ def run_gif():
 
 - [ ] **Step 4: launch Stage A(6 runs)并等完**
 
-Run: `GPUS="2 3 4 5 6 7" STAGE=A bash run_dualview_formal_sweep.sh`(后台,数小时;用 `tail -f outputs/cross_embodiment_wm/dualview_dit_formal/logs/*.log` 盯)
+Run: `STAGE=A bash run_dualview_formal_sweep.sh`(sbatch 提交后即返回;`squeue -u $USER` 看排队,`tail -f outputs/cross_embodiment_wm/dualview_dit_formal/logs/dvf_*.log` 盯进度)
 Expected: 6 个目录各有 metrics.json。
 
 - [ ] **Step 5: 跑聚合,按门控决策**
@@ -682,13 +698,13 @@ Expected: ablation_table.md 生成;gate 两视角 PASS → launch STAGE=B;EXTEND
 
 - [ ] **Step 6: Stage B + Stage C(M1c human-helps)完成后再跑聚合 + gif**
 
-Run: `STAGE=B bash run_dualview_formal_sweep.sh && STAGE=C bash run_dualview_formal_sweep.sh && /scr/yusenluo/anaconda3/envs/iws/bin/python agg_dualview_formal.py && MODE=gif /scr/yusenluo/anaconda3/envs/iws/bin/python exp_scel_dualview_dit_formal.py`
+Run: `STAGE=B bash run_dualview_formal_sweep.sh && STAGE=C bash run_dualview_formal_sweep.sh`;全部 job 完成后(squeue 清空)跑 `/scr/yusenluo/anaconda3/envs/iws/bin/python agg_dualview_formal.py`(CPU)和 `srun --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=2:00:00 env MODE=gif /scr/yusenluo/anaconda3/envs/iws/bin/python exp_scel_dualview_dit_formal.py`
 Expected: 全表 8 行(3 cond × 2 cv rh + flow/eeffilm cv1 r-only)+ human-helps Δ 判定行 + 12 个 gif。Δ 不显著或为负照实进表(③ 层先验 +0.03 天花板,"不帮在③、帮在②"本身就是 paper 论点的一部分)。
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add run_dualview_formal_sweep.sh agg_dualview_formal.py exp_scel_dualview_dit_formal.py
+git add sbatch/dualview_formal_train.sbatch run_dualview_formal_sweep.sh agg_dualview_formal.py exp_scel_dualview_dit_formal.py
 git commit -m "feat(dualview-formal): M1b sweep (variance-first gate) + aggregation table + 3-arm replay gifs"
 ```
 
@@ -783,7 +799,7 @@ def run_e2e():
 - [ ] **Step 3: 单测通过 + e2e 跑通**
 
 Run: `pytest tests/test_dualview_formal.py -v` → 全 PASS。
-Run: `CUDA_VISIBLE_DEVICES=2 MODE=e2e /scr/yusenluo/anaconda3/envs/iws/bin/python exp_scel_dualview_dit_formal.py`
+Run: `srun --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=4:00:00 env MODE=e2e /scr/yusenluo/anaconda3/envs/iws/bin/python exp_scel_dualview_dit_formal.py`
 Expected: summary 4 行;② ADE ≲ 4px(该 ② 在 H=40 时 drift ~2.9/3.1px,H=20 应更小,大很多则查接线);判据 = e2e 列 obj-LPIPS 仍 < eef 列,GT-flow 列为上界。若 ② 太差拉爆 e2e:如实入 report("接口在 GT-flow 上界成立、端到端受 ② 限"),不粉饰。
 
 - [ ] **Step 4: Commit**
@@ -1031,12 +1047,12 @@ if __name__ == "__main__":
 - [ ] **Step 3: 单测通过 + SMOKE**
 
 Run: `pytest tests/test_dualview_formal.py -k iws -v` → 3 PASS。
-Run: `CUDA_VISIBLE_DEVICES=3 SMOKE=1 /scr/yusenluo/anaconda3/envs/iws/bin/python exp_dualview_iws_stage2.py 2>&1 | tail -8`
+Run: `srun --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=1:00:00 env SMOKE=1 /scr/yusenluo/anaconda3/envs/iws/bin/python exp_dualview_iws_stage2.py 2>&1 | tail -8`
 Expected: params 打印、2 epoch loss 下降、summary 三行、`s0_smoke/` 产物齐;**肉眼看一条 seq 的 render npy 不是纯噪声**(quick decode 检查)。
 
 - [ ] **Step 4: 全量训练(seed0,可选 seed1)**
 
-Run: `CUDA_VISIBLE_DEVICES=3 nohup /scr/yusenluo/anaconda3/envs/iws/bin/python exp_dualview_iws_stage2.py > outputs/cross_embodiment_wm/dualview_iws_stage2/train_s0.log 2>&1 &`
+Run: `sbatch --job-name=dvf_iws_s0 --output=outputs/cross_embodiment_wm/dualview_iws_stage2/train_s0_%j.log --export=ALL,SCRIPT=exp_dualview_iws_stage2.py,SEED=0 sbatch/dualview_formal_train.sbatch`
 Expected: metrics.json 落盘。空卡富余时补 `SEED=1`。
 
 - [ ] **Step 5: Commit**
