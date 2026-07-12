@@ -180,6 +180,9 @@ def _save(res, header):
             hit = "★BREAK" if (a[1] <= w[1] + 1e-6 and a[2] > w[2] + 0.3) else ""
             lines.append(f"  N={N:>4} {meth:>6}: rh {a[1]:.2f} (world {w[1]:.2f})  Δ {a[2]:+.2f} (world {w[2]:+.2f}) {hit}")
     open(f"{OUT}/summary.txt", "w").write("\n".join(lines) + "\n")
+    import json
+    json.dump({m: {str(N): v for N, v in d.items()} for m, d in res.items()},
+              open(f"{OUT}/res.json", "w"))                   # 供跨 seed-job 合并
 
 
 def _plot(res):
