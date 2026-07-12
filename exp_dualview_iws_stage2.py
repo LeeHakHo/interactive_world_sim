@@ -153,7 +153,9 @@ def main():
     chosen = eval_seqs(R, ho, n=(4 if SMOKE else 24))
     latR = latcache(R, "robot"); latH = latcache(Hh, "human")
     m = train_iws(R, Hh, pool, okh, latR, latH, sched)
-    torch.save(m, f"{OUT}/iws_dyn.pt")
+    # CMLatentDynamics 不可整模块 pickle (einops 局部 WrappedModule 类); 重建配方:
+    # CMLatentDynamics(latent_dim=2*latent_ch(), action_dim=24, dim=64) + load_state_dict
+    torch.save(m.state_dict(), f"{OUT}/iws_dyn.pt")
     from interactive_world_sim.algorithms.common.metrics.lpips import LearnedPerceptualImagePatchSimilarity
     lp = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False).to(device).eval()
     agg = {f"v{v}_{k}": [] for v in range(2) for k in ["ps", "lp"]}; det = {0: [0, 0], 1: [0, 0]}
