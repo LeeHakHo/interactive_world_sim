@@ -28,12 +28,12 @@
 - ② rollout 真名 = `exp_scel_dualview_wm.rollout_dual`(spec 里写的 rollout_dualview 是笔误);`wm_dual.pt` 已训好。
 - IWS stage2 = `CMLatentDynamics.forward(x (B,C,T,H,W), noise_levels (T,B), stop_noise_levels (T,B), external_cond (T,B,D))`,原生 `action_emd` MLP → 每个 ResnetBlock `cond_emb_layers` FiLM;推理 = AR chunk=1 + 滑窗 + 多步去噪(`latent_world_model.py:1190`)。
 
-**三条件臂定义(M1 的"三方"):**
-| 臂 | 内容 | 注入 | 隔离什么 |
+**三条件臂定义(M1 的"三方";2026-07-12 用户指示对照 IWS/OSCAR 后升级 baseline):**
+| 臂 | 内容 | 注入 | 文献锚点 / 隔离什么 |
 |---|---|---|---|
-| `flow` | 物体 flow splat + footprint (3ch) | spatial-add(`ce`→`emb_cond`) | ours |
-| `eefsp` | **只 splat 3 个 eef 点**(无物体 flow,3ch 同构) | spatial-add(同 flow 臂) | 内容变量:flow 赢是因为"物体运动信息"还是"spatial 注入机制" |
-| `eeffilm` | 单 eef 点 4-dim 向量 | adaLN-FiLM(=IWS stage2 `action_emd`→`cond_emb_layers` 同构) | naive action 接口(探索版 `eef` 臂原样) |
+| `flow` | 物体 flow splat + footprint (3ch) | spatial-add(`ce`→`emb_cond`) | ours(object motion 接口) |
+| `eefsp` | **只 splat 3 个 eef 点**(无物体 flow,3ch 同构) | spatial-add(同 flow 臂) | ≈OSCAR skeleton 空间条件的轻量类比;隔离"内容 vs 注入机制" |
+| `eeffilm` | **全量 eef 向量:3 点×[x,y,dx,dy]×2 视角=24-dim**(指尖隐含 grip 开合;探索版单 wrist 点 4-dim 是 strawman,升级) | MLP→adaLN-FiLM(=IWS stage2 `action_emd`→`cond_emb_layers` 同构,IWS 原生也是全量动作向量) | naive agent-action 接口(IWS 式) |
 
 ---
 
@@ -127,7 +127,8 @@ git commit -m "feat(dualview-formal): Block optional attn_mask passthrough + non
 - Consumes: `exp_scel_dualview_dit.{DualViewDiT, flow_cond, eef_point, load_dual, latcache, _fp, u8, psnr}`;`exp_scel_latent_dit.{Block, GRID}`;`exp_v3_human_helps_pixels.{splat128, K, IMG, device}`。
 - Produces:
   - `eefsp_cond(ef0, eft) -> np.ndarray (3,128,128)`
-  - `build_conds_formal(D, j, t, mode) -> (cond (2,3,128,128)|(2,4), mask (2,128,128))`,`mode ∈ {"flow","eefsp","eeffilm"}`
+  - `eef_vec(ef0, eft) -> np.ndarray (12,)`(3 eef 点 × [x,y,dx,dy],全量向量)
+  - `build_conds_formal(D, j, t, mode) -> (cond (2,3,128,128)|(2,12), mask (2,128,128))`,`mode ∈ {"flow","eefsp","eeffilm"}`
   - `DualViewDiTFormal(mode, crossview: bool, D=384, depth=8, heads=6)`,`forward(z0 (B,2,Cz,16,16), prev 同, cond) -> (B,2,Cz,16,16)`
 
 - [ ] **Step 1: 写失败单测(追加到 tests/test_dualview_formal.py)**
@@ -141,7 +142,7 @@ def _mk(mode, crossview):
 
 def _rand_inputs(mode, Cz):
     z0 = torch.randn(2, 2, Cz, 16, 16); prev = torch.randn(2, 2, Cz, 16, 16)
-    cond = torch.randn(2, 2, 3, 128, 128) if mode in ("flow", "eefsp") else torch.randn(2, 2, 4)
+    cond = torch.randn(2, 2, 3, 128, 128) if mode in ("flow", "eefsp") else torch.randn(2, 2, 12)
     return z0, prev, cond
 
 
@@ -172,7 +173,7 @@ def test_crossview_off_no_leak_flow():
 
 
 def test_crossview_off_no_leak_eeffilm_tokens():
-    """eeffilm 臂:视觉 token 不泄漏;cond 向量经 mean(both views) 全局 FiLM 属 action 级设计,只扰动 z0/prev。"""
+    """eeffilm 臂:视觉 token 不泄漏;cond 向量双视角 concat 进全局 FiLM 属 action 级设计,只扰动 z0/prev。"""
     from exp_scel_latent_renderer import latent_ch
     Cz = latent_ch()
     m = _mk("eeffilm", crossview=False)
@@ -227,7 +228,7 @@ import os
 os.environ.setdefault("VAE_NAME", "ostris/vae-kl-f8-d16"); os.environ.setdefault("HF_HUB_OFFLINE", "1")
 import numpy as np, torch, torch.nn as nn, cv2
 import exp_scel_dualview_dit as dv
-from exp_scel_dualview_dit import (DualViewDiT, flow_cond, eef_point, load_dual, latcache,
+from exp_scel_dualview_dit import (DualViewDiT, flow_cond, load_dual, latcache,
                                    _fp, u8, psnr, FLOW_SCALE, H, BS, LR, PREV_DF, LAM, DIM, DEPTH, HEADS)
 from exp_scel_latent_renderer import enc, dec, latent_ch
 from exp_scel_latent_dit import GRID
@@ -249,9 +250,17 @@ VERSIONS = ("VAE=ostris/vae-kl-f8-d16(frozen) | backbone=add-DiT D384x8 (project
 
 
 def eefsp_cond(ef0, eft):
-    """第三臂 eefsp: 只 splat 3 个 eef 点 (无物体 flow), 与 flow 臂同构 3ch [dx,dy,eef 目标位置密度]."""
+    """第三臂 eefsp: 只 splat 3 个 eef 点 (无物体 flow), 与 flow 臂同构 3ch [dx,dy,eef 目标位置密度].
+    ≈ OSCAR (2606.04463) 最强行 '2D skeleton 空间渲染条件' 的轻量类比."""
     fm = splat128(ef0, eft, np.ones(len(ef0), np.float32))
     return np.stack([fm[0], fm[1], fm[3]]).astype(np.float32)
+
+
+def eef_vec(ef0, eft):
+    """eeffilm 臂全量 eef 向量: 3 点(wrist+2指尖) x [x,y,dx,dy] -> (12,). 指尖隐含 grip 开合.
+    对齐 IWS stage2 原生 '完整动作向量(pos+euler+grip)进 action_emd' 的精神; 单 wrist 点是 strawman."""
+    d = (eft - ef0) * FLOW_SCALE
+    return np.concatenate([eft, d], -1).reshape(-1).astype(np.float32)   # (3,4)->(12,)
 
 
 def build_conds_formal(D, j, t, mode):
@@ -263,8 +272,8 @@ def build_conds_formal(D, j, t, mode):
             c = flow_cond(tr[j, 0], tr[j, t], ef[j, 0], ef[j, t], vs[j, t])
         elif mode == "eefsp":
             c = eefsp_cond(ef[j, 0], ef[j, t])
-        else:                                              # eeffilm = 探索版 eef 臂原样
-            c = eef_point(ef[j, 0], ef[j, t])
+        else:                                              # eeffilm: 全量 12-dim/view
+            c = eef_vec(ef[j, 0], ef[j, t])
         conds.append(c); masks.append(_fp(tr[j, t]))
     return np.stack(conds), np.stack(masks)
 
@@ -276,6 +285,9 @@ class DualViewDiTFormal(DualViewDiT):
         assert mode in ("flow", "eefsp", "eeffilm")
         super().__init__(cond=("eef" if mode == "eeffilm" else "flow"), **kw)
         s.mode, s.crossview = mode, crossview
+        if mode == "eeffilm":                              # 全量 24-dim (2view x 12) 换掉父类 4-dim act_emd
+            D_ = s.D
+            s.act_emd = nn.Sequential(nn.Linear(24, 128), nn.SiLU(), nn.Linear(128, D_))
         n = 4 * GRID * GRID                                # [z0_v0,prev_v0,z0_v1,prev_v1] = 1024
         if not crossview:
             m = torch.full((n, n), float("-inf")); half = n // 2
@@ -294,7 +306,7 @@ class DualViewDiTFormal(DualViewDiT):
             tp = s.emb_prev(s._tok(prev[:, v])) + s.pos + s.view_emb[v] + s.typ[1]
             toks += [t0, tp]
         if s.cond == "eef":
-            cvec = s.act_emd(cond.reshape(B, 2, 4).mean(1))
+            cvec = s.act_emd(cond.reshape(B, 24))          # 双视角 concat 全量向量 (非 mean, IWS 式单一动作向量)
         x = torch.cat(toks, 1)
         for b in s.blocks: x = b(x, cvec, attn_mask=s.attn_mask)
         zs = []
@@ -809,16 +821,16 @@ def test_iws_frame_actions_shape():
     from exp_dualview_iws_stage2 import frame_actions
     D = {"ef": [np.random.rand(5, 48, 3, 2).astype(np.float32) for _ in range(2)]}
     a = frame_actions(D, 3, np.arange(8))
-    assert a.shape == (8, 8) and np.isfinite(a).all()
+    assert a.shape == (8, 24) and np.isfinite(a).all()
 
 
 def test_iws_rollout_shape():
     from exp_dualview_iws_stage2 import rollout_iws, make_sched
     from interactive_world_sim.algorithms.latent_dynamics.models.cm_latent_dynamics import CMLatentDynamics
     torch.manual_seed(0)
-    m = CMLatentDynamics(latent_dim=8, action_dim=8, dim=16, dim_mults=[1, 2],
+    m = CMLatentDynamics(latent_dim=8, action_dim=24, dim=16, dim_mults=[1, 2],
                          attn_resolutions=[1], attn_heads=2, attn_dim_head=8).eval()
-    z0 = torch.randn(1, 8, 1, 16, 16); acts = torch.randn(1, 6, 8)
+    z0 = torch.randn(1, 8, 1, 16, 16); acts = torch.randn(1, 6, 24)
     out = rollout_iws(m, z0, acts, Hn=5, sched=make_sched(100), infer_steps=3, t_win=4, device="cpu")
     assert out.shape == (1, 8, 5, 16, 16) and torch.isfinite(out).all()
 ```
@@ -867,14 +879,14 @@ def make_sched(n=NLEV):
 
 
 def frame_actions(D, j, ts):
-    """clip j 的帧集 ts -> (len(ts), 8) per-frame action: 每 view [x,y,(dx,dy)*FLOW_SCALE step 速度], wrist 点."""
-    outs = []
+    """clip j 的帧集 ts -> (len(ts), 24) per-frame action: 每 view 3 eef 点(wrist+2指尖) x
+    [x,y,(dx,dy)*FLOW_SCALE step 速度] = 12-dim, 双视角 concat. 全量向量对齐 IWS 原生 7-dim 完整动作精神
+    (指尖隐含 grip 开合), 与 formal eeffilm 臂同信息 (那边是 frame0 锚定, 这边 AR per-step 速度)."""
+    ts = np.asarray(ts); prev = np.maximum(ts - 1, 0); outs = []
     for v in range(2):
-        w = np.asarray(D["ef"][v][j][:, 0], np.float32)               # (L,2) wrist
-        prev = np.maximum(np.asarray(ts) - 1, 0)
-        outs.append(np.stack([w[ts, 0], w[ts, 1],
-                              (w[ts, 0] - w[prev, 0]) * FLOW_SCALE,
-                              (w[ts, 1] - w[prev, 1]) * FLOW_SCALE], -1))
+        e = np.asarray(D["ef"][v][j], np.float32)                     # (L,3,2)
+        d = (e[ts] - e[prev]) * FLOW_SCALE                            # (T,3,2)
+        outs.append(np.concatenate([e[ts], d], -1).reshape(len(ts), -1))   # (T,12)
     return np.concatenate(outs, -1).astype(np.float32)
 
 
@@ -886,7 +898,7 @@ def _noise(x0, lv, ab):
 
 def train_iws(R, Hh, pool, okh, latR, latH, sched):
     torch.manual_seed(SEED); rng = np.random.default_rng(SEED)
-    m = CMLatentDynamics(latent_dim=2 * latent_ch(), action_dim=8, dim=64).to(device)
+    m = CMLatentDynamics(latent_dim=2 * latent_ch(), action_dim=24, dim=64).to(device)
     print(f"IWS-DF params={sum(p.numel() for p in m.parameters())/1e6:.1f}M", flush=True)
     opt = torch.optim.AdamW(m.parameters(), lr=LR)
     from interactive_world_sim.algorithms.common.metrics.lpips import LearnedPerceptualImagePatchSimilarity
@@ -936,13 +948,13 @@ def train_iws(R, Hh, pool, okh, latR, latH, sched):
 @torch.no_grad()
 def rollout_iws(m, z0, acts, Hn, sched, infer_steps=INFER_STEPS, t_win=T_WIN, device=device):
     """IWS dynamics_forward 同构 AR 采样: chunk=1, 滑窗 t_win, 每帧 infer_steps 步 x0-pred DDIM 去噪.
-    z0 (1,C,1,16,16) 干净首帧; acts (1,Tmax,8). -> (1,C,Hn,16,16)"""
+    z0 (1,C,1,16,16) 干净首帧; acts (1,Tmax,24). -> (1,C,Hn,16,16)"""
     ab = sched.to(device); xs = z0.to(device).clone()
     for h in range(Hn):
         xs = torch.cat([xs, torch.randn_like(xs[:, :, :1])], 2)
         start = max(0, xs.shape[2] - t_win)
         win = xs[:, :, start:].clone(); Tw = win.shape[2]
-        act_w = acts[:, start:start + Tw].transpose(0, 1).to(device)               # (Tw,1,8)
+        act_w = acts[:, start:start + Tw].transpose(0, 1).to(device)               # (Tw,1,24)
         levels = torch.linspace(NLEV - 1, 0, infer_steps + 1).long()
         for i in range(infer_steps):
             lv = torch.zeros(Tw, 1, dtype=torch.long, device=device); lv[-1] = levels[i]
@@ -963,7 +975,7 @@ def render_iws(m, R, si, sched):
     fr01 = lambda a: torch.from_numpy(a.astype(np.float32).transpose(2, 0, 1)[None] / 255.0).to(device)
     z0 = torch.cat([enc(fr01(R["fr"][v][si, 0])) for v in range(2)], 1)[:, :, None]   # (1,32,1,16,16)
     ts = np.arange(0, K + H)
-    acts = torch.from_numpy(frame_actions(R, si, ts)[None])                           # (1,K+H,8)
+    acts = torch.from_numpy(frame_actions(R, si, ts)[None])                           # (1,K+H,24)
     zs = rollout_iws(m, z0, acts, K + H - 1, sched)[0]                                # (32,K+H-1,16,16)
     outs = [[], []]
     for h in range(H):

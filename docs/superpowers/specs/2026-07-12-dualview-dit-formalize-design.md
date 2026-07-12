@@ -28,10 +28,15 @@ co-train robot+human),flow-cond vs eef-cond 已出判决(cam_high obj-LPIPS 0.32
 
 **controlled ablation 是主证据**:固定 DiT backbone + frozen VAE + 同训练预算/seed,**唯一变量 = 条件注入方式**:
 - **flow**:per-view 物体 flow splat(dx,dy)+ footprint,spatial-add 注入(`ce` 卷积 → emb_cond,加到 token)。域不变物体运动接口(ours)。
-- **eef-FiLM**:4-dim 单 eef 点 [x,y,dx,dy] → `act_emd` Linear → per-block FiLM scale/shift。**代码级等价于 IWS stage2**:
-  `cm_latent_dynamics.ResnetBlock` 的 `cond_emb_layers: Linear(cond_dim, dim_out*2)` → `h=h*(1+cond_scale)+cond_shift`,
-  与本脚本 eef-cond 的 adaLN FiLM 同构。故 eef-FiLM = "IWS stage2 的 action 注入机制,移植到同一 DiT backbone"。
-  这样 flow vs eef 就隔离了"接口"单一变量。
+- **eef-FiLM**:**全量 eef 向量**(3 点[wrist+2指尖] × [x,y,dx,dy] × 2 视角 = 24-dim,指尖隐含 gripper 开合)
+  → `act_emd` MLP → per-block FiLM scale/shift。**代码级等价于 IWS stage2**:`cm_latent_dynamics.ResnetBlock` 的
+  `cond_emb_layers: Linear(cond_dim, dim_out*2)` → `h=h*(1+cond_scale)+cond_shift`,与 adaLN FiLM 同构;IWS 原生
+  action 也是完整向量(pos3+euler3+grip1)进 MLP,**所以 baseline 必须给全量 eef 而非单 wrist 点(探索版单点 4-dim
+  是弱 baseline,会被打 strawman;用户 2026-07-12"多看别人 baseline"核对后升级)**。
+- **eefsp(第三臂)**:同样 3 个 eef 点但 **splat 成空间图、走 flow 臂同一 spatial-add 通路** — 这正是 OSCAR
+  (2606.04463)最强行"2D kinematic skeleton 空间渲染条件"的轻量类比(OSCAR 的 latent-action 向量行反而最差 19.22)。
+  三臂 = 文献三种条件化路线的 controlled 对比:agent 向量-FiLM(IWS)/ agent 空间图(OSCAR skeleton 式)/
+  object motion 空间图(ours)。这样 flow vs eef 就隔离了"接口"单一变量,且每个 baseline 都有文献锚点。
 
 **external baseline(重要 baseline,正式项非 stretch)**:真 IWS stage2 整 pipeline(CMLatentDynamics + Conv3d 时空
 backbone,原生 action-conditioned 注入)独立训一个,同数据同 eval 口径报 obj-LPIPS/PSNR。它 backbone 与我们不同 →
