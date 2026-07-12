@@ -1,6 +1,8 @@
 """结合 skel(同域主体,human 帮) + world(绝对残差,robot 精度)的 ② 世界模型。
 突破 velocity_action 线的 Pareto(单一 featurization 不可两全)。机制:A1 加性 residual /
-align(LaST-HD 对齐) / warm(两阶段课程)。精度来源纯 robot,human 只从 shared 通道帮进来。
+align(同网络自蒸馏简化) / align_wm(LaST-HD 2606.23685 faithful:冻结混训 skel-WM 教师 +
+cosine latent 对齐,主路径纯 world) / warm(两阶段课程)。精度来源纯 robot,human 只从共享
+通道(skel 特征或混训教师)帮进来。
 协议逐字复用 exp_scel_agentframe;SS trainer 复用 amplify_wm/velocity 超参。见 spec
 docs/superpowers/specs/2026-07-12-combine-skel-world-action-design.md。
 Output: outputs/cross_embodiment_wm/combine_action/"""
@@ -33,13 +35,18 @@ def feat_skel(eef3, objc):                                    # (B, Lw*10) OSCAR
 class CombLWC(A.FlowWM_LWC):
     """双 action 头:act_shared(skel 主体) + act_world(world 残差)。forward 收可选 is_h;
     human 样本只走 shared(a1/warm world 残差置 0)。评价路径不传 is_h -> 全 robot,残差全开。"""
-    def __init__(s, P, combine="a1", alpha=0.5, lam_res=1e-3, lam_align=0.3, **kw):
+    def __init__(s, P, combine="a1", alpha=0.5, lam_res=1e-3, lam_align=0.3, teacher=None, **kw):
         super().__init__(P, **kw)
         s.combine, s.alpha, s.lam_res, s.lam_align = combine, alpha, lam_res, lam_align
         s.act_shared = nn.Linear(V.ACT_DIM["skel"], s.Dm)
         s.act_world = nn.Linear(V.ACT_DIM["world"], s.Dm)
-        with torch.no_grad():                                 # 小初始化残差,防独吞
-            s.act_world.weight.mul_(0.1); s.act_world.bias.zero_()
+        if combine in ("a1", "warm"):
+            with torch.no_grad():                             # 小初始化残差,防独吞
+                s.act_world.weight.mul_(0.1); s.act_world.bias.zero_()
+        s.teacher = teacher                                   # align_wm:冻结混训 skel-WM(latent 目标)
+        if teacher is not None:
+            teacher.eval()
+            for pm in teacher.parameters(): pm.requires_grad_(False)
         s.warm_stage = 1
         s.aux = {}
 
@@ -65,6 +72,13 @@ class CombLWC(A.FlowWM_LWC):
             s.aux["res_sq"] = residual.pow(2).mean()
             act = (act_s + residual)[:, None, :]
             x = s.tf(torch.cat([obj, act], 1))[:, :P]
+            return x, anchor
+        if s.combine == "align_wm":                           # LaST-HD faithful:主路径纯 world 保精度,
+            x = s.tf(torch.cat([obj, act_w[:, None]], 1))[:, :P]   # latent 拉向冻结教师的前向动力学特征
+            if s.training and s.teacher is not None:
+                with torch.no_grad():
+                    xt, _ = s.teacher.trunk(hist, eef3)
+                s.aux["align"] = (1 - nn.functional.cosine_similarity(x, xt, dim=-1)).mean()
             return x, anchor
         if s.combine == "align":
             x_s = s.tf(torch.cat([obj, act_s[:, None]], 1))[:, :P]
@@ -106,7 +120,7 @@ def _run_stage(m, tracks, vis, eef, idx, Nr, stage, epochs, seed):
                 ce = nn.functional.cross_entropy(lg0.reshape(-1, m.W * m.W), cls.reshape(-1), reduction="none")
                 losses.append((ce * w.reshape(-1)).sum() / (w.sum() + 1e-6))
                 if m.combine in ("a1", "warm"): regs.append(m.aux["res_sq"] * m.lam_res)
-                elif m.combine == "align": regs.append(m.aux["align"] * m.lam_align)
+                elif m.combine in ("align", "align_wm"): regs.append(m.aux["align"] * m.lam_align)
                 nxt = buf[:, -1] + m.expected_vel(lg0)
                 use_gt = (torch.rand(len(b), 1, 1, device=device) < p)
                 buf = torch.cat([buf, torch.where(use_gt, G[:, K + h], nxt.detach())[:, None]], 1)
@@ -114,10 +128,13 @@ def _run_stage(m, tracks, vis, eef, idx, Nr, stage, epochs, seed):
             opt.zero_grad(); loss.backward(); opt.step()
 
 
-def train_comb(tracks, vis, eef, idx, combine, Nr, seed=0, alpha=0.5, lam_res=1e-3, lam_align=0.3):
+def train_comb(tracks, vis, eef, idx, combine, Nr, seed=0, alpha=0.5, lam_res=1e-3, lam_align=0.3,
+               teacher=None):
+    if combine == "align_wm":
+        assert teacher is not None, "align_wm 需要冻结的混训 skel-WM 教师(与本臂同 idx 同 seed)"
     torch.manual_seed(seed); P = tracks.shape[2]
     m = CombLWC(P, combine=combine, alpha=alpha, lam_res=lam_res, lam_align=lam_align,
-               Dm=384, layers=3, W=15, vel_half=V.VEL_HALF).to(device)
+               teacher=teacher, Dm=384, layers=3, W=15, vel_half=V.VEL_HALF).to(device)
     if combine == "warm":
         _run_stage(m, tracks, vis, eef, idx, Nr, 1, SSm.WM_EPOCHS, seed)   # stage1: shared, robot+human
         for pm in list(m.inp.parameters()) + list(m.tf.parameters()) + list(m.act_shared.parameters()):
@@ -134,7 +151,7 @@ DS = os.environ.get("DS", X.DS)
 N_ROB_LIST = [int(x) for x in os.environ.get("N_ROB_LIST", "20,50,100,400").split(",")]
 SEEDS = [int(x) for x in os.environ.get("SEEDS", "0,1,2").split(",")]
 ANCHORS = ["world", "skel"]                                   # 上下界锚,走 V.train_feat
-COMBINES = os.environ.get("COMBINES", "a1,align,warm").split(",")
+COMBINES = os.environ.get("COMBINES", "a1,align,align_wm,warm").split(",")
 METHODS = ANCHORS + COMBINES
 
 
@@ -203,13 +220,18 @@ def main():
         for seed in SEEDS:
             sub = pool[np.random.default_rng(100 + seed).choice(len(pool), min(N, len(pool)), replace=False)]
             ri = torch.from_numpy(sub); rih = torch.cat([ri, hi])
+            teachers = {}                                     # align_wm 教师=本轮 skel 锚(同 idx 同 seed,Δ 诚实)
             for meth in METHODS:
                 if meth in ANCHORS:
                     wm_ro = V.train_feat(mtr, mvs, mef, ri, meth, seed=seed)
                     wm_rh = V.train_feat(mtr, mvs, mef, rih, meth, seed=seed)
+                    if meth == "skel":
+                        teachers = {"ro": wm_ro, "rh": wm_rh}
                 else:
-                    wm_ro = train_comb(mtr, mvs, mef, ri, meth, Nr, seed=seed)
-                    wm_rh = train_comb(mtr, mvs, mef, rih, meth, Nr, seed=seed)
+                    t_ro = teachers.get("ro") if meth == "align_wm" else None
+                    t_rh = teachers.get("rh") if meth == "align_wm" else None
+                    wm_ro = train_comb(mtr, mvs, mef, ri, meth, Nr, seed=seed, teacher=t_ro)
+                    wm_rh = train_comb(mtr, mvs, mef, rih, meth, Nr, seed=seed, teacher=t_rh)
                 a_ro = X.ade_world(wm_ro, r_tr, r_ef, ho, False)
                 a_rh = X.ade_world(wm_rh, r_tr, r_ef, ho, False)
                 res[meth][N].append((a_ro, a_rh))

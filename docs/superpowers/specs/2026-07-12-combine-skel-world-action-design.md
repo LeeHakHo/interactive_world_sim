@@ -18,7 +18,7 @@
 
 ## 2. 启发来源
 
-- **LaST-HD(arxiv 2606.23685)**:不在 action 输入端对齐,而在 forward-dynamics 的 shared latent 端对齐——auxiliary world model 产 unified latent target,监督跨具身表示对齐,mixed co-train + human-correction。→ 印证"共享性在 dynamics 侧"。`align` 机制直接落地它。
+- **LaST-HD(arxiv 2606.23685,2026-07-12 全文精读,PDF 在仓库根)**:不在 action 输入端对齐,而在 forward-dynamics 的 shared latent 端对齐——**独立的 action-conditioned world model**(混训 unpaired human+robot,冻结)产 unified latent target(深层前向动力学特征),cosine 监督主模型的 latent reasoning;mixed co-train + human-correction。核心 insight 与我们 object-flow 线互证:"推苹果产生的物体运动与具身无关"=action-conditioned **预测性**特征跨域共享,视觉未来帧特征只编码外观不共享。→ `align` 是它的同网络自蒸馏简化;**`align_wm` 是 faithful 落地**(冻结教师+grounding+cosine,见 §3)。
 - 我们的否定线 `mask_subtract` / `contact_gate`:代理指标↑ ≠ 干预有用 → 判据必看最终 rh,不单看 Δ。
 
 ## 3. 机制定义(sweep 成员)
@@ -53,6 +53,20 @@
   Stage2: 加 world residual 头, load Stage1 backbone(低 lr/部分 freeze), idx = robot  # 拉精度
   ```
   human-helps 以 warm-start 存进 backbone。消融 Stage2 是否 freeze backbone。
+
+- **align_wm(LaST-HD faithful,2026-07-12 精读 2606.23685 后新增)**:
+  ```
+  teacher = 冻结的混训 skel-WM(V.train_feat(...,"skel"),与本臂同 idx 同 seed)   # 被 flow CE grounding 的
+                                                                              # action-conditioned 前向动力学特征
+  student 主路径 = 纯 world featurization(保精度,单 path)
+  L = CE(全样本) + λ_align · mean(1 − cos(x_student, teacher.trunk(hist,eef3).detach()))   # 全样本对齐
+  ```
+  与简化版 `align` 的三处差异,逐一对齐原文:①目标来自**独立冻结教师**(非同网络 shared path 的移动靶);
+  ②教师特征被真实未来 flow 的 CE **grounding**(paper 消融:action-conditioned WM 目标 73% > SigLIP 视觉 66%
+  > 无 action 条件 WM 63% > 无 latent 60%,目标质量正是成败点);③ **cosine** + human+robot 全样本监督
+  (paper 把两域都拉向统一目标,action 输入 embodiment-specific 没关系)。
+  **Δ 诚实性(关键)**:ro 臂教师只用 ri 训练、rh 臂教师用 rih——每臂自包含,human 增益经教师进入 rh 臂,
+  不向 ro 臂泄漏。教师=sweep 中本来就要训的 skel 锚(同 idx 同 seed),额外成本≈0。λ_align 默认 0.3,可消融。
 
 **备选(先不纳入,Other 可后补)**:`aux` 多任务辅助头;`adversarial`(gradient-reversal,高风险对照);`target-side Δ`(与 featurization 正交,可叠加)。
 
