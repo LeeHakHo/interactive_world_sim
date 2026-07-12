@@ -127,6 +127,15 @@ def test_iws_frame_actions_shape():
     assert a.shape == (8, 24) and np.isfinite(a).all()
 
 
+def test_ade_px():
+    import numpy as np
+    from exp_scel_dualview_dit_formal import ade_px
+    pred = np.zeros((2, 3, 4, 2), np.float32); gt = pred.copy()
+    gt[0, ..., 0] += 1.0 / 128                          # view0 每点沿 x 错 1px (纯 x 偏移使欧氏距离==1px)
+    a0, a1 = ade_px(pred, gt)
+    assert abs(a0 - 1.0) < 1e-5 and a1 < 1e-6
+
+
 def test_iws_rollout_shape():
     from exp_dualview_iws_stage2 import rollout_iws, make_sched
     from interactive_world_sim.algorithms.latent_dynamics.models.cm_latent_dynamics import CMLatentDynamics

@@ -262,6 +262,65 @@ def run_gif():
     print(f"saved -> {outc}/gifs/", flush=True)
 
 
+def ade_px(pred, gt):
+    """per-view 平均位移误差 px. pred/gt (2,H,P,2) crop-norm."""
+    e = np.linalg.norm(pred - np.nan_to_num(gt, nan=0.5), axis=-1) * IMG
+    return float(e[0].mean()), float(e[1].mean())
+
+
+def run_e2e():
+    """M2: ② pred-flow 驱动 ③. 4 列 GT | GT-flow③(③天花板) | ②pred-flow③(端到端) | eef-FiLM③(naive).
+    ② = dualview_wm/wm_dual.pt (rollout_dual), 动作输入 = GT eef (replay actions, 允许)."""
+    from viz_combined import save_combined_gif, build_flow_cols
+    import exp_scel_dualview_wm as DW
+    R, _ = load_dual()
+    okr = np.where(R["ok"])[0]; perm = np.random.default_rng(0).permutation(okr); ho = perm[:150]
+    chosen = eval_seqs(R, ho)
+    wm = torch.load("outputs/cross_embodiment_wm/dualview_wm/wm_dual.pt",
+                    map_location=device, weights_only=False).eval()
+    mf = torch.load(f"{ROOT}/flow_cv1_s0/dvdit.pt", map_location=device, weights_only=False).eval()
+    me = torch.load(f"{ROOT}/eeffilm_cv1_s0/dvdit.pt", map_location=device, weights_only=False).eval()
+    P = R["tr"][0].shape[2]
+    outd = f"{ROOT}/e2e"; os.makedirs(f"{outd}/gifs", exist_ok=True)
+    from interactive_world_sim.algorithms.common.metrics.lpips import LearnedPerceptualImagePatchSimilarity
+    lp = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False).to(device).eval()
+    cols_lp = {c: {0: [], 1: []} for c in ["gtflow", "e2e", "eef"]}; ades = []
+    vname = {0: "high", 1: "low"}
+    for gi, si in enumerate(chosen):
+        trD = np.concatenate([R["tr"][0][si], np.nan_to_num(R["tr"][1][si], nan=0.5)], 1)[None]  # (1,L,2P,2)
+        pr = DW.rollout_dual(wm, torch.from_numpy(trD).float().to(device),
+                             torch.from_numpy(R["ef"][0][si][None]).float().to(device),
+                             torch.from_numpy(R["ef"][1][si][None]).float().to(device), H).cpu().numpy()[0]
+        pred_tr = np.stack([pr[:, :P], pr[:, P:]])                                    # (2,H,P,2)
+        gt_tr = np.stack([R["tr"][v][si, K:K + H] for v in range(2)])
+        ades.append(ade_px(pred_tr, gt_tr))
+        rr = {"gtflow": render_formal(mf, R, si, "flow"),
+              "e2e": render_formal(mf, R, si, "flow", pred_tr=pred_tr),
+              "eef": render_formal(me, R, si, "eeffilm")}
+        for v in range(2):
+            gtf = R["fr"][v][si, K:K + H].astype(np.float32) / 255.0
+            objm = np.stack([_fp(R["tr"][v][si, K + h]) for h in range(H)])
+            for c in rr:
+                lpv, _, _ = obj_lpips_audit(lp, rr[c][v].astype(np.float32), gtf, objm)
+                cols_lp[c][v].append(lpv)
+            if gi < 6:                                                                # gif 只出前 6 条固定 seq
+                gt = R["fr"][v][si, K:K + H].astype(np.uint8)
+                cols = np.stack([gt, u8(rr["gtflow"][v]), u8(rr["e2e"][v]), u8(rr["eef"][v])])
+                fc = build_flow_cols(gt, R["tr"][v][si, K:K + H], [None] * 4, R["ef"][v][si, K:K + H])
+                save_combined_gif(f"{outd}/gifs/seq{si}_cam{vname[v]}.gif", cols, fc,
+                                  [f"GT {vname[v]}", "GT-flow(③ceiling)", "②pred-flow(e2e)", "eef-FiLM(naive)"],
+                                  [None] * 4, K, caption=f"end-to-end ②→③ | cam_{vname[v]} | {VERSIONS[:60]}")
+    a = np.array(ades)
+    res = {f"{c}_v{v}_lp": float(np.nanmean(cols_lp[c][v])) for c in cols_lp for v in range(2)}
+    res.update({"ade_v0_px": float(a[:, 0].mean()), "ade_v1_px": float(a[:, 1].mean()), "n_eval": len(chosen)})
+    json.dump(res, open(f"{outd}/metrics.json", "w"), indent=2)
+    lines = [f"E2E ②→③ | {VERSIONS}",
+             f"② ADE: cam_high {res['ade_v0_px']:.2f}px | cam_low {res['ade_v1_px']:.2f}px",
+             f"obj-LPIPS v0: GT-flow {res['gtflow_v0_lp']:.3f} | e2e {res['e2e_v0_lp']:.3f} | eef {res['eef_v0_lp']:.3f}",
+             f"obj-LPIPS v1: GT-flow {res['gtflow_v1_lp']:.3f} | e2e {res['e2e_v1_lp']:.3f} | eef {res['eef_v1_lp']:.3f}"]
+    open(f"{outd}/summary.txt", "w").write("\n".join(lines) + "\n"); print("\n".join(lines) + "\n=== DONE ===", flush=True)
+
+
 if __name__ == "__main__":
     if MODE == "train": main()
     elif MODE == "e2e": run_e2e()                                   # Task 5
