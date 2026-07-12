@@ -522,7 +522,7 @@ if __name__ == "__main__":
 Run: `/scr/yusenluo/anaconda3/envs/iws/bin/python -m pytest tests/test_dualview_formal.py -v`
 Expected: 全 PASS。
 
-Run(SLURM srun 拿 1 卡): `cd /scr2/yusenluo/interactive_world_sim && srun --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=1:00:00 env SMOKE=1 COND=flow /scr/yusenluo/anaconda3/envs/iws/bin/python exp_scel_dualview_dit_formal.py 2>&1 | tail -20`
+Run(SLURM srun 拿 1 卡): `cd /scr2/yusenluo/interactive_world_sim && srun --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=1:00:00 /usr/bin/env SMOKE=1 COND=flow /scr/yusenluo/anaconda3/envs/iws/bin/python exp_scel_dualview_dit_formal.py 2>&1 | tail -20`
 Expected: 打印 params、2 个 epoch loss、summary 三行;`outputs/cross_embodiment_wm/dualview_dit_formal/flow_cv1_s0_smoke/{metrics.json,summary.txt,dvdit.pt}` 存在;`det_rate_v*` ∈ (0,1]。
 
 同样 srun SMOKE 跑 `COND=eefsp` 和 `COND=eeffilm CROSSVIEW=0` 各一遍确认三臂+mask 路径都走通(env 变量照替)。
@@ -530,6 +530,13 @@ Expected: 打印 params、2 个 epoch loss、summary 三行;`outputs/cross_embod
 - [ ] **Step 5: 记录每 epoch 耗时,推算全量成本**
 
 从 SMOKE 输出估算 min/epoch(全量样本数 ≈ SMOKE 的 (2550+1650)/160 ≈ 26 倍)→ 60ep 单 run 小时数写进 `docs/superpowers/plans/2026-07-12-dualview-dit-formalize.md` 本行下方,若单 run > 12h,与用户确认降 EPOCHS 或减 DEPTH 前不擅自改。实测: ______ min/ep,单 run ≈ ______ h。
+
+实测(2026-07-12, srun 1×GPU, SMOKE=1 即 80 robot + 80 human = 160 samples, 2 epochs, n_eval=4):
+- flow(cv1)   : wall=0.7min(42s, sacct 确认) → naive 0.35 min/ep(smoke 规模,含 load_dual/latcache/eval/save 固定开销未拆分)→ ×26 样本倍数 ≈ 9.1 min/ep(全量)→ ×60 epochs ≈ **9.1h/run**
+- eefsp(cv1)  : wall=0.5min → 0.25 min/ep → ×26 ≈ 6.5 min/ep → ×60 ≈ **6.5h/run**
+- eeffilm(cv0): wall=0.5min → 0.25 min/ep → ×26 ≈ 6.5 min/ep → ×60 ≈ **6.5h/run**
+
+注: `load_dual()` 在 SMOKE 下仍加载全量数据集(只在之后子采样 pool/okh 索引),故 load 开销在 smoke wall 里已接近全量水平、并非按 26x 线性放大的量——上述估算把它当作"随样本数缩放"处理,是保守上界(全量实际单 run 时长大概率 < 9.1h)。三臂均 < 12h 阈值,未触发降 EPOCHS/DEPTH 确认流程。取 flow(最重臂)9.1h 作为单 run 预算上界供 Task 4 sweep 排期参考。
 
 - [ ] **Step 6: Commit**
 
@@ -698,7 +705,7 @@ Expected: ablation_table.md 生成;gate 两视角 PASS → launch STAGE=B;EXTEND
 
 - [ ] **Step 6: Stage B + Stage C(M1c human-helps)完成后再跑聚合 + gif**
 
-Run: `STAGE=B bash run_dualview_formal_sweep.sh && STAGE=C bash run_dualview_formal_sweep.sh`;全部 job 完成后(squeue 清空)跑 `/scr/yusenluo/anaconda3/envs/iws/bin/python agg_dualview_formal.py`(CPU)和 `srun --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=2:00:00 env MODE=gif /scr/yusenluo/anaconda3/envs/iws/bin/python exp_scel_dualview_dit_formal.py`
+Run: `STAGE=B bash run_dualview_formal_sweep.sh && STAGE=C bash run_dualview_formal_sweep.sh`;全部 job 完成后(squeue 清空)跑 `/scr/yusenluo/anaconda3/envs/iws/bin/python agg_dualview_formal.py`(CPU)和 `srun --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=2:00:00 /usr/bin/env MODE=gif /scr/yusenluo/anaconda3/envs/iws/bin/python exp_scel_dualview_dit_formal.py`
 Expected: 全表 8 行(3 cond × 2 cv rh + flow/eeffilm cv1 r-only)+ human-helps Δ 判定行 + 12 个 gif。Δ 不显著或为负照实进表(③ 层先验 +0.03 天花板,"不帮在③、帮在②"本身就是 paper 论点的一部分)。
 
 - [ ] **Step 7: Commit**
@@ -799,7 +806,7 @@ def run_e2e():
 - [ ] **Step 3: 单测通过 + e2e 跑通**
 
 Run: `pytest tests/test_dualview_formal.py -v` → 全 PASS。
-Run: `srun --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=4:00:00 env MODE=e2e /scr/yusenluo/anaconda3/envs/iws/bin/python exp_scel_dualview_dit_formal.py`
+Run: `srun --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=4:00:00 /usr/bin/env MODE=e2e /scr/yusenluo/anaconda3/envs/iws/bin/python exp_scel_dualview_dit_formal.py`
 Expected: summary 4 行;② ADE ≲ 4px(该 ② 在 H=40 时 drift ~2.9/3.1px,H=20 应更小,大很多则查接线);判据 = e2e 列 obj-LPIPS 仍 < eef 列,GT-flow 列为上界。若 ② 太差拉爆 e2e:如实入 report("接口在 GT-flow 上界成立、端到端受 ② 限"),不粉饰。
 
 - [ ] **Step 4: Commit**
@@ -1047,7 +1054,7 @@ if __name__ == "__main__":
 - [ ] **Step 3: 单测通过 + SMOKE**
 
 Run: `pytest tests/test_dualview_formal.py -k iws -v` → 3 PASS。
-Run: `srun --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=1:00:00 env SMOKE=1 /scr/yusenluo/anaconda3/envs/iws/bin/python exp_dualview_iws_stage2.py 2>&1 | tail -8`
+Run: `srun --gres=gpu:1 --cpus-per-task=8 --mem=64G --time=1:00:00 /usr/bin/env SMOKE=1 /scr/yusenluo/anaconda3/envs/iws/bin/python exp_dualview_iws_stage2.py 2>&1 | tail -8`
 Expected: params 打印、2 epoch loss 下降、summary 三行、`s0_smoke/` 产物齐;**肉眼看一条 seq 的 render npy 不是纯噪声**(quick decode 检查)。
 
 - [ ] **Step 4: 全量训练(seed0,可选 seed1)**
