@@ -110,3 +110,29 @@ def test_obj_lpips_audit_counts_invalid():
     objm[0, 60:70, 60:70] = 1.0; objm[1, 60:70, 60:70] = 1.0      # 只有 2 帧有效
     mean, n_valid, n_total = obj_lpips_audit(FakeLP(), pred, gt, objm)
     assert n_valid == 2 and n_total == 4 and abs(mean - 0.5) < 1e-6
+
+
+def test_iws_sched_monotonic():
+    from exp_dualview_iws_stage2 import make_sched
+    ab = make_sched(1000)
+    assert ab.shape == (1000,) and ab[0] > 0.99 and ab[-1] < 0.01
+    assert bool((ab[1:] <= ab[:-1] + 1e-8).all())
+
+
+def test_iws_frame_actions_shape():
+    import numpy as np
+    from exp_dualview_iws_stage2 import frame_actions
+    D = {"ef": [np.random.rand(5, 48, 3, 2).astype(np.float32) for _ in range(2)]}
+    a = frame_actions(D, 3, np.arange(8))
+    assert a.shape == (8, 24) and np.isfinite(a).all()
+
+
+def test_iws_rollout_shape():
+    from exp_dualview_iws_stage2 import rollout_iws, make_sched
+    from interactive_world_sim.algorithms.latent_dynamics.models.cm_latent_dynamics import CMLatentDynamics
+    torch.manual_seed(0)
+    m = CMLatentDynamics(latent_dim=8, action_dim=24, dim=16, dim_mults=[1, 2],
+                         attn_resolutions=[1], attn_heads=2, attn_dim_head=8).eval()
+    z0 = torch.randn(1, 8, 1, 16, 16); acts = torch.randn(1, 6, 24)
+    out = rollout_iws(m, z0, acts, Hn=5, sched=make_sched(100), infer_steps=3, t_win=4, device="cpu")
+    assert out.shape == (1, 8, 5, 16, 16) and torch.isfinite(out).all()
