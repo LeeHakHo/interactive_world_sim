@@ -238,6 +238,30 @@ def main():
     open(f"{OUT}/summary.txt", "w").write("\n".join(lines) + "\n"); print("\n".join(lines) + "\n=== DONE ===", flush=True)
 
 
+def run_gif():
+    """replay 对比 gif: GT | flow | eefsp | eeffilm (seed0 cv1), 两视角, save_combined_gif protocol."""
+    from viz_combined import save_combined_gif, build_flow_cols
+    R, _ = load_dual()
+    okr = np.where(R["ok"])[0]; perm = np.random.default_rng(0).permutation(okr); ho = perm[:150]
+    chosen = eval_seqs(R, ho)[:6]
+    models = {}
+    for c in ["flow", "eefsp", "eeffilm"]:
+        p = f"{ROOT}/{c}_cv1_s0/dvdit.pt"
+        models[c] = torch.load(p, map_location=device, weights_only=False).eval()
+    outc = f"{ROOT}/compare"; os.makedirs(f"{outc}/gifs", exist_ok=True)
+    vname = {0: "high", 1: "low"}
+    for si in chosen:
+        rr = {c: render_formal(m, R, si, c) for c, m in models.items()}
+        for v in range(2):
+            gt = R["fr"][v][si, K:K + H].astype(np.uint8)
+            cols = np.stack([gt] + [u8(rr[c][v]) for c in ["flow", "eefsp", "eeffilm"]])
+            fc = build_flow_cols(gt, R["tr"][v][si, K:K + H], [None] * 4, R["ef"][v][si, K:K + H])
+            save_combined_gif(f"{outc}/gifs/seq{si}_cam{vname[v]}.gif", cols, fc,
+                              [f"GT {vname[v]}", "flow(ours)", "eefsp", "eeffilm(IWS-style)"], [None] * 4, K,
+                              caption=f"formal 3-arm replay | cam_{vname[v]} | seed0 cv1")
+    print(f"saved -> {outc}/gifs/", flush=True)
+
+
 if __name__ == "__main__":
     if MODE == "train": main()
     elif MODE == "e2e": run_e2e()                                   # Task 5
