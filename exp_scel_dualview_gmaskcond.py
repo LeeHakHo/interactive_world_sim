@@ -1,0 +1,194 @@
+"""③ agent-conditioning 消融(治糊):dual-view DiT 的 cond 加 gmask agent 剪影通道。
+
+背景:can 单视角 detmem(LPIPS 0.147)赢在有 gmask agent 条件;dual-view DiT(0.25-0.31)
+没有 agent 条件→手臂靠猜→糊。本消融同一 DualViewDiT,唯一变量 GMASK∈{0,1}:
+  GMASK=0: cond = per-view flow splat [dx,dy,footprint](现状 3ch)
+  GMASK=1: cond = 3ch ⊕ agent 剪影(robot v0 用 maskgen_caneef(joint7+eef6→128²);
+           human/v1 置零——v1 作 within-run 对照,v0 的提升即 agent 条件的贡献)
+replay GT flow(隔离 ③ 质量);can_dual robot+human co-train;eval=held-out robot
+full-LPIPS/obj-LPIPS/PSNR + 渲染缓存;COMPARE=<dir0>,<dir1> 出 3 列 gif。
+Env: GMASK/EPOCHS(60)/NSEQ/OUT。iws env,GPU。
+Output: outputs/cross_embodiment_wm/dualview_gmask/<g0|g1>/"""
+import os, sys
+os.environ.setdefault("VAE_NAME", "ostris/vae-kl-f8-d16")
+os.environ.setdefault("HF_HUB_OFFLINE", "1")
+os.environ.setdefault("MASKGEN", "outputs/flow_wm/maskgen_caneef/maskgen_caneef.pt")
+os.environ.setdefault("EPOCHS", "60")
+import numpy as np, torch, torch.nn as nn
+
+os.chdir("/scr2/yusenluo/interactive_world_sim")
+import exp_scel_dualview_dit as DIT
+from exp_scel_dualview_dit import (flow_cond, latcache, load_dual, DualViewDiT,
+                                   enc, dec, obj_lpips, psnr, _fp, u8)
+from exp_scel_latent_renderer import latent_ch
+from exp_scel_latent_dit import GRID
+from exp_v3_human_helps_pixels import cbr, load_gmask, gmask_imgs, IMG, device
+from exp_scel_latent_lpips import _decode_grad
+from viz_combined import save_combined_gif, build_flow_cols
+
+SMOKE = os.environ.get("SMOKE", "0") == "1"
+DS = "outputs/flow_render_dataset_can_dual"
+GMASK = os.environ.get("GMASK", "1") == "1"
+EPOCHS = 3 if SMOKE else int(os.environ["EPOCHS"]); BS = 8; LR = 2e-4
+H = 20; HELDOUT = 150; NSEQ = int(os.environ.get("NSEQ", "6")); PREV_DF = 0.3
+LAM = float(os.environ.get("LAM_LPIPS", "1.0"))
+OUT = os.environ.get("OUT", f"outputs/cross_embodiment_wm/dualview_gmask/{'g1' if GMASK else 'g0'}")
+os.makedirs(f"{OUT}/gifs", exist_ok=True)
+_m = sys.modules["__main__"]
+
+
+class DualViewDiTG(DualViewDiT):
+    """DualViewDiT(flow) + 可选第 4 条 gmask cond 通道(同一 ce 卷积栈,首层 3→4ch)。"""
+    def __init__(s, gmask=True):
+        super().__init__(cond="flow")
+        s.gmask = gmask
+        if gmask:
+            s.ce = nn.Sequential(cbr(4, 32), nn.MaxPool2d(2), cbr(32, 64), nn.MaxPool2d(2),
+                                 cbr(64, 128), nn.MaxPool2d(2))
+
+
+setattr(_m, "DualViewDiTG", DualViewDiTG)
+
+
+def build_conds_g(R, joint, dom, j, t, gmask_on):
+    """(2,3|4,128,128) cond + (2,128,128) object mask。gmask:robot v0=maskgen 剪影,其余 0。"""
+    conds, masks = [], []
+    for v in range(2):
+        tr, ef, vs = R["tr"][v], R["ef"][v], R["vs"][v]
+        c = flow_cond(tr[j, 0], tr[j, t], ef[j, 0], ef[j, t], vs[j, t])
+        masks.append(c[2].copy())
+        if gmask_on:
+            if v == 0 and dom == "r":
+                import exp_v3_human_helps_pixels as HP
+                if not HP._G: load_gmask()                      # 懒加载 maskgen
+                g = gmask_imgs(joint[j, t][None], ef[j, t][None])[0].astype(np.float32)
+            else:
+                g = np.zeros((IMG, IMG), np.float32)
+            c = np.concatenate([c, g[None]], 0)
+        conds.append(c)
+    return np.stack(conds), np.stack(masks)
+
+
+def train_g(R, Hh, joint, idx_r, idx_h, latR, latH):
+    """DIT.train 逐字改编:cond 走 build_conds_g,模型 DualViewDiTG(GMASK)。"""
+    torch.manual_seed(0); m = DualViewDiTG(gmask=GMASK).to(device)
+    opt = torch.optim.AdamW(m.parameters(), lr=LR)
+    print(f"DualViewDiTG GMASK={GMASK} params={sum(p.numel() for p in m.parameters())/1e6:.1f}M EPOCHS={EPOCHS}", flush=True)
+    from interactive_world_sim.algorithms.common.metrics.lpips import LearnedPerceptualImagePatchSimilarity
+    lp = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False).to(device).eval()
+    for p in lp.parameters(): p.requires_grad_(False)
+    rng = np.random.default_rng(0)
+    samples = np.array([("r", int(j)) for j in idx_r] + [("h", int(j)) for j in idx_h], dtype=object)
+    fr01 = lambda a: a.astype(np.float32).transpose(2, 0, 1) / 255.0
+    for ep in range(EPOCHS):
+        m.train(); order = rng.permutation(len(samples)); tot = 0; nb = 0
+        for i in range(0, len(order), BS):
+            bidx = order[i:i + BS]
+            z0i, z1i, pvi, gti, cdi, mki, doms = [], [], [], [], [], [], []
+            for si in bidx:
+                dom, j = samples[si]; D = R if dom == "r" else Hh; lc = latR if dom == "r" else latH
+                t = int(rng.integers(9, D["fr"][0].shape[1]))
+                cond, mask = build_conds_g(D, joint, dom, j, t, GMASK)
+                pt = 0 if rng.random() < 0.15 else t - 1
+                z0i.append(lc[j, 0].astype(np.float32)); z1i.append(lc[j, t].astype(np.float32)); pvi.append(lc[j, pt].astype(np.float32))
+                gti.append([fr01(D["fr"][v][j, t]) for v in range(2)])
+                cdi.append(cond); mki.append(mask); doms.append(0 if dom == "r" else 1)
+            f2 = lambda a: torch.from_numpy(np.stack(a).astype(np.float32)).to(device)
+            z0 = f2(z0i); z1 = f2(z1i); pv = f2(pvi); GT = f2(gti)
+            cond = f2(cdi); mask = f2(mki)[:, :, None]; dom = torch.tensor(doms, device=device)
+            a = torch.rand(len(bidx), 1, 1, 1, 1, device=device) * PREV_DF; pv = (1 - a) * pv + a * torch.randn_like(pv)
+            pred = m(z0, pv, cond)
+            img = _decode_grad(pred.reshape(-1, latent_ch(), GRID, GRID)).clamp(0, 1).reshape(len(bidx), 2, 3, IMG, IMG)
+            rs = (dom == 0); hs = (dom == 1)
+            loss = 0.0 * pred.sum()
+            if rs.any():
+                loss = loss + ((pred[rs] - z1[rs]) ** 2).mean()
+                loss = loss + LAM * lp(img[rs].reshape(-1, 3, IMG, IMG) * 2 - 1, GT[rs].reshape(-1, 3, IMG, IMG) * 2 - 1)
+            if hs.any():
+                om = mask[hs]; loss = loss + (((img[hs] - GT[hs]) ** 2) * om).sum() / (om.sum() * 3 + 1e-6)
+            opt.zero_grad(); loss.backward(); opt.step(); tot += float(loss); nb += 1
+        if ep % 15 == 0 or ep == EPOCHS - 1: print(f"  GMASK={GMASK} ep{ep} loss={tot/nb:.4f}", flush=True)
+    return m.eval()
+
+
+@torch.no_grad()
+def render_g(m, R, joint, si):
+    fr01 = lambda a: torch.from_numpy(a.astype(np.float32).transpose(2, 0, 1)[None] / 255.0).to(device)
+    z0 = torch.stack([enc(fr01(R["fr"][v][si, 0]))[0] for v in range(2)])[None]
+    prev = z0.clone(); outs = [[], []]
+    for h in range(H):
+        cond, _ = build_conds_g(R, joint, "r", si, DIT.K + h, GMASK)
+        cond = torch.from_numpy(cond[None].astype(np.float32)).to(device)
+        pred = m(z0, prev, cond); prev = pred
+        for v in range(2): outs[v].append(dec(pred[:, v])[0].cpu().numpy())
+    return np.stack([np.stack(outs[v]).transpose(0, 2, 3, 1) for v in range(2)])
+
+
+def full_lpips(lp, pred, gt):
+    a = torch.from_numpy(pred).permute(0, 3, 1, 2).float().to(device) * 2 - 1
+    b = torch.from_numpy(gt).permute(0, 3, 1, 2).float().to(device) * 2 - 1
+    return float(np.mean([float(lp(a[i:i+1], b[i:i+1])) for i in range(len(a))]))
+
+
+def main():
+    load_gmask()
+    R, Hh = load_dual()
+    joint = np.load(f"{DS}/clips_robot.npz")["joint"].astype(np.float32)
+    okr = np.where(R["ok"])[0]; okh = np.where(Hh["ok"])[0]
+    perm = np.random.default_rng(0).permutation(okr); ho, pool = perm[:HELDOUT], perm[HELDOUT:]
+    if SMOKE: pool = pool[:60]; okh = okh[:60]
+    latR = latcache(R, "robot"); latH = latcache(Hh, "human")
+    m = train_g(R, Hh, joint, pool, okh, latR, latH); torch.save(m, f"{OUT}/dvdit_g.pt")
+    from interactive_world_sim.algorithms.common.metrics.lpips import LearnedPerceptualImagePatchSimilarity
+    lp = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False).to(device).eval()
+    mot = np.array([np.linalg.norm(np.diff(R["tr"][0][si, DIT.K:DIT.K + H].mean(1), axis=0), axis=-1).sum() for si in ho])
+    chosen = ho[np.argsort(-mot)[:NSEQ]]
+    os.makedirs(f"{OUT}/render_cache", exist_ok=True)
+    np.save(f"{OUT}/render_cache/chosen.npy", chosen)
+    agg = {f"v{v}_{k}": [] for v in range(2) for k in ["ps", "olp", "flp"]}
+    for si in chosen:
+        si = int(si); rr = render_g(m, R, joint, si)
+        np.save(f"{OUT}/render_cache/seq{si}.npy", u8(rr))
+        for v in range(2):
+            gtf = R["fr"][v][si, DIT.K:DIT.K + H].astype(np.float32) / 255.0
+            objm = np.stack([_fp(R["tr"][v][si, DIT.K + h]) for h in range(H)])
+            agg[f"v{v}_ps"].append(np.mean([psnr(rr[v, h], gtf[h]) for h in range(H)]))
+            agg[f"v{v}_olp"].append(obj_lpips(lp, rr[v].astype(np.float32), gtf, objm))
+            agg[f"v{v}_flp"].append(full_lpips(lp, rr[v].astype(np.float32), gtf))
+        print(f"  seq{si} done", flush=True)
+    mn = lambda k: float(np.nanmean(agg[k]))
+    lines = [f"DUAL-VIEW DiT GMASK={int(GMASK)} | replay GT flow | EPOCHS={EPOCHS} | n={len(chosen)}"]
+    for v in range(2):
+        lines.append(f"cam{'_high' if v==0 else '_low '}: PSNR {mn(f'v{v}_ps'):.2f} | obj-LPIPS {mn(f'v{v}_olp'):.3f} | FULL-LPIPS {mn(f'v{v}_flp'):.3f}")
+    import json; json.dump({k: float(np.nanmean(vv)) for k, vv in agg.items()}, open(f"{OUT}/metrics.json", "w"), indent=2)
+    open(f"{OUT}/summary.txt", "w").write("\n".join(lines) + "\n")
+    print("\n".join(lines) + "\n=== DONE ===", flush=True)
+
+
+def compare_runs(dir0, dir1):
+    """GMASK=0 vs 1 渲染缓存 -> 3 列 gif:GT | flow-only | flow+gmask。"""
+    R, _ = load_dual()
+    ch0 = np.load(f"{dir0}/render_cache/chosen.npy"); ch1 = np.load(f"{dir1}/render_cache/chosen.npy")
+    assert (ch0 == ch1).all()
+    OUTC = os.environ.get("OUT", "outputs/cross_embodiment_wm/dualview_gmask/compare")
+    os.makedirs(f"{OUTC}/gifs", exist_ok=True)
+    vname = {0: "high", 1: "low"}
+    for si in ch0:
+        si = int(si)
+        r0 = np.load(f"{dir0}/render_cache/seq{si}.npy"); r1 = np.load(f"{dir1}/render_cache/seq{si}.npy")
+        for v in range(2):
+            gt = R["fr"][v][si, DIT.K:DIT.K + H].astype(np.uint8)
+            cols = np.stack([gt, r0[v], r1[v]])
+            gt_obj = R["tr"][v][si, DIT.K:DIT.K + H]
+            fc = build_flow_cols(gt, gt_obj, [None, None, None], R["ef"][v][si, DIT.K:DIT.K + H])
+            save_combined_gif(f"{OUTC}/gifs/seq{si}_cam{vname[v]}.gif", cols, fc,
+                              ["GT", "flow-only (blur base)", "flow+gmask (agent-cond)"], [None] * 3, DIT.K,
+                              caption=f"agent-conditioning ablation | cam_{vname[v]}")
+    print(f"saved -> {OUTC}/gifs/\n=== DONE ===", flush=True)
+
+
+if __name__ == "__main__":
+    if os.environ.get("COMPARE"):
+        compare_runs(*os.environ["COMPARE"].split(","))
+    else:
+        main()
