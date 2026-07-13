@@ -78,18 +78,26 @@ OSCAR-skeleton 式的 eefsp 臂在易视角(cam_high)甚至反超 flow(cam_low �
 的 +0.03 天花板判死)。**human-helps 的主战场在 ②**(object-flow WM human-help 1.7-2×,
 project_human_helps_end2end),③ 只负责把 ② 的增益无损渲染出来(见 §3)。
 
-## 3. M2 端到端 ②→③(pred-flow 驱动,n=24)
+## 3. M2 端到端 ②→③(pred-flow 驱动,n=24;2026-07-13 勘误后的干净数字)
+
+> **勘误**:初版 e2e 用的 ②(`dualview_wm/wm_dual.pt`)与 ③ 的 split 代码不等价,24 条 eval seq 有 22 条
+> 在该 ② 的训练集内(体检报告 CAN_DATA_AUDIT_2026-07-13.md,CRITICAL 项)。已用 `SPLIT=okfirst` 重训
+> **对 eval seq 可证明零接触**的 ②(`dualview_wm_cleansplit/wm_dual.pt`,commit 23d13de)并重测。
+> 泄漏版数字(ADE 2.07/2.33px,e2e 0.270/0.291)作废,以下为干净数字。
 
 | 列 | v0 obj-LPIPS | v1 obj-LPIPS |
 |---|---|---|
 | GT-flow → ③(③ 天花板) | 0.263 | 0.282 |
-| **② pred-flow → ③(端到端)** | **0.270** | **0.291** |
+| **② pred-flow → ③(端到端,干净 ②)** | **0.270** | **0.298** |
 | eef-FiLM → ③(naive) | 0.285 | 0.345 |
 
-- **② ADE:cam_high 2.07px / cam_low 2.33px**(H=20;验收线 ≲4px)。
-- **端到端只比天花板差 0.007/0.009,仍显著赢 naive** → ②→③ 全链成立:flow 接口不是只在理想 GT 条件下赢,
-  ② 的预测误差几乎不损失渲染质量。这是 eefsp(agent 条件)给不了的:它没有可由 ② 预测、可交互操控的物体运动通道。
-- 注意 ② 输入 view1 遮挡点按训练约定填 0.5(修过一处 train/inference 填充不一致,commit 523b7ae)。
+- **② ADE:cam_high 2.71px / cam_low 3.67px**(H=20;验收线 ≲4px,过)。
+- **端到端比天花板差 0.007/0.016,仍明显赢 naive** → ②→③ 全链在无泄漏条件下成立:核心结论经勘误存活,
+  cam_low 的天花板差距比泄漏版略大(0.016 vs 0.009),如实报。这是 eefsp(agent 条件)给不了的:
+  它没有可由 ② 预测、可交互操控的物体运动通道。
+- 注意:summary.txt 里的 VERSIONS 行仍打印旧 ckpt 路径(静态字符串),实际用的 ② 由 `WM_PT` env 指定
+  为 cleansplit 版,以 e2e 日志(dvf_e2e_clean_53263)为准。
+- ② 输入 view1 遮挡点按训练约定填 0.5(修过一处 train/inference 填充不一致,commit 523b7ae)。
 
 ## 4. M2.5 External baseline:真 IWS stage2(CMLatentDynamics,DF)
 
@@ -110,6 +118,9 @@ project_human_helps_end2end),③ 只负责把 ② 的增益无损渲染出来(�
 4. cross-view 负结果基于本任务/数据;不同任务(需跨视角一致性约束的)可能不同。
 5. cam_low 的 tracks 有 4.07% NaN(遮挡),eval 用 low_valid+det-rate 防护;det-rate 全场 1.00。
 6. 途中两次磁盘满事故导致 eeffilm s1/s2 重跑(结果无影响,输出树已迁 /scr symlink)。
+7. **e2e 泄漏勘误(2026-07-13)**:初版 e2e 的 ② 训练集含 22/24 eval seq,已重训干净 ② 重测(§3);
+   全管线体检报告见仓库根 `CAN_DATA_AUDIT_2026-07-13.md`(标注/clips 层 CLEAN,消费层此一项 CRITICAL,
+   另有 NaN 约定/vis 死参数两个无实测影响的脆弱点)。
 
 ## 6. 复现与产物
 
