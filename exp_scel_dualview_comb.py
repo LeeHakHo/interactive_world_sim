@@ -249,8 +249,11 @@ def main():
                 roH, roL = ade_dual(wm_ro, r_tr, r_eA, r_eB, ho)
                 rhH, rhL = ade_dual(wm_rh, r_tr, r_eA, r_eB, ho)
                 res[meth][N].append((roH, roL, rhH, rhL))
-                if meth == "align_wm":                          # e2e 备用:存 rh 臂 ckpt(最后 seed 覆盖)
-                    torch.save(wm_rh, f"{OUT}/wm_alignwm_rh_N{N}.pt")
+                if meth in ("dummy5", "align_wm"):              # e2e 配对 ckpt:存 rh 臂(最后 seed 覆盖)
+                    try:
+                        torch.save(wm_rh, f"{OUT}/wm_{meth}_rh_N{N}.pt")
+                    except Exception as e:                      # 磁盘满等:别让 ckpt 保存毁掉 metrics
+                        print(f"  [WARN] ckpt save failed: {e}", flush=True)
                 print(f"  N={N:>4} seed={seed} {meth:>9} | ro {(roH+roL)/2:6.2f} rh {(rhH+rhL)/2:6.2f} "
                       f"Δ {(roH+roL)/2-(rhH+rhL)/2:+6.2f} | H/L ro {roH:.2f}/{roL:.2f} rh {rhH:.2f}/{rhL:.2f}", flush=True)
             _save(res, header)
