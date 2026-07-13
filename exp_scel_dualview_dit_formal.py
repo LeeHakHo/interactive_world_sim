@@ -239,7 +239,8 @@ def main():
 
 
 def run_gif():
-    """replay 对比 gif: GT | flow | eefsp | eeffilm (seed0 cv1), 两视角, save_combined_gif protocol."""
+    """replay 对比 gif: GT | flow | eefsp | eeffilm | IWS-stage2(external) (seed0 cv1), 两视角, save_combined_gif protocol.
+    第5列读 Task 6 存的 dualview_iws_stage2/s0/gifs/seq{si}_render.npy (u8, (2,H,128,128,3)); 缺失则该 seq 只出 4 列并 log."""
     from viz_combined import save_combined_gif, build_flow_cols
     R, _ = load_dual()
     okr = np.where(R["ok"])[0]; perm = np.random.default_rng(0).permutation(okr); ho = perm[:150]
@@ -250,14 +251,23 @@ def run_gif():
         models[c] = torch.load(p, map_location=device, weights_only=False).eval()
     outc = f"{ROOT}/compare"; os.makedirs(f"{outc}/gifs", exist_ok=True)
     vname = {0: "high", 1: "low"}
+    iws_dir = "outputs/cross_embodiment_wm/dualview_iws_stage2/s0/gifs"
     for si in chosen:
         rr = {c: render_formal(m, R, si, c) for c, m in models.items()}
+        iws_p = f"{iws_dir}/seq{si}_render.npy"
+        iws = np.load(iws_p) if os.path.exists(iws_p) else None
+        if iws is None:
+            print(f"run_gif: missing {iws_p}, seq{si} rendered with 4 cols (no IWS-stage2 col)", flush=True)
         for v in range(2):
             gt = R["fr"][v][si, K:K + H].astype(np.uint8)
-            cols = np.stack([gt] + [u8(rr[c][v]) for c in ["flow", "eefsp", "eeffilm"]])
-            fc = build_flow_cols(gt, R["tr"][v][si, K:K + H], [None] * 4, R["ef"][v][si, K:K + H])
-            save_combined_gif(f"{outc}/gifs/seq{si}_cam{vname[v]}.gif", cols, fc,
-                              [f"GT {vname[v]}", "flow(ours)", "eefsp", "eeffilm(IWS-style)"], [None] * 4, K,
+            arm_cols = [gt] + [u8(rr[c][v]) for c in ["flow", "eefsp", "eeffilm"]]
+            labels = [f"GT {vname[v]}", "flow(ours)", "eefsp", "eeffilm(IWS-style)"]
+            if iws is not None:
+                arm_cols.append(iws[v]); labels.append("IWS-stage2(external)")
+            cols = np.stack(arm_cols)
+            fc = build_flow_cols(gt, R["tr"][v][si, K:K + H], [None] * len(arm_cols), R["ef"][v][si, K:K + H])
+            save_combined_gif(f"{outc}/gifs/seq{si}_cam{vname[v]}.gif", cols, fc, labels,
+                              [None] * len(arm_cols), K,
                               caption=f"formal 3-arm replay | cam_{vname[v]} | seed0 cv1")
     print(f"saved -> {outc}/gifs/", flush=True)
 
