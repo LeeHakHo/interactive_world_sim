@@ -136,6 +136,30 @@ def test_ade_px():
     assert abs(a0 - 1.0) < 1e-5 and a1 < 1e-6
 
 
+def test_split_okfirst_matches_formal():
+    """audit item5 fix: exp_scel_dualview_wm.split_okfirst must equal ③'s own
+    filter-then-permute split verbatim, and produce a disjoint, all-ok ho/pool."""
+    import numpy as np
+    from exp_scel_dualview_wm import split_okfirst
+
+    n = 300
+    ok = np.ones(n, dtype=bool); ok[::7] = False           # holes, like real low_valid
+    heldout = 150
+
+    ho, pool = split_okfirst(ok, heldout)
+
+    assert set(ho.tolist()).isdisjoint(set(pool.tolist()))
+    assert ok[ho].all() and ok[pool].all()
+
+    # ③-style computation, verbatim (exp_scel_dualview_dit_formal.py run_e2e/main)
+    okr = np.where(ok)[0]
+    perm = np.random.default_rng(0).permutation(okr)
+    ho_formal, pool_formal = perm[:heldout], perm[heldout:]
+
+    assert np.array_equal(ho, ho_formal)
+    assert np.array_equal(pool, pool_formal)
+
+
 def test_iws_rollout_shape():
     from exp_dualview_iws_stage2 import rollout_iws, make_sched
     from interactive_world_sim.algorithms.latent_dynamics.models.cm_latent_dynamics import CMLatentDynamics

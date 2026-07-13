@@ -26,6 +26,7 @@ MIX = os.environ.get("MIX", "rh")                          # rh = co-train robot
 SEED = int(os.environ.get("SEED", "0"))
 EPOCHS = 2 if SMOKE else int(os.environ.get("EPOCHS", "60"))
 NEVAL = int(os.environ.get("NEVAL", "24"))
+WM_PT = os.environ.get("WM_PT", "outputs/cross_embodiment_wm/dualview_wm/wm_dual.pt")
 ROOT = "outputs/cross_embodiment_wm/dualview_dit_formal"
 RUN = f"{CONDM}_cv{int(CROSSVIEW)}_s{SEED}" + ("_ronly" if MIX == "r" else "") + ("_smoke" if SMOKE else "")
 OUT = f"{ROOT}/{RUN}"; os.makedirs(f"{OUT}/gifs", exist_ok=True)
@@ -291,8 +292,7 @@ def run_e2e():
     trB_raw = np.load(f"{dv.DS}/clips_robot.npz")["tracks_low"].astype(np.float32)
     okr = np.where(R["ok"])[0]; perm = np.random.default_rng(0).permutation(okr); ho = perm[:150]
     chosen = eval_seqs(R, ho)
-    wm = torch.load("outputs/cross_embodiment_wm/dualview_wm/wm_dual.pt",
-                    map_location=device, weights_only=False).eval()
+    wm = torch.load(WM_PT, map_location=device, weights_only=False).eval()
     mf = torch.load(f"{ROOT}/flow_cv1_s0/dvdit.pt", map_location=device, weights_only=False).eval()
     me = torch.load(f"{ROOT}/eeffilm_cv1_s0/dvdit.pt", map_location=device, weights_only=False).eval()
     P = R["tr"][0].shape[2]
