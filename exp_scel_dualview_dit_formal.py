@@ -268,7 +268,7 @@ def run_gif():
             fc = build_flow_cols(gt, R["tr"][v][si, K:K + H], [None] * len(arm_cols), R["ef"][v][si, K:K + H])
             save_combined_gif(f"{outc}/gifs/seq{si}_cam{vname[v]}.gif", cols, fc, labels,
                               [None] * len(arm_cols), K,
-                              caption=f"formal 3-arm replay | cam_{vname[v]} | seed0 cv1")
+                              caption=f"formal 3-arm + IWS-external replay | cam_{vname[v]} | seed0 cv1")
     print(f"saved -> {outc}/gifs/", flush=True)
 
 

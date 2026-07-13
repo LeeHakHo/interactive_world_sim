@@ -9,8 +9,8 @@
 **在同一 DiT backbone 上,object-flow 空间条件显著优于 IWS-stage2 式 eef-FiLM 条件(双视角均 >2σ),
 且端到端(② 预测 flow 驱动 ③)几乎无损贴住 GT-flow 天花板、仍显著赢 naive;真 IWS stage2 整管线(CMLatentDynamics
 DF)在同数据同口径下垫底。** 两个诚实 nuance:(a) 对 eeffilm 的优势有一大块来自"空间注入 vs 向量 FiLM"机制差——
-OSCAR-skeleton 式的 eefsp 臂在易视角(cam_high)甚至反超 flow,物体 flow 内容的净增益体现在难视角(cam_low,遮挡多)
-和端到端可预测性;(b) ③ 层 human co-train 三臂全部不显著(复刻先验"human-helps 主战场在 ②")。
+OSCAR-skeleton 式的 eefsp 臂在易视角(cam_high)甚至反超 flow(cam_low 上 flow 均值优但不显著),物体 flow 内容的
+可靠净增益是**端到端可预测性/可控性**(eefsp 无 ② 可预测通道);(b) ③ 层 human co-train 三臂全部不显著(复刻先验"human-helps 主战场在 ②")。
 
 ## 1. Setup(组件版本)
 
@@ -57,8 +57,8 @@ OSCAR-skeleton 式的 eefsp 臂在易视角(cam_high)甚至反超 flow,物体 fl
 **eefsp 臂判读(内容 vs 注入机制,诚实)**:
 - cam_high:eefsp 0.2284 **反超** flow 0.2556(差 >2σ)。易视角下,agent 构型的空间渲染条件已足够让 ③ 内隐推断
   物体运动(can 任务物体大多随夹爪走)——**复刻 OSCAR"skeleton 空间条件最强"的发现**。
-- cam_low:flow 0.2790±0.003 vs eefsp 0.2913±0.014,flow 优且差≈2σ(边缘显著)。遮挡多的难视角,显式物体运动
-  信息才有净价值。
+- cam_low:flow 0.2790±0.003 vs eefsp 0.2913±0.014,flow 均值优但 d=0.0123 = 1.2σ,**<2σ 不显著(n=3,如实报)**。
+  "flow 内容的净价值"由显著证据承担:e2e 可预测性(eefsp 没有可由 ② 预测的物体运动通道,§3)+ flow vs eeffilm 门控。
 - 结论改写:**"flow 赢 naive action"成立,但拆开看 = "空间注入 ≫ 向量 FiLM"(机制,两空间臂共享)+
   "物体运动内容"(flow 独有,在难视角/端到端/可控性上兑现)。** paper 叙事必须按此写,不可把全部差距归给接口内容。
 
@@ -132,4 +132,4 @@ sbatch --export=ALL,SCRIPT=exp_dualview_iws_stage2.py,SEED=0 sbatch/dualview_for
 - e2e:`outputs/cross_embodiment_wm/dualview_dit_formal/e2e/{metrics.json,summary.txt,gifs/seq*_cam{high,low}.gif}`
 - 三臂+IWS 对比 gif:`outputs/cross_embodiment_wm/dualview_dit_formal/compare/gifs/seq*_cam{high,low}.gif`
 - IWS baseline:`outputs/cross_embodiment_wm/dualview_iws_stage2/s0/{metrics.json,summary.txt,iws_dyn.pt(state_dict)}`
-- 单测:`tests/test_dualview_formal.py`(16 项:mask 无泄漏/三臂 shape/eval det-rate/ADE/DF schedule 等)
+- 单测:`tests/test_dualview_formal.py`(13 项:mask 无泄漏/三臂 shape/eval det-rate/ADE/DF schedule 等)
