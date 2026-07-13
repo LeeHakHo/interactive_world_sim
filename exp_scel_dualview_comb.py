@@ -27,8 +27,8 @@ DS = os.environ.get("DS", "outputs/flow_render_dataset_can_dual")
 OUT = os.environ.get("OUT", "outputs/cross_embodiment_wm/dualview_comb"); os.makedirs(OUT, exist_ok=True)
 N_ROB_LIST = [int(x) for x in os.environ.get("N_ROB_LIST", "50,100,400").split(",")]
 SEEDS = [int(x) for x in os.environ.get("SEEDS", "0,1,2").split(",")]
-ANCHORS = ["dummy5", "skel"]
-COMBINES = os.environ.get("COMBINES", "a1,align_wm").split(",")
+ANCHORS = [a for a in os.environ.get("ANCHORS", "dummy5,skel").split(",") if a]
+COMBINES = [c for c in os.environ.get("COMBINES", "a1,align_wm").split(",") if c]
 METHODS = ANCHORS + COMBINES
 
 

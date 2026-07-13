@@ -150,8 +150,8 @@ OUT = os.environ.get("OUT", "outputs/cross_embodiment_wm/combine_action"); os.ma
 DS = os.environ.get("DS", X.DS)
 N_ROB_LIST = [int(x) for x in os.environ.get("N_ROB_LIST", "20,50,100,400").split(",")]
 SEEDS = [int(x) for x in os.environ.get("SEEDS", "0,1,2").split(",")]
-ANCHORS = ["world", "skel"]                                   # 上下界锚,走 V.train_feat
-COMBINES = os.environ.get("COMBINES", "a1,align,align_wm,warm").split(",")
+ANCHORS = [a for a in os.environ.get("ANCHORS", "world,skel").split(",") if a]   # 锚,走 V.train_feat
+COMBINES = [c for c in os.environ.get("COMBINES", "a1,align,align_wm,warm").split(",") if c]
 METHODS = ANCHORS + COMBINES
 
 
