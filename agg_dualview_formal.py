@@ -53,7 +53,7 @@ if ("flow", 1, "rh") in stat and ("eeffilm", 1, "rh") in stat:
         lines.append(f"- gate {v}: flow {mf:.4f} vs eeffilm {me:.4f} | d={d:+.4f} pooled_std={pooled:.4f} -> **{verdict}**")
 
 lines.append("")
-for cond in ["flow", "eeffilm"]:                           # M1c human-helps: Δ = LPIPS(r-only) - LPIPS(r+h), >0 = human 帮
+for cond in ["flow", "eefsp", "eeffilm"]:                  # M1c human-helps: Δ = LPIPS(r-only) - LPIPS(r+h), >0 = human 帮
     if (cond, 1, "rh") in stat and (cond, 1, "r") in stat:
         for v in ["v0_lp", "v1_lp"]:
             mrh, srh = stat[(cond, 1, "rh")][v]; mr, sr = stat[(cond, 1, "r")][v]
