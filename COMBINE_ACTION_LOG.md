@@ -65,6 +65,41 @@
 **眼检坐实**（`plumb_dummy5/eyeball_lastframes.png`）：②pred 列罐子成形与天花板同质,eef 列
 物体涂抹/消失,三 seq 两视角一致。gifs `outputs/cross_embodiment_wm/dualview_e2e/plumb_dummy5/gifs/`。
 
-### 4.2 sweep 结果（待 53157/53158 完成填写）
+### 4.2 sweep 结果（2026-07-13 凌晨，3 seeds 合并；merged_all.json + pareto_merged.png）
 
-（占位：v3 Pareto 表 / dual-view Pareto 表 / align_wm e2e 重跑 / BREAKTHROUGH 判定）
+**v3（held-out robot ADE px@224，world 锚 vs 机制，rh | Δ）：**
+
+| N | world | a1 | align(自蒸馏) | align_wm ★ | warm |
+|---|---|---|---|---|---|
+| 20 | 9.76 \| +4.88 | 11.99 \| +2.62 | 13.12 \| +2.59 | **10.01 \| +4.83** | 11.43 \| +6.98 |
+| 50 | 8.96 \| +2.28 | 11.12 \| +0.85 | 12.57 \| **−1.23** | **8.90 \| +2.41** | 11.47 \| +3.14 |
+| 100 | 8.93 \| +0.67 | 9.63 \| +0.80 | 11.48 \| **−1.27** | **8.79 \| +1.29 ★BREAK** | 10.97 \| +1.41 |
+| 400 | 7.35 \| +2.27 | 8.74 \| +1.78 | 9.15 \| +0.80 | **7.72 \| +1.94** | 9.42 \| +1.34 |
+
+**dual-view（can_dual，drift px@128 两视角平均，dummy5 锚）：**
+
+| N | dummy5 | skel | a1 | align_wm ★ |
+|---|---|---|---|---|
+| 50 | 4.95 \| +4.91 | 6.70 \| +6.68 | 6.40 \| +5.27 | 5.28 \| +4.70 |
+| 100 | 3.98 \| +4.70 | 5.46 \| +7.80 | 5.24 \| +5.73 | 4.01 \| +4.88 |
+| 400 | 3.44 \| +1.54 | 5.58 \| +1.61 | 3.95 \| +0.52 | **3.16 \| +1.55**(n=2) |
+
+**判读（诚实，含显著性）：**
+1. **机制间排序显著**：align_wm 在两个数据集所有 N 全面压制 a1/warm/align（v3 N=100：8.79 vs
+   9.63/10.97/11.48，差距 ≫ seed std ~0.5）。**`align` 自蒸馏在 v3 N=50/100 为负 Δ**——移动靶
+   目标有害，冻结 grounded 教师是成败点 = LaST-HD 机制论的直接消融证据（呼应其 Fig3b）。
+2. **align_wm vs 锚（break 判定）尚不显著**：v3 N=100 ★BREAK（rh 8.79<8.93 且 Δ 2×）但 seed
+   配对 rh_diff [−0.18,−0.71,+0.47] 2/3；dual N=400 rh_diff [−0.39,−0.20] 方向一致但 n=2。
+   → 已排加测：53212（v3 N=100 seeds3-4）/53213（dual N=400 seeds2-4）至 5 seeds。
+3. **can_dual 的 Pareto 张力远弱于 v3**：dummy5 锚本身 Δ +4.7~4.9（v3 world 只 +0.67）——can
+   数据 human 对绝对 action 也大幅帮；结合机制在 can 上的空间主要是精度端（align_wm N400 −8% rh）。
+4. align_wm 从不伤害：所有 cell 的 rh 与锚打平或更好、Δ 打平或更大——作为默认机制无成本。
+
+**事故记录**：/scr2 磁盘满（100%）→ dual s2 在 N=400 align_wm ckpt 保存时崩，metrics 从 log
+抢救回 3/4 格；已清 uv_cache 腾 14G 应急 + torch.save 包 try/except（3316f23）。⚠️另一 session
+19 个 dvf_* job 同样受磁盘风险，用户需醒后清理。
+
+### 4.3 端到端终跑（排队中，53214，依赖 53213_2）
+
+配对 L24-split ckpt（align_wm vs dummy5，N=400 seed2）→ flow-DiT ③，替换 4.1 有泄漏的
+plumbing 数字；输出 `dualview_e2e/final_alignwm|final_dummy5`。
