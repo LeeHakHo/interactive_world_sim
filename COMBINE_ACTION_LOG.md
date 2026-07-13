@@ -99,7 +99,29 @@
 抢救回 3/4 格；已清 uv_cache 腾 14G 应急 + torch.save 包 try/except（3316f23）。⚠️另一 session
 19 个 dvf_* job 同样受磁盘风险，用户需醒后清理。
 
-### 4.3 端到端终跑（排队中，53214，依赖 53213_2）
+### 4.3 5-seed 显著性终判（2026-07-13）
 
-配对 L24-split ckpt（align_wm vs dummy5，N=400 seed2）→ flow-DiT ③，替换 4.1 有泄漏的
-plumbing 数字；输出 `dualview_e2e/final_alignwm|final_dummy5`。
+- **v3 N=100（5 seeds，配对 t）**：align_wm rh 8.93±0.37 vs world 9.07±0.34（diff −0.145，
+  **p=0.61**）；Δ +1.39 vs +0.79（**p=0.26**）。3-seed 的 ★BREAK 是噪声级——**break 不成立**。
+- **dual N=400（5 seeds）**：align_wm rh 3.30±0.38 vs dummy5 3.44±0.52（diff −0.136，5 seed
+  中 4 个为负但 **p=0.42**）；Δ 打平。方向一致的改善迹象，不显著。
+- **终结论**：①"突破 Pareto"未证成（锚点处前沿是硬的，加固"action gap 靠机制消不掉"）；
+  ②机制排序显著且是 paper 素材：**latent 端对齐（LaST-HD 冻结 grounded 教师）是唯一不付
+  精度代价的 human-help 机制**，输入端改造（skel/a1/warm）全部拿精度换 Δ，自蒸馏（align）
+  有害。align_wm 可作无成本默认。
+
+### 4.4 端到端终跑（无泄漏配对 ckpt，N=400 seed2，job 53214）✅
+
+| obj-LPIPS | GT-flow→③(天花板) | ②align_wm→③ | ②dummy5→③ | eef-cond(naive) |
+|---|---|---|---|---|
+| cam_high | 0.299 | 0.309 | 0.305 | 0.382 |
+| cam_low | 0.301 | 0.314 | 0.310 | 0.372 |
+
+② ADE px@128：align_wm 2.66/4.68，dummy5 2.56/4.25（cam_low 明显高于泄漏版 plumbing 的
+2.26——泄漏效应可见，但 ③ 对 ② 噪声鲁棒，e2e 仍贴天花板）。**e2e 主张（干净 ckpt 确认）：
+flow 接口穿过 ② 预测误差仍大幅赢 naive action（LPIPS −0.06~−0.07），两 ② 机制在 N=400
+数据充足区打平（与 4.3 一致）**。
+**gif（眼检坐实）**：5 列对比 `final_compare/gifs/`（GT|GT-flow③|②align_wm|②dummy5|eef，
+两视角×6 seq）+ 各 run 四列 gif；末帧 montage `final_compare/eyeball_lastframes.png`——
+两 ② 列罐子成形与天花板同质，eef 列物体消失/涂抹，三 seq 两视角一致。
+（已知小瑕疵：gif caption 中文字形缺失显示为方块，列标题为 ASCII 不受影响。）
