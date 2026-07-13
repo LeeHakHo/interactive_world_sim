@@ -125,3 +125,22 @@ flow 接口穿过 ② 预测误差仍大幅赢 naive action（LPIPS −0.06~−0
 两视角×6 seq）+ 各 run 四列 gif；末帧 montage `final_compare/eyeball_lastframes.png`——
 两 ② 列罐子成形与天花板同质，eef 列物体消失/涂抹，三 seq 两视角一致。
 （已知小瑕疵：gif caption 中文字形缺失显示为方块，列标题为 ASCII 不受影响。）
+
+## 5. human-vs-robot 数据汇率（2026-07-13，job 53243，用户问"human 数据是否近等效 robot 数据"）
+
+**设计**：补 robot-only scaling 曲线 ro(N) 至全量（v3 world N≤2550 / dual dummy5 N≤2460，
+各 3-5 seeds），把 rh(N)（=N robot+~1800 human）放到曲线上找等效点 ro(N+M)=rh(N)，
+汇率 α=M/1800。图 `data_equiv/exchange_{v3,dual}.png`，数据 `curves.json`。
+
+**判决（两数据集一致）**：
+1. **不是等效（α≪1），但有实打实的汇率**：α 峰值在中等数据区（v3 N=400：α 0.35~0.47，
+   即 1800 human ≈ 640~840 robot；dual N=100-800：α 0.3±）；稀缺区 α≈0.15-0.3。
+   经验法则：**~3-5 条 human ≈ 1 条 robot**（在 human 能帮的区间）。
+2. **α 随 robot 量非单调衰减到 0**：N≥1600 时 α≈0.1 以下；**全量 robot 时 human 边际转负**
+   （v3 5.93 vs 5.66 / dual 2.10 vs 1.98，方向一致但幅度 1-2σ）——human 数据是 robot 稀缺时
+   的替代品，不是无条件的增量；robot 管够时混 human 反而轻微引入域噪声。
+3. **实用换算**（配合 LaST-HD 报告的 human 采集快 4-5×）：α≈0.3 × 采集速度 4-5× ≈
+   **单位采集时间下 human 数据的价值与 robot 大致打平到 1.5×**——这是"用 human 数据"的
+   经济学论证，比"等效"更诚实也更有用。
+4. 曲线形状：rh 曲线在整个稀缺-中段稳定压住 ro 曲线（v3 上 rh(100)=9.07 甚至好于
+   ro(400)=9.63），N≈1600 交叉，全量轻微反超——一张图讲完 human 数据的价值边界。
