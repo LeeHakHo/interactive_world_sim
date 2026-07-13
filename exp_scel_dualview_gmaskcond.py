@@ -187,8 +187,101 @@ def compare_runs(dir0, dir1):
     print(f"saved -> {OUTC}/gifs/\n=== DONE ===", flush=True)
 
 
+@torch.no_grad()
+def render_g_pred(m, R, joint, si, predtr):
+    """② 预测 tracks 驱动的渲染(gmask 版 cond;joint/eef 为 replay action,合法)。"""
+    fr01 = lambda a: torch.from_numpy(a.astype(np.float32).transpose(2, 0, 1)[None] / 255.0).to(device)
+    z0 = torch.stack([enc(fr01(R["fr"][v][si, 0]))[0] for v in range(2)])[None]
+    prev = z0.clone(); outs = [[], []]
+    P = R["tr"][0].shape[2]
+    for h in range(H):
+        conds = []
+        for v in range(2):
+            tr, ef, vs = R["tr"][v], R["ef"][v], R["vs"][v]
+            trt = predtr[h, v * P:(v + 1) * P]
+            c = flow_cond(tr[si, 0], trt, ef[si, 0], ef[si, DIT.K + h], vs[si, DIT.K + h])
+            if GMASK:
+                if v == 0:
+                    import exp_v3_human_helps_pixels as HP
+                    if not HP._G: load_gmask()
+                    g = gmask_imgs(joint[si, DIT.K + h][None], ef[si, DIT.K + h][None])[0].astype(np.float32)
+                else:
+                    g = np.zeros((IMG, IMG), np.float32)
+                c = np.concatenate([c, g[None]], 0)
+            conds.append(c)
+        cond = torch.from_numpy(np.stack(conds)[None].astype(np.float32)).to(device)
+        pred = m(z0, prev, cond); prev = pred
+        for v in range(2): outs[v].append(dec(pred[:, v])[0].cpu().numpy())
+    return np.stack([np.stack(outs[v]).transpose(0, 2, 3, 1) for v in range(2)])
+
+
+def e2e_g():
+    """端到端(锐③版):E2E_CKPT=③ckpt WM2A/WM2B=两个②ckpt -> 4列 gif GT|GT-flow→③|②A→③|②B→③。
+    数据 L24(②正当 heldout);metric 全套。"""
+    import exp_scel_dualview_wm as W
+    import exp_scel_dualview_comb as DC
+    for cls in [W.DualLWC, DC.DualCombLWC]: setattr(_m, cls.__name__, cls)
+    m3 = torch.load(os.environ["E2E_CKPT"], map_location=device, weights_only=False).eval()
+    z = np.load(f"{DS}/clips_robot_L24.npz")
+    f32 = lambda k, nan=0.0: np.nan_to_num(z[k].astype(np.float32), nan=nan)
+    R = {"fr": [z["frames"], z["frames_low"]], "tr": [f32("tracks"), f32("tracks_low", 0.5)],
+         "ef": [f32("eef"), f32("eef_low", 0.5)], "vs": [z["vis"].astype(np.float32), z["vis_low"].astype(np.float32)]}
+    joint = z["joint"].astype(np.float32)
+    perm = np.random.default_rng(0).permutation(len(z["low_valid"]))
+    ho = np.array([i for i in perm[:HELDOUT] if z["low_valid"][i]])
+    mot = np.array([np.linalg.norm(np.diff(R["tr"][0][si, DIT.K:DIT.K + H].mean(1), axis=0), axis=-1).sum() for si in ho])
+    chosen = ho[np.argsort(-mot)[:NSEQ]]
+    trD = np.concatenate([R["tr"][0][chosen], R["tr"][1][chosen]], 2)
+    arms = {}
+    for tag, env in [("A", "WM2A"), ("B", "WM2B")]:
+        wm2 = torch.load(os.environ[env], map_location=device, weights_only=False).eval()
+        pr = W.rollout_dual(wm2, torch.from_numpy(trD).float().to(device),
+                            torch.from_numpy(R["ef"][0][chosen]).float().to(device),
+                            torch.from_numpy(R["ef"][1][chosen]).float().to(device), H).cpu().numpy()
+        arms[tag] = (os.path.basename(os.environ[env]).replace(".pt", ""), pr)
+        print(f"② {tag}={arms[tag][0]}", flush=True)
+    from interactive_world_sim.algorithms.common.metrics.lpips import LearnedPerceptualImagePatchSimilarity
+    lp = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False).to(device).eval()
+    os.makedirs(f"{OUT}/gifs", exist_ok=True)
+    vname = {0: "high", 1: "low"}
+    agg = {}
+    for n, si in enumerate(chosen):
+        si = int(si)
+        r_gtf = render_g(m3, R, joint, si)
+        rA = render_g_pred(m3, R, joint, si, arms["A"][1][n])
+        rB = render_g_pred(m3, R, joint, si, arms["B"][1][n])
+        for v in range(2):
+            gtf = R["fr"][v][si, DIT.K:DIT.K + H].astype(np.float32) / 255.0
+            objm = np.stack([_fp(R["tr"][v][si, DIT.K + h]) for h in range(H)])
+            for cname, rr in [("gtf", r_gtf), ("A", rA), ("B", rB)]:
+                agg.setdefault(f"v{v}_{cname}_olp", []).append(obj_lpips(lp, rr[v].astype(np.float32), gtf, objm))
+                agg.setdefault(f"v{v}_{cname}_flp", []).append(full_lpips(lp, rr[v].astype(np.float32), gtf))
+                agg.setdefault(f"v{v}_{cname}_ps", []).append(np.mean([psnr(rr[v, h], gtf[h]) for h in range(H)]))
+            gt = R["fr"][v][si, DIT.K:DIT.K + H].astype(np.uint8)
+            cols = np.stack([gt, u8(r_gtf[v]), u8(rA[v]), u8(rB[v])])
+            gt_obj = R["tr"][v][si, DIT.K:DIT.K + H]
+            P = R["tr"][0].shape[2]
+            fc = build_flow_cols(gt, gt_obj, [None, gt_obj, arms["A"][1][n][:, v*P:(v+1)*P], arms["B"][1][n][:, v*P:(v+1)*P]],
+                                 R["ef"][v][si, DIT.K:DIT.K + H])
+            save_combined_gif(f"{OUT}/gifs/seq{si}_cam{vname[v]}.gif", cols, fc,
+                              ["GT", "GT-flow (ceiling)", f"(2){arms['A'][0][:14]}", f"(2){arms['B'][0][:14]}"],
+                              [None] * 4, DIT.K, caption=f"e2e sharp-III (gmask, {os.path.basename(os.environ['E2E_CKPT'])}) | cam_{vname[v]}")
+        print(f"  seq{si} done", flush=True)
+    mn = lambda k: float(np.nanmean(agg[k]))
+    lines = [f"E2E sharp-III | III={os.environ['E2E_CKPT']} | (2)A={arms['A'][0]} B={arms['B'][0]} | n={len(chosen)}"]
+    for v in range(2):
+        lines.append(f"cam_{vname[v]}: " + " | ".join(
+            f"{c} PSNR {mn(f'v{v}_{c}_ps'):.2f} objLPIPS {mn(f'v{v}_{c}_olp'):.3f} fullLPIPS {mn(f'v{v}_{c}_flp'):.3f}"
+            for c in ["gtf", "A", "B"]))
+    import json; json.dump({k: float(np.nanmean(vv)) for k, vv in agg.items()}, open(f"{OUT}/metrics.json", "w"), indent=2)
+    open(f"{OUT}/summary.txt", "w").write("\n".join(lines) + "\n")
+    print("\n".join(lines) + "\n=== DONE ===", flush=True)
+
+
 if __name__ == "__main__":
     if os.environ.get("COMPARE"):
         compare_runs(*os.environ["COMPARE"].split(","))
+    elif os.environ.get("E2E_CKPT"):
+        e2e_g()
     else:
         main()
