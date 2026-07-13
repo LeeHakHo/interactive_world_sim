@@ -126,6 +126,23 @@ flow 接口穿过 ② 预测误差仍大幅赢 naive action（LPIPS −0.06~−0
 两 ② 列罐子成形与天花板同质，eef 列物体消失/涂抹，三 seq 两视角一致。
 （已知小瑕疵：gif caption 中文字形缺失显示为方块，列标题为 ASCII 不受影响。）
 
+## 4.5 ③ 治糊：gmask agent 条件化消融（2026-07-13，job 53256/53257，用户投诉"gif 都很糊"）
+
+**诊断**：糊的主因=dual-view DiT 没有 agent 条件（手臂靠猜→均值化黑影）；老 can 单视角 detmem
+（LPIPS 0.147）好就好在有 gmask 剪影条件。**消融**（同 DualViewDiT 14.5M，60ep，replay GT flow，
+唯一变量=cond 加不加 maskgen_caneef 剪影通道；cam_low/human 置零作 within-run 对照）：
+
+| | GMASK=0 (现状) | GMASK=1 (agent-cond) |
+|---|---|---|
+| cam_high PSNR / objLPIPS / fullLPIPS | 22.13 / 0.281 / 0.170 | **24.96 / 0.198 / 0.134** |
+| cam_low 同上 | 21.35 / 0.299 / 0.187 | **22.35 / 0.254 / 0.165** |
+
+**判决**：agent 条件化大胜（cam_high +2.8dB / objLPIPS −0.083），已逼近 detmem 水平；眼检坐实
+（手臂黑影→紧凑成形，`compare/eyeball_lastframes.png`）。**bonus：cam_low 剪影置零也改善**
+（0.299→0.254）——跨视角联合注意力把 v0 的 agent 信息传给了 v1，联合注意力的又一价值证据。
+gif 已传 drive `iws_evals/2026-07-13_gmask_agent_cond/`。→ 后续：100ep 质量版（53277）+ 锐③
+端到端 4 列（53278，②align_wm/dummy5 配对 ckpt）。**建议 formalize 线把 gmask 通道并入正式 ③。**
+
 ## 5. human-vs-robot 数据汇率（2026-07-13，job 53243，用户问"human 数据是否近等效 robot 数据"）
 
 **设计**：补 robot-only scaling 曲线 ro(N) 至全量（v3 world N≤2550 / dual dummy5 N≤2460，
