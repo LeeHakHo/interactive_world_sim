@@ -117,11 +117,16 @@ def main():
     cols_name = ["GT", "GT-flow→③", "②pred-flow→③", "eef-cond(naive)"]
     agg = {f"v{v}_{c}_{k}": [] for v in range(2) for c in ["gtf", "e2e", "eef"] for k in ["ps", "lp"]}
     vname = {0: "high", 1: "low"}
+    os.makedirs(f"{OUT}/render_cache", exist_ok=True)
+    np.save(f"{OUT}/render_cache/chosen.npy", chosen)
+    np.save(f"{OUT}/render_cache/predtr.npy", pr)
     for n, si in enumerate(chosen):
         si = int(si)
         r_gtf = render3(mf, R, si)                              # ③ 天花板
         r_e2e = render3(mf, R, si, predtr=pr[n])                # 端到端
         r_eef = render_eef(me, R, si)                           # naive
+        for cname, rr in [("gtf", r_gtf), ("e2e", r_e2e), ("eef", r_eef)]:
+            np.save(f"{OUT}/render_cache/seq{si}_{cname}.npy", u8(rr))   # 跨 run 合成用
         for v in range(2):
             gtf = R["fr"][v][si, K:K + H].astype(np.float32) / 255.0
             objm = np.stack([_fp(R["tr"][v][si, K + h]) for h in range(H)])
@@ -150,5 +155,35 @@ def main():
     print("\n".join(lines) + f"\ngifs -> {OUT}/gifs/\n=== DONE ===", flush=True)
 
 
+def compare_runs(dirA, dirB, labelA="②align_wm→③", labelB="②dummy5→③"):
+    """两次 e2e run 的渲染缓存 -> 5 列对比 gif:GT | GT-flow→③ | A-pred | B-pred | eef。
+    用法:COMPARE=<dirA>,<dirB> python exp_scel_dualview_e2e.py"""
+    R = load_l24()
+    chosen = np.load(f"{dirA}/render_cache/chosen.npy")
+    chB = np.load(f"{dirB}/render_cache/chosen.npy")
+    assert (chosen == chB).all(), "两 run 的 seq 选择必须一致"
+    prA = np.load(f"{dirA}/render_cache/predtr.npy"); prB = np.load(f"{dirB}/render_cache/predtr.npy")
+    OUTC = os.environ.get("OUT", "outputs/cross_embodiment_wm/dualview_e2e/final_compare")
+    os.makedirs(f"{OUTC}/gifs", exist_ok=True)
+    vname = {0: "high", 1: "low"}
+    for n, si in enumerate(chosen):
+        si = int(si)
+        ld = lambda d, c: np.load(f"{d}/render_cache/seq{si}_{c}.npy")
+        gtf, eA, eB, eef = ld(dirA, "gtf"), ld(dirA, "e2e"), ld(dirB, "e2e"), ld(dirA, "eef")
+        for v in range(2):
+            gt = R["fr"][v][si, K:K + H].astype(np.uint8)
+            cols = np.stack([gt, gtf[v], eA[v], eB[v], eef[v]])
+            gt_obj = R["tr"][v][si, K:K + H]
+            pA = prA[n][:, v * 48:(v + 1) * 48]; pB = prB[n][:, v * 48:(v + 1) * 48]
+            fc = build_flow_cols(gt, gt_obj, [None, gt_obj, pA, pB, None], R["ef"][v][si, K:K + H])
+            save_combined_gif(f"{OUTC}/gifs/seq{si}_cam{vname[v]}.gif", cols, fc,
+                              ["GT", "GT-flow→③", labelA, labelB, "eef-cond(naive)"], [None] * 5, K,
+                              caption=f"e2e 机制对比: {labelA} vs {labelB} | cam_{vname[v]}")
+    print(f"saved 5-col compare gifs -> {OUTC}/gifs/\n=== DONE ===", flush=True)
+
+
 if __name__ == "__main__":
-    main()
+    if os.environ.get("COMPARE"):
+        compare_runs(*os.environ["COMPARE"].split(","))
+    else:
+        main()
