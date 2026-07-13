@@ -140,8 +140,16 @@ flow 接口穿过 ② 预测误差仍大幅赢 naive action（LPIPS −0.06~−0
 **判决**：agent 条件化大胜（cam_high +2.8dB / objLPIPS −0.083），已逼近 detmem 水平；眼检坐实
 （手臂黑影→紧凑成形，`compare/eyeball_lastframes.png`）。**bonus：cam_low 剪影置零也改善**
 （0.299→0.254）——跨视角联合注意力把 v0 的 agent 信息传给了 v1，联合注意力的又一价值证据。
-gif 已传 drive `iws_evals/2026-07-13_gmask_agent_cond/`。→ 后续：100ep 质量版（53277）+ 锐③
-端到端 4 列（53278，②align_wm/dummy5 配对 ckpt）。**建议 formalize 线把 gmask 通道并入正式 ③。**
+gif 已传 drive `iws_evals/2026-07-13_gmask_agent_cond/`。**建议 formalize 线把 gmask 通道并入正式 ③。**
+
+**100ep 质量版（53277）**：cam_high PSNR **25.52** / objLPIPS **0.172** / fullLPIPS **0.124**——
+full-frame 口径**超过老单视角 detmem（0.147/25.6）**，且是双视角联合渲染；cam_low 0.247/0.167。
+
+**锐③端到端（53278，`e2e_sharp/`，4 列 GT|GT-flow|②align_wm|②dummy5，配对无泄漏 ②）**：
+| cam_high fullLPIPS | ceiling 0.131 | ②align_wm 0.138 | ②dummy5 0.137 |
+pred 列贴住天花板（gap ≤0.007），两 ② 打平（与 sweep N=400 统计一致）；眼检：夹爪指头级细节、
+横臂实心、罐子干净，pred 与 ceiling 肉眼难分（`e2e_sharp/eyeball_lastframes.png`）。
+**"gif 都糊"的投诉在端到端层面解决：糊=agent 无条件化，非 flow 接口或 DiT 架构的问题。**
 
 ## 5. human-vs-robot 数据汇率（2026-07-13，job 53243，用户问"human 数据是否近等效 robot 数据"）
 
