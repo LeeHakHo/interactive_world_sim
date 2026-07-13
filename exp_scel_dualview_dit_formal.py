@@ -273,6 +273,8 @@ def run_e2e():
     ② = dualview_wm/wm_dual.pt (rollout_dual), 动作输入 = GT eef (replay actions, 允许)."""
     from viz_combined import save_combined_gif, build_flow_cols
     import exp_scel_dualview_wm as DW
+    import __main__ as _m                                   # wm_dual.pt 由 exp_scel_dualview_wm 作为 __main__ 保存
+    _m.DualLWC = DW.DualLWC                                 # unpickle 需在 __main__ 找到类 (该脚本唯一自定义类, 其余均模块级 import 可解析)
     R, _ = load_dual()
     # ② 须吃 raw view1 tracks(带 NaN)填 0.5, 匹配 wm_dual 训练口径 (exp_scel_dualview_wm.main);
     # load_dual 的 R["tr"][1] 已被 nan_to_num 填 0.0, 直接喂 ② = train/inference 分布错配.
