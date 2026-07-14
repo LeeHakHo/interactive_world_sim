@@ -33,7 +33,7 @@ GMASK_LOW = os.environ.get("GMASK_LOW", "0") == "1"            # v1 也用真剪
 WARP = os.environ.get("WARP", "0") == "1"                      # 刚体 warp-as-condition RGB 预览 3ch
 DIM_G = int(os.environ.get("DIM_G", "384")); DEPTH_G = int(os.environ.get("DEPTH_G", "8"))
 EPOCHS = 3 if SMOKE else int(os.environ["EPOCHS"]); BS = 8; LR = 2e-4
-H = 20; HELDOUT = 150; NSEQ = int(os.environ.get("NSEQ", "6")); PREV_DF = 0.3
+H = int(os.environ.get("HORIZON", "20")); HELDOUT = 150; NSEQ = int(os.environ.get("NSEQ", "6")); PREV_DF = 0.3
 LAM = float(os.environ.get("LAM_LPIPS", "1.0"))
 OUT = os.environ.get("OUT", f"outputs/cross_embodiment_wm/dualview_gmask/{'g1' if GMASK else 'g0'}")
 os.makedirs(f"{OUT}/gifs", exist_ok=True)
@@ -180,6 +180,17 @@ def render_g(m, R, joint, si):
     return np.stack([np.stack(outs[v]).transpose(0, 2, 3, 1) for v in range(2)])
 
 
+def fp_vis(trt, vis):
+    """修正版 footprint:只用可见点(vis>0.5)构凸包,防 nan→中心点拽偏(metric 审计发现)。"""
+    import cv2
+    fp = np.zeros((IMG, IMG), np.float32)
+    ok = vis > 0.5
+    if ok.sum() < 5: return fp                                 # 检测失败帧记无效
+    vp = np.clip((trt[ok] * IMG).astype(np.int32), 0, IMG - 1)
+    cv2.fillConvexPoly(fp, cv2.convexHull(vp.reshape(-1, 1, 2)), 1.0)
+    return fp
+
+
 def full_lpips(lp, pred, gt):
     a = torch.from_numpy(pred).permute(0, 3, 1, 2).float().to(device) * 2 - 1
     b = torch.from_numpy(gt).permute(0, 3, 1, 2).float().to(device) * 2 - 1
@@ -193,8 +204,13 @@ def main():
     okr = np.where(R["ok"])[0]; okh = np.where(Hh["ok"])[0]
     perm = np.random.default_rng(0).permutation(okr); ho, pool = perm[:HELDOUT], perm[HELDOUT:]
     if SMOKE: pool = pool[:60]; okh = okh[:60]
-    latR = latcache(R, "robot"); latH = latcache(Hh, "human")
-    m = train_g(R, Hh, joint, pool, okh, latR, latH); torch.save(m, f"{OUT}/dvdit_g.pt")
+    ck = os.environ.get("RENDER_CKPT")
+    if ck:
+        m = torch.load(ck, map_location=device, weights_only=False).eval()
+        print(f"RENDER-ONLY from {ck} (HORIZON={H})", flush=True)
+    else:
+        latR = latcache(R, "robot"); latH = latcache(Hh, "human")
+        m = train_g(R, Hh, joint, pool, okh, latR, latH); torch.save(m, f"{OUT}/dvdit_g.pt")
     from interactive_world_sim.algorithms.common.metrics.lpips import LearnedPerceptualImagePatchSimilarity
     lp = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False).to(device).eval()
     mot = np.array([np.linalg.norm(np.diff(R["tr"][0][si, DIT.K:DIT.K + H].mean(1), axis=0), axis=-1).sum() for si in ho])
@@ -207,7 +223,7 @@ def main():
         np.save(f"{OUT}/render_cache/seq{si}.npy", u8(rr))
         for v in range(2):
             gtf = R["fr"][v][si, DIT.K:DIT.K + H].astype(np.float32) / 255.0
-            objm = np.stack([_fp(R["tr"][v][si, DIT.K + h]) for h in range(H)])
+            objm = np.stack([fp_vis(R["tr"][v][si, DIT.K + h], R["vs"][v][si, DIT.K + h]) for h in range(H)])
             agg[f"v{v}_ps"].append(np.mean([psnr(rr[v, h], gtf[h]) for h in range(H)]))
             agg[f"v{v}_olp"].append(obj_lpips(lp, rr[v].astype(np.float32), gtf, objm))
             agg[f"v{v}_flp"].append(full_lpips(lp, rr[v].astype(np.float32), gtf))
@@ -275,7 +291,7 @@ def e2e_g():
     import exp_scel_dualview_comb as DC
     for cls in [W.DualLWC, DC.DualCombLWC]: setattr(_m, cls.__name__, cls)
     m3 = torch.load(os.environ["E2E_CKPT"], map_location=device, weights_only=False).eval()
-    z = np.load(f"{DS}/clips_robot_L24.npz")
+    z = np.load(os.environ.get("E2E_DS", f"{DS}/clips_robot_L24.npz"))
     f32 = lambda k, nan=0.0: np.nan_to_num(z[k].astype(np.float32), nan=nan)
     R = {"fr": [z["frames"], z["frames_low"]], "tr": [f32("tracks"), f32("tracks_low", 0.5)],
          "ef": [f32("eef"), f32("eef_low", 0.5)], "vs": [z["vis"].astype(np.float32), z["vis_low"].astype(np.float32)]}
@@ -305,7 +321,7 @@ def e2e_g():
         rB = render_g_pred(m3, R, joint, si, arms["B"][1][n])
         for v in range(2):
             gtf = R["fr"][v][si, DIT.K:DIT.K + H].astype(np.float32) / 255.0
-            objm = np.stack([_fp(R["tr"][v][si, DIT.K + h]) for h in range(H)])
+            objm = np.stack([fp_vis(R["tr"][v][si, DIT.K + h], R["vs"][v][si, DIT.K + h]) for h in range(H)])
             for cname, rr in [("gtf", r_gtf), ("A", rA), ("B", rB)]:
                 agg.setdefault(f"v{v}_{cname}_olp", []).append(obj_lpips(lp, rr[v].astype(np.float32), gtf, objm))
                 agg.setdefault(f"v{v}_{cname}_flp", []).append(full_lpips(lp, rr[v].astype(np.float32), gtf))
