@@ -181,7 +181,7 @@ def _save(res, header):
         lines.append("")
     lines.append("BREAKTHROUGH check (rh <= dummy5.rh AND Δ > dummy5.Δ,两视角平均):")
     for N in N_ROB_LIST:
-        w = _agg(res, "dummy5", N)
+        w = _agg(res, "dummy5", N) if "dummy5" in res else None
         if w is None: continue
         for meth in [m for m in METHODS if m != "dummy5"]:
             a = _agg(res, meth, N)

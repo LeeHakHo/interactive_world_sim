@@ -178,7 +178,7 @@ def _save(res, header):
         lines.append("")
     lines.append("BREAKTHROUGH check (判据1: rh <= world.rh AND Δ >> world.Δ):")
     for N in N_ROB_LIST:
-        w = _agg(res, "world", N)
+        w = _agg(res, "world", N) if "world" in res else None
         if w is None: continue
         for meth in COMBINES:
             a = _agg(res, meth, N)
