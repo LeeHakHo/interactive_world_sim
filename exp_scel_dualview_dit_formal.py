@@ -478,6 +478,20 @@ def _eval_seqs_persisted(R, ho, n=24):
     return eval_seqs(R, ho, n=n)
 
 
+def run_reeval():
+    """MODE=eval: 载入已有 {OUT}/dvdit.pt 重跑 run_eval(含新增 agent 指标), 写 metrics_reeval.json,
+    不覆盖发布版 metrics.json (老 ckpt 补测新指标用)."""
+    R, _ = load_dual()
+    okr = np.where(R["ok"])[0]; perm = np.random.default_rng(0).permutation(okr); ho = perm[:150]
+    chosen = _eval_seqs_persisted(R, ho)
+    m = torch.load(f"{OUT}/dvdit.pt", map_location=device, weights_only=False).eval()
+    res = run_eval(m, R, chosen, CONDM, out=None)
+    res.update({"cond": CONDM, "crossview": int(CROSSVIEW), "mix": MIX, "seed": SEED,
+                "n_eval": len(chosen), "reeval": 1})
+    json.dump(res, open(f"{OUT}/metrics_reeval.json", "w"), indent=2)
+    print(json.dumps(res, indent=1), flush=True)
+
+
 def run_gif():
     """replay 对比 gif: GT | flow | eefsp | eeffilm | IWS-stage2(external) (seed0 cv1), 两视角, save_combined_gif protocol.
     第5列读 Task 6 存的 dualview_iws_stage2/s0/gifs/seq{si}_render.npy (u8, (2,H,128,128,3)); 缺失则该 seq 只出 4 列并 log.
@@ -582,4 +596,5 @@ def run_e2e():
 if __name__ == "__main__":
     if MODE == "train": main()
     elif MODE == "e2e": run_e2e()                                   # Task 5
+    elif MODE == "eval": run_reeval()
     elif MODE == "gif": run_gif()                                   # Task 4 Step 5
