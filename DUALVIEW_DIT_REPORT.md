@@ -99,6 +99,18 @@ project_human_helps_end2end),③ 只负责把 ② 的增益无损渲染出来(�
   为 cleansplit 版,以 e2e 日志(dvf_e2e_clean_53263)为准。
 - ② 输入 view1 遮挡点按训练约定填 0.5(修过一处 train/inference 填充不一致,commit 523b7ae)。
 
+**补充:44 帧长时长压力测试(用户 2026-07-14 要求更长 gif 后加测;干净 ②,目录 e2e_H44/)**
+| 列 | v0 obj-LPIPS | v1 obj-LPIPS |
+|---|---|---|
+| GT-flow → ③ | 0.265 | 0.284 |
+| ② pred-flow → ③ | 0.277 | 0.305 |
+| eef-FiLM → ③ | 0.282 | 0.333 |
+
+② ADE 涨到 3.85/4.93px(20 帧时 2.71/3.67)。诚实解读:**44 帧下端到端在俯视机位对 naive 的优势收窄到
+0.005(接近噪声),低角度机位仍清晰(0.305 vs 0.333);长时长的瓶颈是 ② 的漂移累积**。渲染绝对质量
+(糊)是整条确定性 latent 回归路线的共性限制,三臂同待遇;候选改进=flow-warp 像素搬运
+([[project_flow_warp_renderer]] 判过"战场在有纹理物体",can 罐正是),待立项。
+
 ## 4. M2.5 External baseline:真 IWS stage2(CMLatentDynamics,DF)
 
 - **是什么**:IWS stage2 原生 dynamics 模块(Conv3d 时空 backbone + `action_emd`→per-block FiLM 注入,模块零修改)
