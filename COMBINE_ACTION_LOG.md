@@ -142,6 +142,15 @@ flow 接口穿过 ② 预测误差仍大幅赢 naive action（LPIPS −0.06~−0
 （0.299→0.254）——跨视角联合注意力把 v0 的 agent 信息传给了 v1，联合注意力的又一价值证据。
 gif 已传 drive `iws_evals/2026-07-13_gmask_agent_cond/`。**建议 formalize 线把 gmask 通道并入正式 ③。**
 
+**cam_low 补剪影 + 容量消融（53307，60ep 受控链，答用户"low 还糊/容量够不够"）**：
+| 60ep | high obj/full | low obj/full | low PSNR |
+| v0-only 剪影 | 0.198/0.134 | 0.254/0.165 | 22.35 |
+| + v1 真剪影(maskgen_caneef_low IoU0.836,现成没接过) | 0.192/0.132 | **0.233/0.154** | **23.56** |
+| + 容量 512×12(2.5×参数) | 0.186/0.129 | 0.236/0.155 | 23.42 |
+判决:**v1 剪影有效(low +1.2dB);容量不是瓶颈**(2.5×参数≈白给,这档数据喂不饱)。low 剩余差距
+(0.233 vs 0.192)嫌疑=tracks_low 条件噪+低机位本征难度→下一杠杆 warp-as-condition(刚体 Umeyama
+搬运首帧罐子像素作 RGB 预览通道,53310 arm0)+最优配置 100ep 定版(arm1)。
+
 **100ep 质量版（53277）**：cam_high PSNR **25.52** / objLPIPS **0.172** / fullLPIPS **0.124**——
 full-frame 口径**超过老单视角 detmem（0.147/25.6）**，且是双视角联合渲染；cam_low 0.247/0.167。
 
