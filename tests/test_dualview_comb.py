@@ -69,3 +69,12 @@ def test_train_dcomb_smoke():
                                torch.from_numpy(efB[:2]).float().to(device))
         assert torch.isfinite(logits).all(), comb
     assert all(torch.equal(a, b) for a, b in zip(snap, t.parameters()))  # 教师没被 align_wm 训练动
+
+
+def test_stems_per_domain_encoder():
+    hist, efA, efB = _dummy(B=2)
+    m = DC.DualCombLWC(P, combine="stems", Dm=384, layers=3, W=15, vel_half=0.06).to(device).eval()
+    with torch.no_grad():
+        lr, _ = m.fwd_dual(hist, efA, efB, torch.zeros(2, dtype=torch.bool, device=device))
+        lh, _ = m.fwd_dual(hist, efA, efB, torch.ones(2, dtype=torch.bool, device=device))
+    assert not torch.allclose(lr, lh)

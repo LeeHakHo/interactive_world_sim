@@ -109,3 +109,16 @@ def test_train_comb_align_wm_smoke():
     logits, _ = m(torch.from_numpy(tr[:4, :K]).permute(0, 2, 1, 3).float().to(device),
                   torch.from_numpy(ef[:4]).float().to(device))
     assert torch.isfinite(logits).all()
+
+
+def test_stems_per_domain_encoder():
+    # EgoWAM 式:human 与 robot 走不同动作编码器,同输入不同域输出必须不同
+    hist, eef3 = _dummy(B=2)
+    m = C.CombLWC(48, combine="stems").to(device).eval()
+    with torch.no_grad():
+        lr, _ = m(hist, eef3, torch.zeros(2, dtype=torch.bool, device=device))
+        lh, _ = m(hist, eef3, torch.ones(2, dtype=torch.bool, device=device))
+    assert not torch.allclose(lr, lh)
+    with torch.no_grad():
+        ld, _ = m(hist, eef3)                                 # 缺省=全 robot,与显式全 robot 一致
+    assert torch.allclose(lr, ld)

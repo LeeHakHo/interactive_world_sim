@@ -50,6 +50,7 @@ class DualCombLWC(W.DualLWC):
         super().__init__(P, **kw)
         s.combine, s.alpha, s.lam_res, s.lam_align = combine, alpha, lam_res, lam_align
         s.act_shared = nn.Linear(Lw * 10 * 2, s.Dm)
+        s.act_stem_h = nn.Linear(Lw * 20, s.Dm)                # stems:human 专属编码器(EgoWAM 式,dummy5 入)
         if combine == "a1":
             with torch.no_grad():                              # 小初始化残差,防独吞
                 s.act.weight.mul_(0.1); s.act.bias.zero_()
@@ -79,6 +80,8 @@ class DualCombLWC(W.DualLWC):
             residual = s.alpha * s.act(d5) * (~is_h).float()[:, None]      # human -> 0
             s.aux["res_sq"] = residual.pow(2).mean()
             act = act_s + residual
+        elif s.combine == "stems":                             # EgoWAM/HPT:每具身独立编码器,无显式对齐
+            act = torch.where(is_h[:, None], s.act_stem_h(d5), s.act(d5))
         elif s.combine == "align_wm":                          # LaST-HD:主路径纯世界,latent 拉向冻结教师
             act = s.act(d5)
         else:

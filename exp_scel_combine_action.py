@@ -43,6 +43,7 @@ class CombLWC(A.FlowWM_LWC):
         if combine in ("a1", "warm"):
             with torch.no_grad():                             # 小初始化残差,防独吞
                 s.act_world.weight.mul_(0.1); s.act_world.bias.zero_()
+        s.act_stem_h = nn.Linear(V.ACT_DIM["world"], s.Dm)    # stems:human 专属动作编码器(EgoWAM 式)
         s.teacher = teacher                                   # align_wm:冻结混训 skel-WM(latent 目标)
         if teacher is not None:
             teacher.eval()
@@ -72,6 +73,11 @@ class CombLWC(A.FlowWM_LWC):
             s.aux["res_sq"] = residual.pow(2).mean()
             act = (act_s + residual)[:, None, :]
             x = s.tf(torch.cat([obj, act], 1))[:, :P]
+            return x, anchor
+        if s.combine == "stems":                              # EgoWAM/HPT 式:每具身独立动作编码器,
+            w = feat_world(eef3, objc)                        # 无显式对齐,共享 trunk+flow 目标隐式对齐
+            act = torch.where(is_h[:, None], s.act_stem_h(w), s.act_world(w))
+            x = s.tf(torch.cat([obj, act[:, None]], 1))[:, :P]
             return x, anchor
         if s.combine == "align_wm":                           # LaST-HD faithful:主路径纯 world 保精度,
             x = s.tf(torch.cat([obj, act_w[:, None]], 1))[:, :P]   # latent 拉向冻结教师的前向动力学特征
