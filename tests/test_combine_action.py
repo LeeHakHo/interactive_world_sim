@@ -54,7 +54,7 @@ def test_train_comb_smoke():
     vs = np.ones((30, 24, 48), np.float32)
     ef = (rng.random((30, 24, 3, 2)).astype(np.float32))
     idx = torch.arange(30)  # 0..19 robot, 20..29 human
-    for comb in ["a1", "align", "warm"]:
+    for comb in ["a1", "align", "warm", "stems"]:
         m = C.train_comb(tr, vs, ef, idx, comb, Nr, seed=0)
         logits, anchor = m(torch.from_numpy(tr[:4, :K]).permute(0, 2, 1, 3).float().to(device),
                            torch.from_numpy(ef[:4]).float().to(device))

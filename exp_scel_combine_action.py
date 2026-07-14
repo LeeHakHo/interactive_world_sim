@@ -130,7 +130,7 @@ def _run_stage(m, tracks, vis, eef, idx, Nr, stage, epochs, seed):
                 nxt = buf[:, -1] + m.expected_vel(lg0)
                 use_gt = (torch.rand(len(b), 1, 1, device=device) < p)
                 buf = torch.cat([buf, torch.where(use_gt, G[:, K + h], nxt.detach())[:, None]], 1)
-            loss = torch.stack(losses).mean() + torch.stack(regs).mean()
+            loss = torch.stack(losses).mean() + (torch.stack(regs).mean() if regs else 0.0)
             opt.zero_grad(); loss.backward(); opt.step()
 
 
