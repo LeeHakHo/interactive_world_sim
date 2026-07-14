@@ -29,6 +29,8 @@ from viz_combined import save_combined_gif, build_flow_cols
 SMOKE = os.environ.get("SMOKE", "0") == "1"
 DS = "outputs/flow_render_dataset_can_dual"
 GMASK = os.environ.get("GMASK", "1") == "1"
+GMASK_LOW = os.environ.get("GMASK_LOW", "0") == "1"            # v1 也用真剪影(maskgen_caneef_low IoU0.836)
+DIM_G = int(os.environ.get("DIM_G", "384")); DEPTH_G = int(os.environ.get("DEPTH_G", "8"))
 EPOCHS = 3 if SMOKE else int(os.environ["EPOCHS"]); BS = 8; LR = 2e-4
 H = 20; HELDOUT = 150; NSEQ = int(os.environ.get("NSEQ", "6")); PREV_DF = 0.3
 LAM = float(os.environ.get("LAM_LPIPS", "1.0"))
@@ -38,16 +40,46 @@ _m = sys.modules["__main__"]
 
 
 class DualViewDiTG(DualViewDiT):
-    """DualViewDiT(flow) + 可选第 4 条 gmask cond 通道(同一 ce 卷积栈,首层 3→4ch)。"""
-    def __init__(s, gmask=True):
-        super().__init__(cond="flow")
+    """DualViewDiT(flow) + 可选第 4 条 gmask cond 通道(同一 ce 卷积栈,首层 3→4ch)。D/depth 可调(容量消融)。"""
+    def __init__(s, gmask=True, D=None, depth=None):
+        D = D or DIM_G; depth = depth or DEPTH_G
+        super().__init__(cond="flow", D=D, depth=depth, heads=max(1, D // 64))
         s.gmask = gmask
         if gmask:
             s.ce = nn.Sequential(cbr(4, 32), nn.MaxPool2d(2), cbr(32, 64), nn.MaxPool2d(2),
                                  cbr(64, 128), nn.MaxPool2d(2))
+            s.emb_cond = nn.Linear(128, D)
 
 
 setattr(_m, "DualViewDiTG", DualViewDiTG)
+
+_GL = {}
+
+
+def load_gmask_low():
+    from train_maskgen_v3eef import MaskGen
+    ck = torch.load("outputs/flow_wm/maskgen_caneef_low/maskgen_caneef.pt", map_location="cpu")
+    g = MaskGen(ck["indim"]).to(device); g.load_state_dict(ck["g"]); g.eval()
+    _GL.update(g=g, xm=ck["xm"], xs=ck["xs"]); print("loaded g-mask LOW (IoU0.836)", flush=True)
+
+
+@torch.no_grad()
+def gmask_low_imgs(joint_t, eef_t):
+    feat = np.concatenate([joint_t[:, :7], eef_t.reshape(len(eef_t), 6)], 1)
+    x = torch.from_numpy(((feat - _GL["xm"]) / _GL["xs"]).astype(np.float32)).to(device)
+    return torch.sigmoid(_GL["g"](x)[:, 0]).cpu().numpy()
+
+
+def _agent_ch(v, dom, joint, ef_vt, j, t):
+    """per-view agent 剪影通道:v0=maskgen_caneef,v1=maskgen_caneef_low(GMASK_LOW 时),否则 0。"""
+    import exp_v3_human_helps_pixels as HP
+    if dom == "r" and v == 0:
+        if not HP._G: load_gmask()
+        return gmask_imgs(joint[j, t][None], ef_vt[None])[0].astype(np.float32)
+    if dom == "r" and v == 1 and GMASK_LOW:
+        if not _GL: load_gmask_low()
+        return gmask_low_imgs(joint[j, t][None], ef_vt[None])[0].astype(np.float32)
+    return np.zeros((IMG, IMG), np.float32)
 
 
 def build_conds_g(R, joint, dom, j, t, gmask_on):
@@ -58,12 +90,7 @@ def build_conds_g(R, joint, dom, j, t, gmask_on):
         c = flow_cond(tr[j, 0], tr[j, t], ef[j, 0], ef[j, t], vs[j, t])
         masks.append(c[2].copy())
         if gmask_on:
-            if v == 0 and dom == "r":
-                import exp_v3_human_helps_pixels as HP
-                if not HP._G: load_gmask()                      # 懒加载 maskgen
-                g = gmask_imgs(joint[j, t][None], ef[j, t][None])[0].astype(np.float32)
-            else:
-                g = np.zeros((IMG, IMG), np.float32)
+            g = _agent_ch(v, dom, joint, ef[j, t], j, t)
             c = np.concatenate([c, g[None]], 0)
         conds.append(c)
     return np.stack(conds), np.stack(masks)
@@ -201,12 +228,7 @@ def render_g_pred(m, R, joint, si, predtr):
             trt = predtr[h, v * P:(v + 1) * P]
             c = flow_cond(tr[si, 0], trt, ef[si, 0], ef[si, DIT.K + h], vs[si, DIT.K + h])
             if GMASK:
-                if v == 0:
-                    import exp_v3_human_helps_pixels as HP
-                    if not HP._G: load_gmask()
-                    g = gmask_imgs(joint[si, DIT.K + h][None], ef[si, DIT.K + h][None])[0].astype(np.float32)
-                else:
-                    g = np.zeros((IMG, IMG), np.float32)
+                g = _agent_ch(v, "r", joint, ef[si, DIT.K + h], si, DIT.K + h)
                 c = np.concatenate([c, g[None]], 0)
             conds.append(c)
         cond = torch.from_numpy(np.stack(conds)[None].astype(np.float32)).to(device)

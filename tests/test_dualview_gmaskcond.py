@@ -34,3 +34,31 @@ def test_model_forward_4ch():
     m0 = G.DualViewDiTG(gmask=False).to(device)
     out0 = m0(z0, z0.clone(), cond[:, :, :3])
     assert out0.shape == out.shape
+
+
+def test_capacity_variant_forward():
+    import exp_scel_dualview_gmaskcond as G
+    from exp_v3_human_helps_pixels import device
+    from exp_scel_latent_renderer import latent_ch
+    m = G.DualViewDiTG(gmask=True, D=512, depth=12).to(device)
+    n_base = sum(p.numel() for p in G.DualViewDiTG(gmask=True).parameters())
+    n_big = sum(p.numel() for p in m.parameters())
+    assert n_big > 1.8 * n_base
+    z0 = torch.randn(1, 2, latent_ch(), 16, 16, device=device)
+    cond = torch.randn(1, 2, 4, 128, 128, device=device)
+    assert m(z0, z0.clone(), cond).shape == (1, 2, latent_ch(), 16, 16)
+
+
+def test_gmask_low_channel():
+    import exp_scel_dualview_gmaskcond as G
+    import numpy as np
+    G.GMASK_LOW = True
+    rng = np.random.default_rng(0)
+    P = 48
+    R = {"tr": [rng.random((2, 24, P, 2)).astype(np.float32)] * 2,
+         "ef": [rng.random((2, 24, 3, 2)).astype(np.float32)] * 2,
+         "vs": [np.ones((2, 24, P), np.float32)] * 2}
+    joint = rng.random((2, 24, 7)).astype(np.float32)
+    c4, _ = G.build_conds_g(R, joint, "r", 0, 5, True)
+    assert np.abs(c4[1, 3]).max() > 0.0                        # v1 现在有真剪影
+    G.GMASK_LOW = False
