@@ -3,11 +3,18 @@ controlled 三方 (flow | eefsp | eeffilm) x crossview {1,0} x seed, 复用探�
 + 第4臂 COND=flowwarp (spec docs/superpowers/specs/2026-07-14-flowwarp-can-dual.md): flow 臂条件不变,
 额外把 frame0 像素域 masked-local transport 到当前帧(warp_rgb_masked)、VAE 编码为 z_warp 追加 token,
 输出 = z_warp 的残差(DualViewDiTWarp), 治糊/外观锚死, 只训 replay(GT tracks) 判渲染上限.
++ 第5/6臂 COND=flowskel|flowskel3 (spec FLOW_WARP_REPR_LOG.md §用户指示四/候选#8, OSCAR 式 agent 骨架):
+flow 臂 3ch 条件 + 第4通道 = 当前帧骨架线画(纯几何,来自关节/eef 关键点,不看未来帧像素,零泄漏);
+flowskel = 整臂 FK 连杆链(skel_sidecar_robot.npz segments,线宽随夹爪开度调制);flowskel3 = 只手部
+3点(base/fin1/fin2,消融整臂 vs 只手);人手两模式相同(腕+两指尖+前臂方向短线,skel_sidecar_human.npz)。
+模型 DualViewDiTSkel: 复用 flow 臂的 spatial-add 通路,只重建 s.ce 首层为 4ch 输入。
+额外指标 agent_lpips_audit: 感知相似度裁剪窗口改为以骨架关键点质心为中心(而非物体足迹),对所有臂通用
+(数据侧量,与渲染 COND 无关),写入 metrics.json 的 a{v}_lp / agent_det_rate_v{v}。
 MODE=train: 训一个 (COND, CROSSVIEW, SEED, EPOCHS) 格子 -> OUT/{cond}_cv{cv}_s{seed}/
 MODE=eval : 只重跑 eval (需已有 dvdit.pt)
 MODE=gif  : replay 对比 gif (GT | flow | eefsp | eeffilm, seed0 cv1)
 MODE=e2e  : ② pred-flow 端到端 (Task 5)
-Env: MODE, COND(flow|eefsp|eeffilm|flowwarp), CROSSVIEW(1|0), SEED, EPOCHS(60), SMOKE, NEVAL(24)
+Env: MODE, COND(flow|eefsp|eeffilm|flowwarp|flowskel|flowskel3), CROSSVIEW(1|0), SEED, EPOCHS(60), SMOKE, NEVAL(24)
 iws env + GPU. 输出根 outputs/cross_embodiment_wm/dualview_dit_formal/"""
 import json
 import os
@@ -51,8 +58,75 @@ def eef_vec(ef0, eft):
     return np.concatenate([eft, d], -1).reshape(-1).astype(np.float32)   # (3,4)->(12,)
 
 
-def build_conds_formal(D, j, t, mode):
-    """clip j frame t 的 per-view cond + loss mask (物体 footprint, cond 无关, 三臂同)."""
+# ---- 5th/6th arm COND=flowskel|flowskel3 (spec FLOW_WARP_REPR_LOG.md §用户指示四/候选#8): flow's 3ch cond
+# + a 4th channel = OSCAR-style deterministic skeleton LINE DRAWING at frame t. Inputs are joints/eef keypoints
+# (action/proprioception, legal WM condition per the doc's no-leakage rule) -- never a future-frame image.
+_SKEL_CACHE = None
+GRIP_MAX = 0.04                                             # can rig gripper opening range (m), see MEMORY 夹爪开合
+ROBOT_HAND_SEGS = np.array([[0, 1], [0, 2]], np.int32)       # flowskel3: base(0)->fin1(1), base(0)->fin2(2) (D["ef"] order)
+HUMAN_SEGS = np.array([[0, 1], [0, 2], [0, 3]], np.int32)    # wrist(0)->fingertip1/2(1,2)->forearm_stub(3)
+
+
+def _load_skel():
+    """lazy-load skeleton sidecars (outputs/flow_render_dataset_can_dual/skel_sidecar_{robot,human}.npz).
+    Row j of each sidecar is verbatim-aligned to row j of clips_robot.npz / clips_human_L24.npz -- built by
+    augment_clips_skeleton.py iterating those same npz rows in order (robot: `for n in range(N)`; human:
+    gathered via VID/FIDX into the original row index, never resorted). Spot-checked here once (assert) via
+    the docstring's own acceptance gate: carriage_left/right (skel idx 6,7) vs eef fingertip slots 1/2 must
+    land within ~10px if rows truly correspond; empirically ~1.4-3.4px on clips {0,500,1500,2699} (verified
+    2026-07-14, well inside the gate) -- so a >10px mismatch here means the two npz files drifted out of sync."""
+    global _SKEL_CACHE
+    if _SKEL_CACHE is None:
+        rs = np.load(f"{dv.DS}/skel_sidecar_robot.npz")
+        hs = np.load(f"{dv.DS}/skel_sidecar_human.npz")
+        _SKEL_CACHE = {"robot": rs, "human": hs}
+        zr = np.load(f"{dv.DS}/clips_robot.npz", mmap_mode="r")
+        for j in (0, min(500, len(zr["eef"]) - 1), len(zr["eef"]) - 1):
+            skel_pt = rs["skel2d_high"][j, 0, [6, 7]]; eef_pt = zr["eef"][j, 0, [1, 2]]
+            d = np.linalg.norm(skel_pt - eef_pt, axis=-1) * IMG
+            assert np.all(d < 10), f"skel sidecar misaligned with clips at row {j}: {d}px (expect <10px)"
+    return _SKEL_CACHE
+
+
+def grip_thickness(grip_val, base=2, scale=3):
+    """OSCAR-style visual gripper-state cue: line width grows with opening (grip in [0, GRIP_MAX] m)."""
+    return int(base + np.clip(float(grip_val), 0, GRIP_MAX) / GRIP_MAX * scale)
+
+
+def skel_channel(pts, segs, thick_px, res=IMG):
+    """Draw a skeleton line chain onto a (res,res) canvas (intensity 1.0) then GaussianBlur(5,5) sigma=1 for
+    smoothness. pts: (P,2) crop-norm coords, UNCLIPPED (may lie outside [0,1] or be NaN) -- cv2.line clips
+    out-of-canvas endpoints to the in-frame portion natively, so segments with a finite pair are drawn as-is;
+    segments touching a NaN point (e.g. human hand not detected this frame) are skipped, not zero-filled."""
+    canvas = np.zeros((res, res), np.float32)
+    P = np.asarray(pts, np.float64) * res
+    for a, b in segs:
+        pa, pb = P[a], P[b]
+        if not (np.all(np.isfinite(pa)) and np.all(np.isfinite(pb))): continue
+        cv2.line(canvas, (int(round(pa[0])), int(round(pa[1]))), (int(round(pb[0])), int(round(pb[1]))), 1.0, thick_px)
+    return cv2.GaussianBlur(canvas, (5, 5), 1)
+
+
+def skel_cond_channel(dom, v, j, t, mode, ef_t):
+    """4th cond channel for clip j (domain dom='r'|'h') view v frame t. ef_t: (3,2) this view's eef points at
+    frame t (D["ef"][v][j, t]) -- only used for flowskel3's robot hand-only chain; human uses the sidecar's
+    4 points for BOTH modes (identical, per spec: 'human identical to flowskel')."""
+    sk = _load_skel(); view = "skel2d_high" if v == 0 else "skel2d_low"
+    if dom == "r":
+        thick = grip_thickness(sk["robot"]["grip"][j, t])
+        if mode == "flowskel":
+            pts, segs = sk["robot"][view][j, t], sk["robot"]["segments"]
+        else:                                               # flowskel3: hand-only (base->fin1, base->fin2)
+            pts, segs = ef_t, ROBOT_HAND_SEGS
+    else:                                                    # human: same skeleton for both flowskel/flowskel3
+        pts, segs, thick = sk["human"][view][j, t], HUMAN_SEGS, 3
+    return skel_channel(pts, segs, thick)
+
+
+def build_conds_formal(D, j, t, mode, dom="r"):
+    """clip j frame t 的 per-view cond + loss mask (物体 footprint, cond 无关, 各臂同).
+    dom ('r'|'h') only matters for flowskel/flowskel3 (picks robot vs human skeleton sidecar); all render/eval
+    call-sites operate on the robot dict R only, so the default dom='r' covers them without change."""
     conds, masks = [], []
     for v in range(2):
         tr, ef, vs = D["tr"][v], D["ef"][v], D["vs"][v]
@@ -60,6 +134,10 @@ def build_conds_formal(D, j, t, mode):
             c = flow_cond(tr[j, 0], tr[j, t], ef[j, 0], ef[j, t], vs[j, t])
         elif mode == "eefsp":
             c = eefsp_cond(ef[j, 0], ef[j, t])
+        elif mode in ("flowskel", "flowskel3"):
+            c3 = flow_cond(tr[j, 0], tr[j, t], ef[j, 0], ef[j, t], vs[j, t])
+            c4 = skel_cond_channel(dom, v, j, t, mode, ef[j, t])
+            c = np.concatenate([c3, c4[None]], 0)
         else:                                              # eeffilm: 全量 12-dim/view
             c = eef_vec(ef[j, 0], ef[j, t])
         conds.append(c); masks.append(_fp(tr[j, t]))
@@ -184,6 +262,20 @@ class DualViewDiTWarp(DualViewDiTFormal):
         return torch.stack(zs, 1)
 
 
+class DualViewDiTSkel(DualViewDiTFormal):
+    """5th/6th arm COND=flowskel|flowskel3: identical to the flow arm's spatial-add condition pathway
+    (s.ce/s.emb_cond/s.pos/s.view_emb/s.typ, crossview attn-mask) -- only s.ce's FIRST conv is rebuilt to
+    take 4 input channels (flow's 3ch + the skeleton line-drawing channel) instead of 3; the rest of s.ce
+    (32->64->128 + pools) is unchanged. No forward() override needed: DualViewDiTFormal.forward already
+    routes s.cond=='flow' through s.ce(cond[:, v]), and cond here is (B,2,4,128,128)."""
+    def __init__(s, mode, crossview=CROSSVIEW, **kw):
+        assert mode in ("flowskel", "flowskel3")
+        super().__init__(mode="flow", crossview=crossview, **kw)   # builds ce=cbr(3,32)...; first conv replaced below
+        s.mode = mode
+        from exp_v3_human_helps_pixels import cbr
+        s.ce[0] = cbr(4, 32)
+
+
 def obj_lpips_audit(lp, pred, gt, objm):
     """单一权威 obj-region LPIPS: footprint 质心 64x64 crop; <5 点帧记无效并计数 (det-rate)."""
     outs = []; n_total = len(pred)
@@ -191,6 +283,26 @@ def obj_lpips_audit(lp, pred, gt, objm):
         ys, xs = np.where(objm[h] > 0.5)
         if len(xs) < 5: continue
         cx, cy = int(xs.mean()), int(ys.mean())
+        x1 = min(max(cx - 32, 0) + 64, IMG); y1 = min(max(cy - 32, 0) + 64, IMG)
+        x0, y0 = x1 - 64, y1 - 64
+        a = torch.from_numpy(pred[h, y0:y1, x0:x1]).permute(2, 0, 1)[None].float().to(device) * 2 - 1
+        b = torch.from_numpy(gt[h, y0:y1, x0:x1]).permute(2, 0, 1)[None].float().to(device) * 2 - 1
+        outs.append(float(lp(a, b)))
+    return (float(np.mean(outs)) if outs else float("nan")), len(outs), n_total
+
+
+def agent_lpips_audit(lp, pred, gt, skel_pts):
+    """agent-region LPIPS: same 64x64-crop-LPIPS recipe as obj_lpips_audit, but the crop centers on the
+    centroid of IN-FRAME skeleton points at each frame (skel_pts: (T,P,2) crop-norm, robot P=9 skel2d /
+    human P=4) instead of the object footprint. IN-FRAME = finite AND inside [0,1]. <2 in-frame points ->
+    invalid, counted in the denominator (agent det-rate) -- data-side metric, mode-independent (works for
+    every COND arm since the skeleton sidecar exists regardless of what the renderer was conditioned on)."""
+    outs = []; n_total = len(pred)
+    for h in range(n_total):
+        p = skel_pts[h]
+        infr = np.all(np.isfinite(p), -1) & (p[:, 0] >= 0) & (p[:, 0] <= 1) & (p[:, 1] >= 0) & (p[:, 1] <= 1)
+        if infr.sum() < 2: continue
+        cx, cy = int(p[infr, 0].mean() * IMG), int(p[infr, 1].mean() * IMG)
         x1 = min(max(cx - 32, 0) + 64, IMG); y1 = min(max(cy - 32, 0) + 64, IMG)
         x0, y0 = x1 - 64, y1 - 64
         a = torch.from_numpy(pred[h, y0:y1, x0:x1]).permute(2, 0, 1)[None].float().to(device) * 2 - 1
@@ -216,8 +328,13 @@ def train_formal(R, Hh, idx_r, idx_h, latR, latH, mode, crossview, seed, epochs)
     """探索版 train() 配方原样, 唯一变化: seed 线程化 + DualViewDiTFormal + build_conds_formal.
     mode=='flowwarp': 额外在 batch 内建 z_warp (frame0 pixel-warp -> 单次 batched VAE encode, 见 build_zwarp)."""
     torch.manual_seed(seed)
-    m = (DualViewDiTWarp(crossview=crossview) if mode == "flowwarp"
-         else DualViewDiTFormal(mode=mode, crossview=crossview)).to(device)
+    if mode == "flowwarp":
+        m = DualViewDiTWarp(crossview=crossview)
+    elif mode in ("flowskel", "flowskel3"):
+        m = DualViewDiTSkel(mode=mode, crossview=crossview)
+    else:
+        m = DualViewDiTFormal(mode=mode, crossview=crossview)
+    m = m.to(device)
     opt = torch.optim.AdamW(m.parameters(), lr=LR)
     print(f"formal {RUN} params={sum(p.numel() for p in m.parameters())/1e6:.1f}M", flush=True)
     from interactive_world_sim.algorithms.common.metrics.lpips import LearnedPerceptualImagePatchSimilarity
@@ -235,7 +352,7 @@ def train_formal(R, Hh, idx_r, idx_h, latR, latH, mode, crossview, seed, epochs)
             for si in bidx:
                 dom, j = samples[si]; D = R if dom == "r" else Hh; lc = latR if dom == "r" else latH
                 t = int(rng.integers(9, D["fr"][0].shape[1]))
-                cond, mask = build_conds_formal(D, j, t, mode)
+                cond, mask = build_conds_formal(D, j, t, mode, dom=dom)
                 pt = 0 if rng.random() < 0.15 else t - 1
                 z0i.append(lc[j, 0].astype(np.float32)); z1i.append(lc[j, t].astype(np.float32)); pvi.append(lc[j, pt].astype(np.float32))
                 gti.append([fr01(D["fr"][v][j, t]) for v in range(2)])
@@ -298,10 +415,14 @@ def render_formal(m, R, si, mode, pred_tr=None):
 
 
 def run_eval(m, R, chosen, mode, out=None, pred_tr_fn=None):
-    """单一权威 eval: 每 seq render + per-view PSNR/obj-LPIPS/det-rate. -> res dict"""
+    """单一权威 eval: 每 seq render + per-view PSNR/obj-LPIPS/det-rate + agent-region LPIPS/det-rate
+    (agent_lpips_audit, 数据侧量, 对所有 COND 臂通用). -> res dict; 不改动既有 key, 只追加 a{v}_lp / agent_det_rate_v{v}."""
     from interactive_world_sim.algorithms.common.metrics.lpips import LearnedPerceptualImagePatchSimilarity
     lp = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False).to(device).eval()
-    agg = {f"v{v}_{k}": [] for v in range(2) for k in ["ps", "lp"]}; det = {0: [0, 0], 1: [0, 0]}
+    agg = {f"v{v}_{k}": [] for v in range(2) for k in ["ps", "lp"]}
+    agg.update({f"a{v}_lp": [] for v in range(2)})
+    det = {0: [0, 0], 1: [0, 0]}; adet = {0: [0, 0], 1: [0, 0]}
+    sk = _load_skel()["robot"]                                  # agent metric always keys off the robot skeleton (R is robot-only here)
     for si in chosen:
         rr = render_formal(m, R, si, mode, pred_tr=None if pred_tr_fn is None else pred_tr_fn(si))
         if out is not None: np.save(f"{out}/gifs/seq{si}_render.npy", u8(rr))
@@ -311,8 +432,15 @@ def run_eval(m, R, chosen, mode, out=None, pred_tr_fn=None):
             agg[f"v{v}_ps"].append(np.mean([psnr(rr[v, h], gtf[h]) for h in range(H)]))
             lpv, nv, nt = obj_lpips_audit(lp, rr[v].astype(np.float32), gtf, objm)
             agg[f"v{v}_lp"].append(lpv); det[v][0] += nv; det[v][1] += nt
+            view = "skel2d_high" if v == 0 else "skel2d_low"
+            skel_pts = sk[view][si, K:K + H]
+            alv, av, at = agent_lpips_audit(lp, rr[v].astype(np.float32), gtf, skel_pts)
+            agg[f"a{v}_lp"].append(alv); adet[v][0] += av; adet[v][1] += at
     res = {f"v{v}_{k}": float(np.nanmean(agg[f"v{v}_{k}"])) for v in range(2) for k in ["ps", "lp"]}
-    for v in range(2): res[f"det_rate_v{v}"] = det[v][0] / max(det[v][1], 1)
+    res.update({f"a{v}_lp": float(np.nanmean(agg[f"a{v}_lp"])) for v in range(2)})
+    for v in range(2):
+        res[f"det_rate_v{v}"] = det[v][0] / max(det[v][1], 1)
+        res[f"agent_det_rate_v{v}"] = adet[v][0] / max(adet[v][1], 1)
     return res
 
 
@@ -335,8 +463,10 @@ def main():
                 "wall_min": round((time.time() - t0) / 60, 1), "n_eval": len(chosen)})
     json.dump(res, open(f"{OUT}/metrics.json", "w"), indent=2)
     lines = [f"DUAL-VIEW DiT FORMAL {RUN} | {VERSIONS}",
-             f"cam_high: PSNR {res['v0_ps']:.2f} | obj-LPIPS {res['v0_lp']:.3f} | det {res['det_rate_v0']:.2f}",
-             f"cam_low : PSNR {res['v1_ps']:.2f} | obj-LPIPS {res['v1_lp']:.3f} | det {res['det_rate_v1']:.2f}",
+             f"cam_high: PSNR {res['v0_ps']:.2f} | obj-LPIPS {res['v0_lp']:.3f} | det {res['det_rate_v0']:.2f} | "
+             f"agent-LPIPS {res['a0_lp']:.3f} | agent-det {res['agent_det_rate_v0']:.2f}",
+             f"cam_low : PSNR {res['v1_ps']:.2f} | obj-LPIPS {res['v1_lp']:.3f} | det {res['det_rate_v1']:.2f} | "
+             f"agent-LPIPS {res['a1_lp']:.3f} | agent-det {res['agent_det_rate_v1']:.2f}",
              f"epochs={EPOCHS} seed={SEED} wall={res['wall_min']}min"]
     open(f"{OUT}/summary.txt", "w").write("\n".join(lines) + "\n"); print("\n".join(lines) + "\n=== DONE ===", flush=True)
 

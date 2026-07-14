@@ -193,6 +193,52 @@ def test_flowwarp_forward_shape():
     assert out.shape == (2, 2, Cz, 16, 16) and torch.isfinite(out).all()
 
 
+def test_skel_channel_draws_lines():
+    """synthetic 2-point skeleton -> 4th channel nonzero along the expected segment, ~0 far away
+    (spec: OSCAR-style deterministic line drawing, exp_scel_dualview_dit_formal.skel_channel)."""
+    import numpy as np
+    from exp_scel_dualview_dit_formal import skel_channel
+    pts = np.array([[0.5, 0.5], [0.9, 0.5]], np.float32)      # horizontal segment, mid-canvas
+    segs = np.array([[0, 1]], np.int32)
+    ch = skel_channel(pts, segs, thick_px=3)
+    assert ch.shape == (128, 128)
+    assert ch[60:68, 85:95].max() > 0.3                       # along the segment
+    assert ch[:10, :10].max() < 1e-3                          # far corner untouched
+
+
+def test_flowskel_forward_shape():
+    """DualViewDiTSkel forward with 4ch cond (flow 3ch + skel line channel) -> (B,2,Cz,16,16) finite."""
+    from exp_scel_dualview_dit_formal import DualViewDiTSkel
+    from exp_scel_latent_renderer import latent_ch
+    Cz = latent_ch()
+    torch.manual_seed(0)
+    m = DualViewDiTSkel(mode="flowskel", crossview=True, D=64, depth=2, heads=2).eval()
+    z0 = torch.randn(2, 2, Cz, 16, 16); prev = torch.randn(2, 2, Cz, 16, 16)
+    cond = torch.randn(2, 2, 4, 128, 128)
+    with torch.no_grad():
+        out = m(z0, prev, cond)
+    assert out.shape == (2, 2, Cz, 16, 16) and torch.isfinite(out).all()
+
+
+def test_agent_lpips_audit_counts():
+    """same pattern as test_obj_lpips_audit_counts_invalid but for the agent-region metric: frames with
+    <2 in-frame skeleton points are marked invalid and counted (agent det-rate), not silently skipped."""
+    import numpy as np
+    from exp_scel_dualview_dit_formal import agent_lpips_audit
+
+    class FakeLP:
+        def __call__(self, a, b): return torch.tensor(0.5)
+
+    T = 4
+    pred = np.random.rand(T, 128, 128, 3).astype(np.float32); gt = pred.copy()
+    skel_pts = np.full((T, 4, 2), np.nan, np.float32)
+    skel_pts[0, :2] = [[0.5, 0.5], [0.55, 0.5]]                # 2 in-frame points -> valid
+    skel_pts[1, :3] = [[0.2, 0.2], [0.25, 0.2], [0.3, 0.2]]    # 3 in-frame points -> valid
+    # frames 2,3 stay all-NaN -> invalid, still counted in n_total (agent det-rate)
+    mean, n_valid, n_total = agent_lpips_audit(FakeLP(), pred, gt, skel_pts)
+    assert n_valid == 2 and n_total == 4 and abs(mean - 0.5) < 1e-6
+
+
 def test_iws_rollout_shape():
     from exp_dualview_iws_stage2 import rollout_iws, make_sched
     from interactive_world_sim.algorithms.latent_dynamics.models.cm_latent_dynamics import CMLatentDynamics
