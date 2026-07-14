@@ -85,6 +85,19 @@ def _load_skel():
             skel_pt = rs["skel2d_high"][j, 0, [6, 7]]; eef_pt = zr["eef"][j, 0, [1, 2]]
             d = np.linalg.norm(skel_pt - eef_pt, axis=-1) * IMG
             assert np.all(d < 10), f"skel sidecar misaligned with clips at row {j}: {d}px (expect <10px)"
+        # symmetric human-side guard: skel sidecar joint 0 (wrist) must be a verbatim copy of the trusted
+        # wrist_sidecar_human.npz wrist2d_high (augment_clips_skeleton.py builds it from that exact array), so
+        # any future regeneration of either file that drifts row alignment fails loudly here instead of silently
+        # drawing skeletons on the wrong clip. Compare only where BOTH are finite (hand-not-detected frames are
+        # NaN in both by construction, but guard each independently); <1px gate (expected 0.0px, verbatim copy).
+        ws = np.load(f"{dv.DS}/wrist_sidecar_human.npz")["wrist2d_high"]      # lazy, assert-only: NOT kept in cache
+        skw = hs["skel2d_high"][..., 0, :]                                     # (N,L,2) joint 0 = wrist
+        Nh = len(skw)
+        for j in (0, Nh // 2, Nh - 1):
+            both = np.isfinite(skw[j]).all(-1) & np.isfinite(ws[j]).all(-1)    # (L,) frames finite in BOTH
+            if not both.any(): continue                                        # all-NaN row: nothing comparable
+            d = np.linalg.norm(skw[j][both] - ws[j][both], axis=-1).max() * IMG
+            assert d < 1, f"human skel sidecar wrist misaligned with wrist_sidecar at row {j}: {d:.2f}px (expect <1px)"
     return _SKEL_CACHE
 
 
