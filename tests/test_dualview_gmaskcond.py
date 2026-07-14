@@ -49,6 +49,26 @@ def test_capacity_variant_forward():
     assert m(z0, z0.clone(), cond).shape == (1, 2, latent_ch(), 16, 16)
 
 
+def test_warp_preview_identity_and_motion():
+    """trt==tr0 -> 搬运结果=footprint 内的原像素;平移 -> 像素跟着移。"""
+    import exp_scel_dualview_gmaskcond as G
+    import numpy as np
+    rng = np.random.default_rng(0)
+    fr0 = (rng.random((128, 128, 3)) * 255).astype(np.uint8)
+    tr0 = rng.random((48, 2)).astype(np.float32) * 0.3 + 0.35   # 中央点簇
+    vis = np.ones(48, np.float32)
+    w_id = G.warp_preview(fr0, tr0, tr0, vis)
+    assert w_id.shape == (3, 128, 128) and w_id.max() > 0
+    ys, xs = np.where(w_id.sum(0) > 0)
+    assert len(xs) > 50                                        # footprint 区域非空
+    trt = tr0 + np.array([0.2, 0.0], np.float32)               # 右移
+    w_mv = G.warp_preview(fr0, tr0, trt, vis)
+    assert w_mv[:, :, :int(0.3*128)].sum() < w_id[:, :, :int(0.3*128)].sum() + 1e-6
+    assert not np.allclose(w_mv, w_id)
+    w_few = G.warp_preview(fr0, tr0, trt, np.zeros(48, np.float32))  # 无可见点 -> 全零
+    assert w_few.max() == 0.0
+
+
 def test_gmask_low_channel():
     import exp_scel_dualview_gmaskcond as G
     import numpy as np

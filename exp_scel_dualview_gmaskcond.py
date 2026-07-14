@@ -30,6 +30,7 @@ SMOKE = os.environ.get("SMOKE", "0") == "1"
 DS = "outputs/flow_render_dataset_can_dual"
 GMASK = os.environ.get("GMASK", "1") == "1"
 GMASK_LOW = os.environ.get("GMASK_LOW", "0") == "1"            # v1 也用真剪影(maskgen_caneef_low IoU0.836)
+WARP = os.environ.get("WARP", "0") == "1"                      # 刚体 warp-as-condition RGB 预览 3ch
 DIM_G = int(os.environ.get("DIM_G", "384")); DEPTH_G = int(os.environ.get("DEPTH_G", "8"))
 EPOCHS = 3 if SMOKE else int(os.environ["EPOCHS"]); BS = 8; LR = 2e-4
 H = 20; HELDOUT = 150; NSEQ = int(os.environ.get("NSEQ", "6")); PREV_DF = 0.3
@@ -41,12 +42,14 @@ _m = sys.modules["__main__"]
 
 class DualViewDiTG(DualViewDiT):
     """DualViewDiT(flow) + 可选第 4 条 gmask cond 通道(同一 ce 卷积栈,首层 3→4ch)。D/depth 可调(容量消融)。"""
-    def __init__(s, gmask=True, D=None, depth=None):
+    def __init__(s, gmask=True, D=None, depth=None, warp=None):
         D = D or DIM_G; depth = depth or DEPTH_G
+        warp = WARP if warp is None else warp
         super().__init__(cond="flow", D=D, depth=depth, heads=max(1, D // 64))
-        s.gmask = gmask
-        if gmask:
-            s.ce = nn.Sequential(cbr(4, 32), nn.MaxPool2d(2), cbr(32, 64), nn.MaxPool2d(2),
+        s.gmask, s.warp = gmask, warp
+        cin = 3 + (1 if gmask else 0) + (3 if warp else 0)
+        if cin != 3:
+            s.ce = nn.Sequential(cbr(cin, 32), nn.MaxPool2d(2), cbr(32, 64), nn.MaxPool2d(2),
                                  cbr(64, 128), nn.MaxPool2d(2))
             s.emb_cond = nn.Linear(128, D)
 
@@ -68,6 +71,30 @@ def gmask_low_imgs(joint_t, eef_t):
     feat = np.concatenate([joint_t[:, :7], eef_t.reshape(len(eef_t), 6)], 1)
     x = torch.from_numpy(((feat - _GL["xm"]) / _GL["xs"]).astype(np.float32)).to(device)
     return torch.sigmoid(_GL["g"](x)[:, 0]).cpu().numpy()
+
+
+def warp_preview(fr0, tr0, trt, vis):
+    """刚体 warp-as-condition:vis 加权 Umeyama 相似变换(tr0→trt)把首帧 footprint 内像素
+    搬到预测位置 -> (3,128,128) RGB 预览(区域外 0)。罐子刚体假设;<3 可见点返回全零。"""
+    import cv2
+    ok = vis > 0.5
+    if ok.sum() < 3: return np.zeros((3, IMG, IMG), np.float32)
+    src = tr0[ok] * IMG; dst = trt[ok] * IMG
+    ms, md = src.mean(0), dst.mean(0)
+    sc, dc = src - ms, dst - md
+    cov = dc.T @ sc / len(sc)
+    U, S, Vt = np.linalg.svd(cov)
+    d = np.sign(np.linalg.det(U @ Vt))
+    R = U @ np.diag([1, d]) @ Vt
+    var = (sc ** 2).sum() / len(sc)
+    s = (S * [1, d]).sum() / (var + 1e-9)
+    A = np.concatenate([s * R, (md - s * R @ ms)[:, None]], 1).astype(np.float32)  # (2,3)
+    fp = np.zeros((IMG, IMG), np.float32)
+    vp = np.clip(src.astype(np.int32), 0, IMG - 1)
+    if len(vp) >= 3: cv2.fillConvexPoly(fp, cv2.convexHull(vp.reshape(-1, 1, 2)), 1.0)
+    masked = fr0.astype(np.float32) / 255.0 * fp[:, :, None]
+    warped = cv2.warpAffine(masked, A, (IMG, IMG))
+    return warped.transpose(2, 0, 1).astype(np.float32)
 
 
 def _agent_ch(v, dom, joint, ef_vt, j, t):
@@ -92,6 +119,8 @@ def build_conds_g(R, joint, dom, j, t, gmask_on):
         if gmask_on:
             g = _agent_ch(v, dom, joint, ef[j, t], j, t)
             c = np.concatenate([c, g[None]], 0)
+        if WARP:
+            c = np.concatenate([c, warp_preview(R["fr"][v][j, 0], tr[j, 0], tr[j, t], vs[j, t])], 0)
         conds.append(c)
     return np.stack(conds), np.stack(masks)
 
@@ -230,6 +259,8 @@ def render_g_pred(m, R, joint, si, predtr):
             if GMASK:
                 g = _agent_ch(v, "r", joint, ef[si, DIT.K + h], si, DIT.K + h)
                 c = np.concatenate([c, g[None]], 0)
+            if WARP:
+                c = np.concatenate([c, warp_preview(R["fr"][v][si, 0], tr[si, 0], trt, vs[si, DIT.K + h])], 0)
             conds.append(c)
         cond = torch.from_numpy(np.stack(conds)[None].astype(np.float32)).to(device)
         pred = m(z0, prev, cond); prev = pred
