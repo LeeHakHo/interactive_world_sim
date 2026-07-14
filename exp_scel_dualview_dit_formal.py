@@ -239,13 +239,21 @@ def main():
     open(f"{OUT}/summary.txt", "w").write("\n".join(lines) + "\n"); print("\n".join(lines) + "\n=== DONE ===", flush=True)
 
 
+def _eval_seqs_persisted(R, ho, n=24):
+    """gif/e2e 用: HORIZON 改变时 motion 排序会变, 不重算, 直接读发布版 eval seq 名单 (n=24 固定)."""
+    p = f"{ROOT}/eval_seqs_n{n}.json"
+    if os.path.exists(p): return json.load(open(p))
+    return eval_seqs(R, ho, n=n)
+
+
 def run_gif():
     """replay 对比 gif: GT | flow | eefsp | eeffilm | IWS-stage2(external) (seed0 cv1), 两视角, save_combined_gif protocol.
-    第5列读 Task 6 存的 dualview_iws_stage2/s0/gifs/seq{si}_render.npy (u8, (2,H,128,128,3)); 缺失则该 seq 只出 4 列并 log."""
+    第5列读 Task 6 存的 dualview_iws_stage2/s0/gifs/seq{si}_render.npy (u8, (2,H,128,128,3)); 缺失则该 seq 只出 4 列并 log.
+    HORIZON env 可加长 (机器人 clip 48 帧, K=4, 最长 44); IWS 列的 npy 是 20 帧存档, 更长时截断/跳过该列."""
     from viz_combined import save_combined_gif, build_flow_cols
     R, _ = load_dual()
     okr = np.where(R["ok"])[0]; perm = np.random.default_rng(0).permutation(okr); ho = perm[:150]
-    chosen = eval_seqs(R, ho)[:6]
+    chosen = _eval_seqs_persisted(R, ho)[:6]
     models = {}
     for c in ["flow", "eefsp", "eeffilm"]:
         p = f"{ROOT}/{c}_cv1_s0/dvdit.pt"
@@ -257,6 +265,9 @@ def run_gif():
         rr = {c: render_formal(m, R, si, c) for c, m in models.items()}
         iws_p = f"{iws_dir}/seq{si}_render.npy"
         iws = np.load(iws_p) if os.path.exists(iws_p) else None
+        if iws is not None and iws.shape[1] < H:                 # 存档 npy 只有 20 帧, 长 HORIZON 时跳过该列
+            print(f"run_gif: {iws_p} has {iws.shape[1]} frames < H={H}, dropping IWS col for seq{si}", flush=True)
+            iws = None
         if iws is None:
             print(f"run_gif: missing {iws_p}, seq{si} rendered with 4 cols (no IWS-stage2 col)", flush=True)
         for v in range(2):
@@ -291,12 +302,12 @@ def run_e2e():
     # load_dual 的 R["tr"][1] 已被 nan_to_num 填 0.0, 直接喂 ② = train/inference 分布错配.
     trB_raw = np.load(f"{dv.DS}/clips_robot.npz")["tracks_low"].astype(np.float32)
     okr = np.where(R["ok"])[0]; perm = np.random.default_rng(0).permutation(okr); ho = perm[:150]
-    chosen = eval_seqs(R, ho)
+    chosen = _eval_seqs_persisted(R, ho)
     wm = torch.load(WM_PT, map_location=device, weights_only=False).eval()
     mf = torch.load(f"{ROOT}/flow_cv1_s0/dvdit.pt", map_location=device, weights_only=False).eval()
     me = torch.load(f"{ROOT}/eeffilm_cv1_s0/dvdit.pt", map_location=device, weights_only=False).eval()
     P = R["tr"][0].shape[2]
-    outd = f"{ROOT}/e2e"; os.makedirs(f"{outd}/gifs", exist_ok=True)
+    outd = os.environ.get("E2E_DIR", f"{ROOT}/e2e"); os.makedirs(f"{outd}/gifs", exist_ok=True)   # 长 HORIZON 走独立目录, 不覆盖发布版 H=20
     from interactive_world_sim.algorithms.common.metrics.lpips import LearnedPerceptualImagePatchSimilarity
     lp = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False).to(device).eval()
     cols_lp = {c: {0: [], 1: []} for c in ["gtflow", "e2e", "eef"]}; ades = []
