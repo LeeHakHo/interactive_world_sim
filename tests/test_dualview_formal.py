@@ -160,6 +160,39 @@ def test_split_okfirst_matches_formal():
     assert np.array_equal(pool, pool_formal)
 
 
+def test_warp_moves_object():
+    """warp_rgb_masked: masked-local pixel transport moves frame0 content to the new tracked-point location
+    (spec §1 flowwarp arm). Untracked-region content (incl. frame0's own patch, since this porting has no
+    old-position erase — that's the residual net's job per spec §2 risk notes) is left alone: check the
+    NEW footprint (which the old patch never covered) is now bright, and the far background is untouched."""
+    import numpy as np
+    from exp_scel_dualview_dit_formal import warp_rgb_masked
+    img = np.zeros((128, 128, 3), np.float32)
+    img[56:72, 56:72] = 1.0                                     # bright 16x16 patch, center px (64,64)
+    I0 = torch.from_numpy(img.transpose(2, 0, 1))[None]
+    pos0 = np.array([[0.5, 0.5], [0.44, 0.44], [0.56, 0.44], [0.5, 0.56]], np.float32)   # 4 pts on the patch
+    post = pos0 + np.array([0.1, 0.0], np.float32)               # +0.1 norm in x = +12.8px
+    warped, mask = warp_rgb_masked(I0, pos0, post, sigma=4.0)
+    w = warped[0].numpy().transpose(1, 2, 0)
+    assert w[64, 80, 0] > 0.5                                    # x=80 outside orig patch (<=72), inside new footprint
+    far = (slice(0, 10), slice(0, 10))                           # corner, far outside old+new footprints
+    assert np.array_equal(w[far], img[far])
+
+
+def test_flowwarp_forward_shape():
+    """DualViewDiTWarp forward: random z0/prev/z_warp/cond -> (B,2,Cz,16,16) finite (spec §2 residual arm)."""
+    from exp_scel_dualview_dit_formal import DualViewDiTWarp
+    from exp_scel_latent_renderer import latent_ch
+    Cz = latent_ch()
+    torch.manual_seed(0)
+    m = DualViewDiTWarp(crossview=True, D=64, depth=2, heads=2).eval()
+    z0 = torch.randn(2, 2, Cz, 16, 16); prev = torch.randn(2, 2, Cz, 16, 16)
+    zwarp = torch.randn(2, 2, Cz, 16, 16); cond = torch.randn(2, 2, 3, 128, 128)
+    with torch.no_grad():
+        out = m(z0, prev, cond, zwarp)
+    assert out.shape == (2, 2, Cz, 16, 16) and torch.isfinite(out).all()
+
+
 def test_iws_rollout_shape():
     from exp_dualview_iws_stage2 import rollout_iws, make_sched
     from interactive_world_sim.algorithms.latent_dynamics.models.cm_latent_dynamics import CMLatentDynamics

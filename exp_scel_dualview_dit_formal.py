@@ -1,16 +1,19 @@
 """DUAL-VIEW DiT ③ 正式化 (spec docs/superpowers/specs/2026-07-12-dualview-dit-formalize-design.md).
 controlled 三方 (flow | eefsp | eeffilm) x crossview {1,0} x seed, 复用探索脚本组件 (import, 不复制).
++ 第4臂 COND=flowwarp (spec docs/superpowers/specs/2026-07-14-flowwarp-can-dual.md): flow 臂条件不变,
+额外把 frame0 像素域 masked-local transport 到当前帧(warp_rgb_masked)、VAE 编码为 z_warp 追加 token,
+输出 = z_warp 的残差(DualViewDiTWarp), 治糊/外观锚死, 只训 replay(GT tracks) 判渲染上限.
 MODE=train: 训一个 (COND, CROSSVIEW, SEED, EPOCHS) 格子 -> OUT/{cond}_cv{cv}_s{seed}/
 MODE=eval : 只重跑 eval (需已有 dvdit.pt)
 MODE=gif  : replay 对比 gif (GT | flow | eefsp | eeffilm, seed0 cv1)
 MODE=e2e  : ② pred-flow 端到端 (Task 5)
-Env: MODE, COND(flow|eefsp|eeffilm), CROSSVIEW(1|0), SEED, EPOCHS(60), SMOKE, NEVAL(24)
+Env: MODE, COND(flow|eefsp|eeffilm|flowwarp), CROSSVIEW(1|0), SEED, EPOCHS(60), SMOKE, NEVAL(24)
 iws env + GPU. 输出根 outputs/cross_embodiment_wm/dualview_dit_formal/"""
 import json
 import os
 
 os.environ.setdefault("VAE_NAME", "ostris/vae-kl-f8-d16"); os.environ.setdefault("HF_HUB_OFFLINE", "1")
-import numpy as np, torch, torch.nn as nn, cv2
+import numpy as np, torch, torch.nn as nn, torch.nn.functional as Fn, cv2
 import exp_scel_dualview_dit as dv
 from exp_scel_dualview_dit import (DualViewDiT, flow_cond, load_dual, latcache,
                                    _fp, u8, psnr, FLOW_SCALE, H, BS, LR, PREV_DF, LAM, DIM, DEPTH, HEADS)
@@ -53,7 +56,7 @@ def build_conds_formal(D, j, t, mode):
     conds, masks = [], []
     for v in range(2):
         tr, ef, vs = D["tr"][v], D["ef"][v], D["vs"][v]
-        if mode == "flow":
+        if mode == "flow" or mode == "flowwarp":            # flowwarp: identical 3ch cond map as flow arm
             c = flow_cond(tr[j, 0], tr[j, t], ef[j, 0], ef[j, t], vs[j, t])
         elif mode == "eefsp":
             c = eefsp_cond(ef[j, 0], ef[j, t])
@@ -101,6 +104,86 @@ class DualViewDiTFormal(DualViewDiT):
         return torch.stack(zs, 1)
 
 
+# ---- 4th arm COND=flowwarp (spec docs/superpowers/specs/2026-07-14-flowwarp-can-dual.md): masked-local pixel
+# transport of frame0 by object tracks (ported from exp_scel_flow_warp_render.cube_warp_grid/warp_rgb_masked,
+# single-view v3 cube -> per-view here), VAE-encode -> z_warp fed as a 3rd token group; output = residual on z_warp.
+WARP_SIG = float(os.environ.get("WARP_SIG", "1.3"))       # gaussian splat sigma multiplier (same default as v3 precedent)
+
+
+def warp_grid_mask(pos0, post, res, sigma):
+    """BACKWARD warp grid (1,res,res,2) in [-1,1] + soft object-footprint MASK (1,1,res,res).
+    Field splatted at CURRENT pos (post) w/ offset back to frame0 = (pos0-post); mask = tracked-point footprint
+    -> warp applies ONLY inside the tracked object; untracked regions (plate/arm/bg) keep frame0 (masked-local)."""
+    ys, xs = np.mgrid[0:res, 0:res].astype(np.float32)
+    fx = np.zeros((res, res), np.float32); fy = np.zeros((res, res), np.float32); w = np.zeros((res, res), np.float32)
+    for k in range(len(post)):
+        cx, cy = float(post[k, 0]) * res, float(post[k, 1]) * res
+        g = np.exp(-((xs - cx) ** 2 + (ys - cy) ** 2) / (2 * sigma ** 2))
+        off = pos0[k] - post[k]                            # backward offset in norm[0,1]
+        fx += g * off[0]; fy += g * off[1]; w += g
+    fx /= (w + 1e-6); fy /= (w + 1e-6)
+    base_x = (xs + 0.5) / res * 2 - 1; base_y = (ys + 0.5) / res * 2 - 1
+    grid = np.stack([base_x + fx * 2.0, base_y + fy * 2.0], -1)
+    mask = np.clip(w / (w.max() + 1e-6), 0, 1)
+    return torch.from_numpy(grid[None]).float(), torch.from_numpy(mask[None, None]).float()
+
+
+def warp_rgb_masked(I0_rgb, pos0, post, res=IMG, sigma=None):
+    """PIXEL-domain masked transport: warp I0 RGB (1,3,IMG,IMG) so tracked points move pos0->post; everything
+    untracked stays I0. Returns (warped_rgb (1,3,IMG,IMG), mask (1,1,IMG,IMG))."""
+    sig = sigma if sigma is not None else max(3.0, IMG / 16 * WARP_SIG)
+    grid, mask = warp_grid_mask(np.asarray(pos0), np.asarray(post), res, sig)
+    grid = grid.to(I0_rgb.device); mask = mask.to(I0_rgb.device)
+    w = Fn.grid_sample(I0_rgb, grid, mode="bilinear", padding_mode="border", align_corners=False)
+    return mask * w + (1 - mask) * I0_rgb, mask
+
+
+def build_zwarp(I0_rgb, pos0s, posts):
+    """I0_rgb (N,3,IMG,IMG) tensor; pos0s/posts: length-N list of (P,2) np track arrays (frame0, frame t), one
+    per (sample,view) flattened. Per-item pixel-warp (grid differs per item, unavoidable python loop) then a
+    SINGLE batched VAE encode call -> z_warp (N,Cz,16,16) (the compute-heavy step stays batched)."""
+    warped = torch.cat([warp_rgb_masked(I0_rgb[k:k + 1], pos0s[k], posts[k])[0] for k in range(I0_rgb.shape[0])], 0)
+    return enc(warped)
+
+
+class DualViewDiTWarp(DualViewDiTFormal):
+    """COND=flowwarp 4th arm: flow cond path identical to 'flow' arm (spatial-add 3ch cond), PLUS a 3rd token
+    group per view = embedded z_warp (masked-local pixel transport of frame0, VAE-encoded); output = residual
+    on the transported latent per view (network only fills holes/seams, doesn't repaint the object)."""
+    def __init__(s, crossview=CROSSVIEW, **kw):
+        super().__init__(mode="flow", crossview=crossview, **kw)   # reuse flow's ce/emb_cond/pos/view_emb/typ
+        s.mode = "flowwarp"
+        s.emb_zwarp = nn.Linear(s.zdim, s.D)
+        s.typ_warp = nn.Parameter(torch.randn(1, s.D) * 0.02)
+        n = 6 * GRID * GRID                                # [z0,prev,zwarp] x 2 views = 1536
+        if not crossview:
+            m = torch.full((n, n), float("-inf")); half = n // 2
+            m[:half, :half] = 0; m[half:, half:] = 0
+            s.register_buffer("attn_mask", m, persistent=False)
+        else:
+            s.attn_mask = None
+
+    def forward(s, z0, prev, cond, z_warp):
+        """z0/prev/z_warp (B,2,Cz,16,16); cond (B,2,3,128,128). pred = z_warp + residual, per view."""
+        B = z0.shape[0]; toks = []
+        for v in range(2):
+            t0 = s.emb_z0(s._tok(z0[:, v]))
+            cf = s.ce(cond[:, v]); t0 = t0 + s.emb_cond(s._tok(cf))
+            t0 = t0 + s.pos + s.view_emb[v] + s.typ[0]
+            tp = s.emb_prev(s._tok(prev[:, v])) + s.pos + s.view_emb[v] + s.typ[1]
+            tw = s.emb_zwarp(s._tok(z_warp[:, v])) + s.pos + s.view_emb[v] + s.typ_warp[0]
+            toks += [t0, tp, tw]
+        x = torch.cat(toks, 1)
+        for b in s.blocks: x = b(x, None, attn_mask=s.attn_mask)
+        zs = []
+        for v in range(2):
+            base = v * 3 * GRID * GRID
+            f = s.norm(x[:, base: base + GRID * GRID])
+            out = s.out(f).transpose(1, 2).reshape(B, s.zdim, GRID, GRID)
+            zs.append(z_warp[:, v] + out)                  # residual ON the transported latent
+        return torch.stack(zs, 1)
+
+
 def obj_lpips_audit(lp, pred, gt, objm):
     """单一权威 obj-region LPIPS: footprint 质心 64x64 crop; <5 点帧记无效并计数 (det-rate)."""
     outs = []; n_total = len(pred)
@@ -130,9 +213,11 @@ def eval_seqs(R, ho, n=NEVAL):
 
 
 def train_formal(R, Hh, idx_r, idx_h, latR, latH, mode, crossview, seed, epochs):
-    """探索版 train() 配方原样, 唯一变化: seed 线程化 + DualViewDiTFormal + build_conds_formal."""
+    """探索版 train() 配方原样, 唯一变化: seed 线程化 + DualViewDiTFormal + build_conds_formal.
+    mode=='flowwarp': 额外在 batch 内建 z_warp (frame0 pixel-warp -> 单次 batched VAE encode, 见 build_zwarp)."""
     torch.manual_seed(seed)
-    m = DualViewDiTFormal(mode=mode, crossview=crossview).to(device)
+    m = (DualViewDiTWarp(crossview=crossview) if mode == "flowwarp"
+         else DualViewDiTFormal(mode=mode, crossview=crossview)).to(device)
     opt = torch.optim.AdamW(m.parameters(), lr=LR)
     print(f"formal {RUN} params={sum(p.numel() for p in m.parameters())/1e6:.1f}M", flush=True)
     from interactive_world_sim.algorithms.common.metrics.lpips import LearnedPerceptualImagePatchSimilarity
@@ -146,7 +231,7 @@ def train_formal(R, Hh, idx_r, idx_h, latR, latH, mode, crossview, seed, epochs)
         m.train(); order = rng.permutation(len(samples)); tot = 0; nb = 0
         for i in range(0, len(order), BS):
             bidx = order[i:i + BS]
-            z0i, z1i, pvi, gti, cdi, mki, doms = [], [], [], [], [], [], []
+            z0i, z1i, pvi, gti, cdi, mki, doms, i0i, p0i, pti = [], [], [], [], [], [], [], [], [], []
             for si in bidx:
                 dom, j = samples[si]; D = R if dom == "r" else Hh; lc = latR if dom == "r" else latH
                 t = int(rng.integers(9, D["fr"][0].shape[1]))
@@ -155,11 +240,19 @@ def train_formal(R, Hh, idx_r, idx_h, latR, latH, mode, crossview, seed, epochs)
                 z0i.append(lc[j, 0].astype(np.float32)); z1i.append(lc[j, t].astype(np.float32)); pvi.append(lc[j, pt].astype(np.float32))
                 gti.append([fr01(D["fr"][v][j, t]) for v in range(2)])
                 cdi.append(cond); mki.append(mask); doms.append(0 if dom == "r" else 1)
+                if mode == "flowwarp":
+                    i0i += [fr01(D["fr"][v][j, 0]) for v in range(2)]
+                    p0i += [D["tr"][v][j, 0] for v in range(2)]; pti += [D["tr"][v][j, t] for v in range(2)]
             f2 = lambda a: torch.from_numpy(np.stack(a).astype(np.float32)).to(device)
             z0 = f2(z0i); z1 = f2(z1i); pv = f2(pvi); GT = f2(gti)
             cond = f2(cdi); mask = f2(mki)[:, :, None]; dom = torch.tensor(doms, device=device)
             a = torch.rand(len(bidx), 1, 1, 1, 1, device=device) * PREV_DF; pv = (1 - a) * pv + a * torch.randn_like(pv)
-            pred = m(z0, pv, cond)
+            if mode == "flowwarp":
+                I0b = f2(i0i)                                          # (2B,3,IMG,IMG), batched single enc() call
+                zw = build_zwarp(I0b, p0i, pti).reshape(len(bidx), 2, latent_ch(), GRID, GRID)
+                pred = m(z0, pv, cond, zw)
+            else:
+                pred = m(z0, pv, cond)
             img = _decode_grad(pred.reshape(-1, latent_ch(), GRID, GRID)).clamp(0, 1).reshape(len(bidx), 2, 3, IMG, IMG)
             rs = (dom == 0); hs = (dom == 1)
             loss = 0.0 * pred.sum()
@@ -176,10 +269,13 @@ def train_formal(R, Hh, idx_r, idx_h, latR, latH, mode, crossview, seed, epochs)
 @torch.no_grad()
 def render_formal(m, R, si, mode, pred_tr=None):
     """render H 帧双视角. pred_tr=None: replay GT 条件; 否则 (2,H,P,2) 用 ② 预测 tracks 建 flow cond
-    (vis 用最后观测帧 K-1, 可部署口径)."""
+    (vis 用最后观测帧 K-1, 可部署口径). mode=='flowwarp': 每步 t=K+h 从 frame0 用 GT tracks(replay) 建 z_warp."""
     fr01 = lambda a: torch.from_numpy(a.astype(np.float32).transpose(2, 0, 1)[None] / 255.0).to(device)
     z0 = torch.stack([enc(fr01(R["fr"][v][si, 0]))[0] for v in range(2)])[None]
     prev = z0.clone(); outs = [[], []]
+    if mode == "flowwarp":
+        I0cat = torch.cat([fr01(R["fr"][v][si, 0]) for v in range(2)], 0)      # (2,3,IMG,IMG)
+        pos0s = [R["tr"][v][si, 0] for v in range(2)]
     for h in range(H):
         t = K + h
         if pred_tr is None:
@@ -190,7 +286,13 @@ def render_formal(m, R, si, mode, pred_tr=None):
                             R["vs"][v][si, K - 1]) for v in range(2)]
             cond = np.stack(cs)
         cond = torch.from_numpy(cond[None].astype(np.float32)).to(device)
-        pred = m(z0, prev, cond); prev = pred
+        if mode == "flowwarp":
+            posts = [R["tr"][v][si, t] for v in range(2)]
+            zw = build_zwarp(I0cat, pos0s, posts).reshape(1, 2, latent_ch(), GRID, GRID)
+            pred = m(z0, prev, cond, zw)
+        else:
+            pred = m(z0, prev, cond)
+        prev = pred
         for v in range(2): outs[v].append(dec(pred[:, v])[0].cpu().numpy())
     return np.stack([np.stack(outs[v]).transpose(0, 2, 3, 1) for v in range(2)])
 
