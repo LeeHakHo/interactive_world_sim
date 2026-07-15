@@ -239,6 +239,30 @@ def test_agent_lpips_audit_counts():
     assert n_valid == 2 and n_total == 4 and abs(mean - 0.5) < 1e-6
 
 
+def test_flowskelv2_dispatch_draws():
+    """flowskelv2 (isomorphic skeleton): the robot path must read the V2 sidecar cache entry (not v1) and
+    draw with FIXED 3px width -- grip no longer modulates line width (aperture is geometric in the v2
+    fingertips), matching the human side's 3px = fully isomorphic encoding. Sidecar stubbed via _SKEL_CACHE."""
+    import numpy as np
+    import exp_scel_dualview_dit_formal as F
+    saved = F._SKEL_CACHE
+    try:
+        segs = np.array([[0, 1]], np.int32)
+        v2pts = np.array([[[[0.2, 0.5], [0.8, 0.5]]]], np.float32)      # (1,1,2,2) horizontal segment
+        v1pts = np.array([[[[0.5, 0.1], [0.5, 0.9]]]], np.float32)      # vertical (deliberately different)
+        grip = np.full((1, 1), 0.04, np.float32)                        # fully open -> v1-style width would be 5px
+        F._SKEL_CACHE = {"robot": {"skel2d_high": v1pts, "segments": segs, "grip": grip},
+                         "robot_v2": {"skel2d_high": v2pts, "segments": segs, "grip": grip}}
+        out = F.skel_cond_channel("r", 0, 0, 0, "flowskelv2", np.random.rand(3, 2).astype(np.float32))
+        assert out.max() > 0.3                                                       # something drawn
+        assert np.array_equal(out, F.skel_channel(v2pts[0, 0], segs, 3))             # v2 points, fixed 3px
+        assert not np.array_equal(out, F.skel_channel(v1pts[0, 0], segs, 3))         # NOT the v1 sidecar
+        assert not np.array_equal(out, F.skel_channel(v2pts[0, 0], segs,
+                                                      F.grip_thickness(0.04)))       # NOT grip-modulated (5px)
+    finally:
+        F._SKEL_CACHE = saved
+
+
 def test_render_formal_pred_tr_flowskel_gate():
     """e2e wiring: render_formal's pred_tr branch accepts mode='flowskel' (flow 3ch built from predicted
     tracks + skeleton 4th channel from actions/sidecar) -> (2,H,128,128,3) finite; and still REJECTS modes

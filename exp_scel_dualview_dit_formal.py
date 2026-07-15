@@ -6,15 +6,18 @@ controlled 三方 (flow | eefsp | eeffilm) x crossview {1,0} x seed, 复用探�
 + 第5/6臂 COND=flowskel|flowskel3 (spec FLOW_WARP_REPR_LOG.md §用户指示四/候选#8, OSCAR 式 agent 骨架):
 flow 臂 3ch 条件 + 第4通道 = 当前帧骨架线画(纯几何,来自关节/eef 关键点,不看未来帧像素,零泄漏);
 flowskel = 整臂 FK 连杆链(skel_sidecar_robot.npz segments,线宽随夹爪开度调制);flowskel3 = 只手部
-3点(base/fin1/fin2,消融整臂 vs 只手);人手两模式相同(腕+两指尖+前臂方向短线,skel_sidecar_human.npz)。
-模型 DualViewDiTSkel: 复用 flow 臂的 spatial-add 通路,只重建 s.ce 首层为 4ch 输入。
+3点(base/fin1/fin2,消融整臂 vs 只手);人手各骨架模式相同(腕+两指尖+前臂方向短线,skel_sidecar_human.npz)。
++ 第7臂 COND=flowskelv2 (同构骨架, 用户拍板): robot 改读 skel_sidecar_robot_v2.npz (8点 link_1..6 +
+grip 几何闭合指尖 x2; link_6 分叉到双指尖 = 与 human wrist→fin1/fin2 同拓扑), 线宽统一 3px
+(开合已由指尖几何编码, 线宽调制退役; human 本就 3px → 完全同构编码); 其余与 flowskel 逐点相同。
+模型 DualViewDiTSkel: 复用 flow 臂的 spatial-add 通路,只重建 s.ce 首层为 4ch 输入 (三个骨架臂共用)。
 额外指标 agent_lpips_audit: 感知相似度裁剪窗口改为以骨架关键点质心为中心(而非物体足迹),对所有臂通用
 (数据侧量,与渲染 COND 无关),写入 metrics.json 的 a{v}_lp / agent_det_rate_v{v}。
 MODE=train: 训一个 (COND, CROSSVIEW, SEED, EPOCHS) 格子 -> OUT/{cond}_cv{cv}_s{seed}/
 MODE=eval : 只重跑 eval (需已有 dvdit.pt)
 MODE=gif  : replay 对比 gif (GT | flow | eefsp | eeffilm, seed0 cv1)
 MODE=e2e  : ② pred-flow 端到端 (Task 5)
-Env: MODE, COND(flow|eefsp|eeffilm|flowwarp|flowskel|flowskel3), CROSSVIEW(1|0), SEED, EPOCHS(60), SMOKE, NEVAL(24)
+Env: MODE, COND(flow|eefsp|eeffilm|flowwarp|flowskel|flowskel3|flowskelv2), CROSSVIEW(1|0), SEED, EPOCHS(60), SMOKE, NEVAL(24)
 iws env + GPU. 输出根 outputs/cross_embodiment_wm/dualview_dit_formal/"""
 import json
 import os
@@ -78,13 +81,23 @@ def _load_skel():
     global _SKEL_CACHE
     if _SKEL_CACHE is None:
         rs = np.load(f"{dv.DS}/skel_sidecar_robot.npz")
+        r2 = np.load(f"{dv.DS}/skel_sidecar_robot_v2.npz")
         hs = np.load(f"{dv.DS}/skel_sidecar_human.npz")
-        _SKEL_CACHE = {"robot": rs, "human": hs}
+        _SKEL_CACHE = {"robot": rs, "robot_v2": r2, "human": hs}
         zr = np.load(f"{dv.DS}/clips_robot.npz", mmap_mode="r")
         for j in (0, min(500, len(zr["eef"]) - 1), len(zr["eef"]) - 1):
             skel_pt = rs["skel2d_high"][j, 0, [6, 7]]; eef_pt = zr["eef"][j, 0, [1, 2]]
             d = np.linalg.norm(skel_pt - eef_pt, axis=-1) * IMG
             assert np.all(d < 10), f"skel sidecar misaligned with clips at row {j}: {d}px (expect <10px)"
+        # v2 sidecar guard: v2 fingertips (idx 6,7) move with grip GEOMETRICALLY, so they match the clips'
+        # nominal eef fingertip slots 1/2 only at OPEN grip (they coincide at grip=GRIP_MAX; closed rows
+        # intentionally differ) -- assert on 3 rows that HAVE an open-grip frame (grip>0.035), at that row's
+        # first such frame; empirically ~0.75px (verified 2026-07-15), gate <10px = row-misalignment detector.
+        og = np.where((r2["grip"] > 0.035).any(1))[0]
+        for j in (og[0], og[len(og) // 2], og[-1]):
+            t = int(np.argmax(r2["grip"][j] > 0.035))
+            d = np.linalg.norm(r2["skel2d_high"][j, t, [6, 7]] - zr["eef"][j, t, [1, 2]], axis=-1) * IMG
+            assert np.all(d < 10), f"v2 skel sidecar misaligned with clips at row {j} t{t}: {d}px (expect <10px)"
         # symmetric human-side guard: skel sidecar joint 0 (wrist) must be a verbatim copy of the trusted
         # wrist_sidecar_human.npz wrist2d_high (augment_clips_skeleton.py builds it from that exact array), so
         # any future regeneration of either file that drifts row alignment fails loudly here instead of silently
@@ -123,15 +136,21 @@ def skel_channel(pts, segs, thick_px, res=IMG):
 def skel_cond_channel(dom, v, j, t, mode, ef_t):
     """4th cond channel for clip j (domain dom='r'|'h') view v frame t. ef_t: (3,2) this view's eef points at
     frame t (D["ef"][v][j, t]) -- only used for flowskel3's robot hand-only chain; human uses the sidecar's
-    4 points for BOTH modes (identical, per spec: 'human identical to flowskel')."""
+    4 points for ALL skeleton modes (identical, per spec: human is the reference topology).
+    flowskelv2 (isomorphic): robot reads the V2 sidecar (grip closes the fingertips GEOMETRICALLY, link_6
+    spreads to both fingertips = same topology as human wrist->fin1/fin2) and draws at FIXED 3px like the
+    human side -- grip line-width modulation is retired for this arm (aperture is in the geometry)."""
     sk = _load_skel(); view = "skel2d_high" if v == 0 else "skel2d_low"
     if dom == "r":
-        thick = grip_thickness(sk["robot"]["grip"][j, t])
         if mode == "flowskel":
             pts, segs = sk["robot"][view][j, t], sk["robot"]["segments"]
+            thick = grip_thickness(sk["robot"]["grip"][j, t])
+        elif mode == "flowskelv2":
+            pts, segs, thick = sk["robot_v2"][view][j, t], sk["robot_v2"]["segments"], 3
         else:                                               # flowskel3: hand-only (base->fin1, base->fin2)
             pts, segs = ef_t, ROBOT_HAND_SEGS
-    else:                                                    # human: same skeleton for both flowskel/flowskel3
+            thick = grip_thickness(sk["robot"]["grip"][j, t])
+    else:                                                    # human: same skeleton for all skeleton modes
         pts, segs, thick = sk["human"][view][j, t], HUMAN_SEGS, 3
     return skel_channel(pts, segs, thick)
 
@@ -147,7 +166,7 @@ def build_conds_formal(D, j, t, mode, dom="r"):
             c = flow_cond(tr[j, 0], tr[j, t], ef[j, 0], ef[j, t], vs[j, t])
         elif mode == "eefsp":
             c = eefsp_cond(ef[j, 0], ef[j, t])
-        elif mode in ("flowskel", "flowskel3"):
+        elif mode in ("flowskel", "flowskel3", "flowskelv2"):
             c3 = flow_cond(tr[j, 0], tr[j, t], ef[j, 0], ef[j, t], vs[j, t])
             c4 = skel_cond_channel(dom, v, j, t, mode, ef[j, t])
             c = np.concatenate([c3, c4[None]], 0)
@@ -276,13 +295,13 @@ class DualViewDiTWarp(DualViewDiTFormal):
 
 
 class DualViewDiTSkel(DualViewDiTFormal):
-    """5th/6th arm COND=flowskel|flowskel3: identical to the flow arm's spatial-add condition pathway
+    """skeleton arms COND=flowskel|flowskel3|flowskelv2: identical to the flow arm's spatial-add condition pathway
     (s.ce/s.emb_cond/s.pos/s.view_emb/s.typ, crossview attn-mask) -- only s.ce's FIRST conv is rebuilt to
     take 4 input channels (flow's 3ch + the skeleton line-drawing channel) instead of 3; the rest of s.ce
     (32->64->128 + pools) is unchanged. No forward() override needed: DualViewDiTFormal.forward already
     routes s.cond=='flow' through s.ce(cond[:, v]), and cond here is (B,2,4,128,128)."""
     def __init__(s, mode, crossview=CROSSVIEW, **kw):
-        assert mode in ("flowskel", "flowskel3")
+        assert mode in ("flowskel", "flowskel3", "flowskelv2")
         super().__init__(mode="flow", crossview=crossview, **kw)   # builds ce=cbr(3,32)...; first conv replaced below
         s.mode = mode
         from exp_v3_human_helps_pixels import cbr
@@ -343,7 +362,7 @@ def train_formal(R, Hh, idx_r, idx_h, latR, latH, mode, crossview, seed, epochs)
     torch.manual_seed(seed)
     if mode == "flowwarp":
         m = DualViewDiTWarp(crossview=crossview)
-    elif mode in ("flowskel", "flowskel3"):
+    elif mode in ("flowskel", "flowskel3", "flowskelv2"):
         m = DualViewDiTSkel(mode=mode, crossview=crossview)
     else:
         m = DualViewDiTFormal(mode=mode, crossview=crossview)
@@ -413,10 +432,10 @@ def render_formal(m, R, si, mode, pred_tr=None):
         if pred_tr is None:
             cond, _ = build_conds_formal(R, si, t, mode)
         else:
-            assert mode in ("flow", "flowskel")
+            assert mode in ("flow", "flowskel", "flowskelv2")
             cs = [flow_cond(R["tr"][v][si, 0], pred_tr[v][h], R["ef"][v][si, 0], R["ef"][v][si, t],
                             R["vs"][v][si, K - 1]) for v in range(2)]
-            if mode == "flowskel":                          # 4th ch from sidecar joints/grip at t (actions, not predictions)
+            if mode in ("flowskel", "flowskelv2"):          # 4th ch from sidecar joints/grip at t (actions, not predictions)
                 cs = [np.concatenate([cs[v], skel_cond_channel("r", v, si, t, mode, R["ef"][v][si, t])[None]], 0)
                       for v in range(2)]
             cond = np.stack(cs)
