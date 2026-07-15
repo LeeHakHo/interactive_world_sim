@@ -253,9 +253,11 @@ def compare_runs(dir0, dir1):
             cols = np.stack([gt, r0[v], r1[v]])
             gt_obj = R["tr"][v][si, DIT.K:DIT.K + H]
             fc = build_flow_cols(gt, gt_obj, [None, None, None], R["ef"][v][si, DIT.K:DIT.K + H])
+            labA = os.environ.get("CMP_LABEL_A", "A " + os.path.basename(dir0))
+            labB = os.environ.get("CMP_LABEL_B", "B " + os.path.basename(dir1))
             save_combined_gif(f"{OUTC}/gifs/seq{si}_cam{vname[v]}.gif", cols, fc,
-                              ["GT", "flow-only (blur base)", "flow+gmask (agent-cond)"], [None] * 3, DIT.K,
-                              caption=f"agent-conditioning ablation | cam_{vname[v]}")
+                              ["1 real video", f"2 {labA}", f"3 {labB}"], [None] * 3, DIT.K,
+                              caption=f"render ablation: {labA} vs {labB} | cam_{vname[v]}")
     print(f"saved -> {OUTC}/gifs/\n=== DONE ===", flush=True)
 
 
@@ -333,8 +335,9 @@ def e2e_g():
             fc = build_flow_cols(gt, gt_obj, [None, gt_obj, arms["A"][1][n][:, v*P:(v+1)*P], arms["B"][1][n][:, v*P:(v+1)*P]],
                                  R["ef"][v][si, DIT.K:DIT.K + H])
             save_combined_gif(f"{OUT}/gifs/seq{si}_cam{vname[v]}.gif", cols, fc,
-                              ["GT", "GT-flow (ceiling)", f"(2){arms['A'][0][:14]}", f"(2){arms['B'][0][:14]}"],
-                              [None] * 4, DIT.K, caption=f"e2e sharp-III (gmask, {os.path.basename(os.environ['E2E_CKPT'])}) | cam_{vname[v]}")
+                              ["1 real video", "2 TRUE motion->render", "3 PRED motion (align_wm)", "4 PRED motion (dummy5)"],
+                              [None] * 4, DIT.K,
+                              caption=f"col2=renderer ceiling; col3/4=full pipeline (WM predicts motion) | cam_{vname[v]}")
         print(f"  seq{si} done", flush=True)
     mn = lambda k: float(np.nanmean(agg[k]))
     lines = [f"E2E sharp-III | III={os.environ['E2E_CKPT']} | (2)A={arms['A'][0]} B={arms['B'][0]} | n={len(chosen)}"]
