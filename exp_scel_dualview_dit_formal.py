@@ -41,7 +41,7 @@ EPOCHS = 2 if SMOKE else int(os.environ.get("EPOCHS", "60"))
 NEVAL = int(os.environ.get("NEVAL", "24"))
 WM_PT = os.environ.get("WM_PT", "outputs/cross_embodiment_wm/dualview_wm/wm_dual.pt")
 ROOT = "outputs/cross_embodiment_wm/dualview_dit_formal"
-RUN = f"{CONDM}_cv{int(CROSSVIEW)}_s{SEED}" + ("_ronly" if MIX == "r" else "") + ("_smoke" if SMOKE else "")
+RUN = f"{CONDM}_cv{int(CROSSVIEW)}_s{SEED}" + ("_ronly" if MIX == "r" else "") + os.environ.get("RUN_TAG", "") + ("_smoke" if SMOKE else "")
 OUT = f"{ROOT}/{RUN}"; os.makedirs(f"{OUT}/gifs", exist_ok=True)
 VERSIONS = ("VAE=ostris/vae-kl-f8-d16(frozen) | backbone=add-DiT D384x8 (project_detmem_dit winner) | "
             "data=flow_render_dataset_can_dual | 2ckpt=dualview_wm/wm_dual.pt (e2e only)")
