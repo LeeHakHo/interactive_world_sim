@@ -1,21 +1,15 @@
 #!/bin/bash
-#SBATCH --job-name=phase0_stage1_mixed_vit
-#SBATCH --output=/scr2/yusenluo/interactive_world_sim/phantom_logs/phase0_stage1_mixed_vit.log
+#SBATCH --job-name=phase0_emb_film_rs
+#SBATCH --output=/scr2/yusenluo/interactive_world_sim/phantom_logs/phase0_stage1_mixed_emb_film_resume.log
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:1
 #SBATCH --cpus-per-task=8
 #SBATCH --time=24:00:00
 #SBATCH --mem=128G
 
-# Phase 0 v3 Step 1: Stage 1 with SplitEncoder + L_dom + L_adv on mixed
-# robot+human EEF data. See docs/superpowers/specs/2026-05-24-phase0-latent-decompose-design.md
-# and docs/superpowers/plans/2026-05-24-phase0-latent-decompose.md.
-#   - ViT-S patch=8 encoder, channel-split into z_task(288) + z_emb(96)
-#   - L_dom (CE on z_emb) + L_adv (GRL + CE on z_task) added to rec loss
-#   - balanced 50/50 robot/human batch (dataset.sample_ratio=0.5)
-#   - DynaMo SSL OFF (replaced by latent_decompose)
-#   - 12 robot + 3 human episodes, cam_high only
-#   - max 300k steps (same as robot-only baseline for fair G3 comparison)
+# RESUME of the emb_film (no-OT) Stage-1 run (was job 45723, hit 24h time limit
+# at step 20000). Local resume via `load=<last.ckpt>` -> trainer.fit(ckpt_path=)
+# restores optimizer/step/scheduler and continues toward max_steps=300005.
 
 source /scr/yusenluo/anaconda3/etc/profile.d/conda.sh
 conda activate iws
@@ -23,12 +17,15 @@ conda activate iws
 cd /scr2/yusenluo/interactive_world_sim
 
 JOBTAG="${SLURM_JOB_ID:-$(date +%s)}"
+RESUME_CKPT="/scr2/yusenluo/interactive_world_sim/outputs/2026-05-25/10-26-17_job45723_phase0_emb_film/checkpoints/last.ckpt"
 
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export HYDRA_FULL_ERROR=1
 
 python main.py \
-  hydra.run.dir="outputs/\${now:%Y-%m-%d}/\${now:%H-%M-%S}_job${JOBTAG}_phase0_stage1_mixed_vit" \
-  +name=phase0_stage1_mixed_vit \
+  hydra.run.dir="outputs/\${now:%Y-%m-%d}/\${now:%H-%M-%S}_job${JOBTAG}_phase0_emb_film_resume" \
+  +name=phase0_emb_film_resume \
+  load="${RESUME_CKPT}" \
   algorithm=latent_world_model \
   experiment=exp_latent_dyn \
   dataset=play_mixed_eef \
@@ -39,7 +36,8 @@ python main.py \
   experiment.training.optim.accumulate_grad_batches=4 \
   experiment.training.max_steps=300005 \
   experiment.training.log_every_n_steps=100 \
-  experiment.training.checkpointing.every_n_train_steps=20000 \
+  experiment.training.checkpointing.every_n_train_steps=2000 \
+  +experiment.training.checkpointing.save_last=true \
   +experiment.training.checkpointing.save_top_k=1 \
   experiment.training.data.num_workers=4 \
   experiment.validation.batch_size=2 \
@@ -49,4 +47,6 @@ python main.py \
   algorithm.training_stage=1 \
   algorithm.dynamo_ssl.enabled=false \
   algorithm.dynamo_ssl.encoder_backbone=vit \
-  algorithm.latent_decompose.enabled=true
+  algorithm.latent_decompose.enabled=true \
+  algorithm.latent_decompose.method=emb_film \
+  algorithm.latent_decompose.c_emb=16

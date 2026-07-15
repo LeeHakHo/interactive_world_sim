@@ -44,7 +44,7 @@ python main.py \
   experiment.training.optim.accumulate_grad_batches=4 \
   experiment.training.max_steps=300005 \
   experiment.training.log_every_n_steps=100 \
-  experiment.training.checkpointing.every_n_train_steps=20000 \
+  experiment.training.checkpointing.every_n_train_steps=5000 \
   +experiment.training.checkpointing.save_top_k=1 \
   experiment.training.data.num_workers=4 \
   experiment.validation.batch_size=2 \
