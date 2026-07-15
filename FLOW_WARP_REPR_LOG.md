@@ -150,6 +150,21 @@
 (基线 0.263/0.282),agent 区 0.214/0.251(基线 0.296/0.311);整臂 vs 只手近平(整臂略优)。
 对比 gif:outputs/cross_embodiment_wm/dualview_dit_formal/compare_newarms/gifs/(Drive 见 07 文件夹)。
 
+**[已完成] 44 帧长时长压测(用户要求 gif 加长后补测,MODE=eval HORIZON=44,seed0)**:
+| 臂 | 物体区 H44(vs H20) | agent 区 H44 |
+|---|---|---|
+| flow | 0.265/0.284(0.263/0.282,退化) | 0.305/0.323 |
+| **flowskel** | **0.193/0.227(0.194/0.229,零退化!)** | 0.214/0.252 |
+| flowskel3 | 0.198/0.234 | 0.220/0.260 |
+| flowwarp | 0.285/0.294(0.271/0.282,退化最多) | 0.329/0.343 |
+- **额外发现:骨架通道让长程渲染漂移基本消失**(44 帧与 20 帧持平),对基线差距拉大到 0.072/0.057;
+  解释:agent 位置被确定性骨架锚定,自回归误差不再通过 agent 区域累积。眼检(44 帧最后一帧)确认。
+- 44 帧 gif:outputs/cross_embodiment_wm/dualview_dit_formal/compare_newarms/gifs/
+  (Drive:iws_evals/2026-07-15_flow表示升级_骨架与warp/08_新臂对比gif_44帧长版)。
+- 骨架条件通道可视化(用户过目用,含闭合/低机位/人手边界情形):
+  outputs/cross_embodiment_wm/skel_channel_viz/skel_channel_cases.png;闭合夹爪时叉尖略开(FK 名义姿态,
+  已知 ~19px 尾部),待用户裁决是否用开度收拢端点。
+
 ## 5. 舍弃项与原因
 - **flowwarp(掩码像素搬运)**:数字平局(0.271 vs 0.263)+ 眼检不优 + ghost 伪影;搁置,复活条件见上。
 
