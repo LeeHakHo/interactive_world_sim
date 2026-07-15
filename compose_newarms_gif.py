@@ -10,7 +10,7 @@ from viz_combined import save_combined_gif, build_flow_cols
 
 ROOT = "outputs/cross_embodiment_wm/dualview_dit_formal"
 ARMS = ["flow", "flowskel", "flowskel3", "flowwarp"]
-K, H, NSEQ = 4, 20, 6
+K, H, NSEQ = 4, int(__import__("os").environ.get("HORIZON", "20")), 6
 OUT = f"{ROOT}/compare_newarms"; os.makedirs(f"{OUT}/gifs", exist_ok=True)
 
 z = np.load("outputs/flow_render_dataset_can_dual/clips_robot.npz")
