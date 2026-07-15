@@ -79,6 +79,45 @@ Output:
     skel2d_high (1800,24,4,2) f32, skel2d_low (1800,24,4,2) f32 [crop-norm, unclipped, NaN
     where the frame's hand wasn't detected], joint_names (4,) str
     = ["wrist","fingertip1","fingertip2","forearm_stub"].
+
+--- ISOMORPHIC V2 (env SKEL_V2=1, robot mode only) ---
+Motivation: make the robot skeleton topology structurally identical (same J=8, same "chain
+into a terminal 2-way spread" shape) to the human skeleton above, and make gripper aperture
+*geometrically* visible in the keypoints themselves (v1's carriage_left/right, per Concerns
+note 2, do NOT move with true grip state -- `grip` was only ever a side-channel for line
+width). V2 does not replace v1 (v1 stays in production, untouched); it is written to a
+SEPARATE file skel_sidecar_robot_v2.npz only when SKEL_V2=1 is set, and v1's own output path
+is not written to in that mode.
+
+Topology (8 points, isomorphic to human's wrist->fin1/fin2 + forearm_stub):
+  [link_1, link_2, link_3, link_4, link_5, link_6, fingertipL', fingertipR']
+  segments = [[0,1],[1,2],[2,3],[3,4],[4,5],[5,6],[5,7]] -- the same arm chain as v1 for
+  link_1..6, then link_6 spreads to the two fingertips (mirrors human wrist->fin1/fin2), and
+  the arm chain into link_6 mirrors the human forearm-stub bone. `ee_gripper_link` (v1's
+  9th/last point, the un-pulled-back nominal EE mount -- see v1 Concerns note 1) is DROPPED:
+  keeping it would add a second point converging on link_6 from a different direction (a
+  forward "V" the human topology does not have).
+
+Grip geometric closure (fixes v1 Concerns note 2): computed in 3D, BEFORE projection, using
+the SAME per-frame pinocchio FK carriage_left/right points as v1 (`fk_points()` unmodified)
+-- so this is still 100% derived from `joint`/`grip` (both already legal WM inputs in
+clips_robot.npz), current-frame only, no leakage. Let car_l, car_r = the two carriage 3D
+points, mid = their 3D midpoint, t = clip(grip / GRIP_MAX, 0, 1) (GRIP_MAX=0.04, the dataset's
+observed max, verified via clips_robot.npz['grip'].max() ~= 0.039996; grip=0 -> fully closed
+per the can-pipeline convention, e.g. grip~=0.029 = holding the can). Then:
+  fingertipL' = mid + (car_l - mid) * t
+  fingertipR' = mid + (car_r - mid) * t
+i.e. at t=0 (fully closed) both fingertips collapse onto the 3D midpoint; at t=1 (fully open,
+grip>=GRIP_MAX) they sit exactly at v1's nominal carriage_left/right. Both views are then
+projected from these adjusted 3D points with the identical calibration/crop recipe as v1
+(`project_batch` + `to_norm_batch`, same T_HIGH/K_HIGH/T_LOW/K_LOW/CROP_HIGH/CROP_LOW).
+
+Output (SKEL_V2=1 only):
+  outputs/flow_render_dataset_can_dual/skel_sidecar_robot_v2.npz
+    skel2d_high (2700,48,8,2) f32, skel2d_low (2700,48,8,2) f32 [crop-norm, unclipped],
+    joint_names (8,) str, segments (7,2) int32, grip (2700,48) f32 (verbatim copy, same as
+    v1, for any downstream consumer that still wants the raw scalar alongside the now-visible
+    geometric aperture).
 """
 import os
 import sys
@@ -155,6 +194,13 @@ ROBOT_SKEL = [f"follower_right_link_{i}" for i in range(1, 7)] + [
     "follower_right_ee_gripper_link"]
 ROBOT_SEGS = np.array([(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 8), (6, 8), (7, 8)], np.int32)
 
+# --- ISOMORPHIC V2 (see module docstring) ---
+SKEL_V2 = os.environ.get("SKEL_V2", "0") == "1"
+GRIP_MAX = 0.04  # dataset observed max (clips_robot.npz['grip'].max() ~= 0.039996)
+ROBOT_SKEL_V2 = [f"follower_right_link_{i}" for i in range(1, 7)] + [
+    "follower_right_fingertipL_closed", "follower_right_fingertipR_closed"]
+ROBOT_SEGS_V2 = np.array([(0, 1), (1, 2), (2, 3), (3, 4), (4, 5), (5, 6), (5, 7)], np.int32)
+
 
 def augment_robot(clips_path: str, out_path: str) -> None:
     import pinocchio as pin  # deferred: only robot mode needs the phantom env
@@ -182,14 +228,39 @@ def augment_robot(clips_path: str, out_path: str) -> None:
             P9[n, t] = fk_points(J[n, t, :6].astype(np.float64))
         if n % 300 == 0:
             print(f"  robot FK {n}/{N}", flush=True)
-    skel2d_high = to_norm_batch(project_batch(P9, T_HIGH, K_HIGH), CROP_HIGH).astype(np.float32)
-    skel2d_low = to_norm_batch(project_batch(P9, T_LOW, K_LOW), CROP_LOW).astype(np.float32)
+
+    if not SKEL_V2:
+        # v1 behavior, UNCHANGED.
+        skel2d_high = to_norm_batch(project_batch(P9, T_HIGH, K_HIGH), CROP_HIGH).astype(np.float32)
+        skel2d_low = to_norm_batch(project_batch(P9, T_LOW, K_LOW), CROP_LOW).astype(np.float32)
+        os.makedirs(OUTDIR, exist_ok=True)
+        np.savez(out_path, skel2d_high=skel2d_high, skel2d_low=skel2d_low,
+                 joint_names=np.array(ROBOT_SKEL), segments=ROBOT_SEGS,
+                 grip=GRIP.astype(np.float32))
+        print(f"saved {out_path}: skel2d_high finite {np.isfinite(skel2d_high).all(-1).mean()*100:.1f}%, "
+              f"skel2d_low finite {np.isfinite(skel2d_low).all(-1).mean()*100:.1f}%", flush=True)
+        return
+
+    # --- ISOMORPHIC V2: geometric grip closure in 3D, before projection ---
+    car_l = P9[:, :, 6, :]   # (N,L,3) carriage_left, same FK point as v1
+    car_r = P9[:, :, 7, :]   # (N,L,3) carriage_right
+    mid = 0.5 * (car_l + car_r)
+    t_close = np.clip(GRIP.astype(np.float64) / GRIP_MAX, 0.0, 1.0)[..., None]  # (N,L,1)
+    fin_l = mid + (car_l - mid) * t_close
+    fin_r = mid + (car_r - mid) * t_close
+    P8 = np.concatenate(
+        [P9[:, :, :6, :], fin_l[:, :, None, :], fin_r[:, :, None, :]], axis=2)  # (N,L,8,3)
+
+    skel2d_high_v2 = to_norm_batch(project_batch(P8, T_HIGH, K_HIGH), CROP_HIGH).astype(np.float32)
+    skel2d_low_v2 = to_norm_batch(project_batch(P8, T_LOW, K_LOW), CROP_LOW).astype(np.float32)
+    v2_path = out_path.replace("skel_sidecar_robot.npz", "skel_sidecar_robot_v2.npz")
+    assert v2_path != out_path, f"refusing to overwrite v1 output: {out_path}"
     os.makedirs(OUTDIR, exist_ok=True)
-    np.savez(out_path, skel2d_high=skel2d_high, skel2d_low=skel2d_low,
-             joint_names=np.array(ROBOT_SKEL), segments=ROBOT_SEGS,
+    np.savez(v2_path, skel2d_high=skel2d_high_v2, skel2d_low=skel2d_low_v2,
+             joint_names=np.array(ROBOT_SKEL_V2), segments=ROBOT_SEGS_V2,
              grip=GRIP.astype(np.float32))
-    print(f"saved {out_path}: skel2d_high finite {np.isfinite(skel2d_high).all(-1).mean()*100:.1f}%, "
-          f"skel2d_low finite {np.isfinite(skel2d_low).all(-1).mean()*100:.1f}%", flush=True)
+    print(f"saved {v2_path}: skel2d_high finite {np.isfinite(skel2d_high_v2).all(-1).mean()*100:.1f}%, "
+          f"skel2d_low finite {np.isfinite(skel2d_low_v2).all(-1).mean()*100:.1f}%", flush=True)
 
 
 # ---------------------------------------------------------------------------
