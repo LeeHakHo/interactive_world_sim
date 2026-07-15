@@ -239,6 +239,38 @@ def test_agent_lpips_audit_counts():
     assert n_valid == 2 and n_total == 4 and abs(mean - 0.5) < 1e-6
 
 
+def test_render_formal_pred_tr_flowskel_gate():
+    """e2e wiring: render_formal's pred_tr branch accepts mode='flowskel' (flow 3ch built from predicted
+    tracks + skeleton 4th channel from actions/sidecar) -> (2,H,128,128,3) finite; and still REJECTS modes
+    without a pred_tr path (eefsp). Heavy deps (VAE enc/dec, real skeleton sidecar, device) are swapped for
+    stubs -- this tests the conditioning wiring and the mode gate, not render quality."""
+    import numpy as np
+    import exp_scel_dualview_dit_formal as F
+    from exp_scel_latent_renderer import latent_ch
+    Cz = latent_ch()
+    saved = {k: getattr(F, k) for k in ("H", "device", "enc", "dec", "skel_cond_channel")}
+    try:
+        F.H = 2; F.device = "cpu"
+        F.enc = lambda x: torch.zeros(x.shape[0], Cz, 16, 16)
+        F.dec = lambda z: torch.zeros(z.shape[0], 3, 128, 128)
+        F.skel_cond_channel = lambda *a, **k: np.zeros((128, 128), np.float32)
+        L, P = 8, 5
+        rng = np.random.default_rng(0)
+        R = {"fr": [rng.integers(0, 255, (1, L, 128, 128, 3), dtype=np.uint8)] * 2,
+             "tr": [rng.random((1, L, P, 2)).astype(np.float32)] * 2,
+             "ef": [rng.random((1, L, 3, 2)).astype(np.float32)] * 2,
+             "vs": [np.ones((1, L, P), np.float32)] * 2}
+        torch.manual_seed(0)
+        m = F.DualViewDiTSkel(mode="flowskel", crossview=True, D=64, depth=2, heads=2).eval()
+        pred_tr = rng.random((2, 2, P, 2)).astype(np.float32)
+        out = F.render_formal(m, R, 0, "flowskel", pred_tr=pred_tr)
+        assert out.shape == (2, 2, 128, 128, 3) and np.isfinite(out).all()
+        with pytest.raises(AssertionError):
+            F.render_formal(m, R, 0, "eefsp", pred_tr=pred_tr)
+    finally:
+        for k, v in saved.items(): setattr(F, k, v)
+
+
 def test_iws_rollout_shape():
     from exp_dualview_iws_stage2 import rollout_iws, make_sched
     from interactive_world_sim.algorithms.latent_dynamics.models.cm_latent_dynamics import CMLatentDynamics

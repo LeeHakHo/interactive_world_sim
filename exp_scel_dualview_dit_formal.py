@@ -399,7 +399,9 @@ def train_formal(R, Hh, idx_r, idx_h, latR, latH, mode, crossview, seed, epochs)
 @torch.no_grad()
 def render_formal(m, R, si, mode, pred_tr=None):
     """render H 帧双视角. pred_tr=None: replay GT 条件; 否则 (2,H,P,2) 用 ② 预测 tracks 建 flow cond
-    (vis 用最后观测帧 K-1, 可部署口径). mode=='flowwarp': 每步 t=K+h 从 frame0 用 GT tracks(replay) 建 z_warp."""
+    (vis 用最后观测帧 K-1, 可部署口径). mode=='flowwarp': 每步 t=K+h 从 frame0 用 GT tracks(replay) 建 z_warp.
+    mode=='flowskel' + pred_tr: flow 3ch 从 ② 预测 tracks 建(与 flow 臂逐字节一致), 第4通道骨架照常从 SIDECAR
+    的关节/夹爪(动作/本体感知, 合法输入非预测)画 = 可部署口径, 不需要预测骨架."""
     fr01 = lambda a: torch.from_numpy(a.astype(np.float32).transpose(2, 0, 1)[None] / 255.0).to(device)
     z0 = torch.stack([enc(fr01(R["fr"][v][si, 0]))[0] for v in range(2)])[None]
     prev = z0.clone(); outs = [[], []]
@@ -411,9 +413,12 @@ def render_formal(m, R, si, mode, pred_tr=None):
         if pred_tr is None:
             cond, _ = build_conds_formal(R, si, t, mode)
         else:
-            assert mode == "flow"
+            assert mode in ("flow", "flowskel")
             cs = [flow_cond(R["tr"][v][si, 0], pred_tr[v][h], R["ef"][v][si, 0], R["ef"][v][si, t],
                             R["vs"][v][si, K - 1]) for v in range(2)]
+            if mode == "flowskel":                          # 4th ch from sidecar joints/grip at t (actions, not predictions)
+                cs = [np.concatenate([cs[v], skel_cond_channel("r", v, si, t, mode, R["ef"][v][si, t])[None]], 0)
+                      for v in range(2)]
             cond = np.stack(cs)
         cond = torch.from_numpy(cond[None].astype(np.float32)).to(device)
         if mode == "flowwarp":
@@ -551,7 +556,12 @@ def ade_px(pred, gt):
 
 def run_e2e():
     """M2: ② pred-flow 驱动 ③. 4 列 GT | GT-flow③(③天花板) | ②pred-flow③(端到端) | eef-FiLM③(naive).
-    ② = dualview_wm/wm_dual.pt (rollout_dual), 动作输入 = GT eef (replay actions, 允许)."""
+    ② = dualview_wm/wm_dual.pt (rollout_dual), 动作输入 = GT eef (replay actions, 允许).
+    + flowskel_cv1_s0 ckpt 存在时追加两列: skel-gtflow(flowskel 模型 GT tracks = 它的 replay 天花板) |
+    skel-e2e(同一 ② rollout 的 pred_tr 建 flow 3ch, 骨架第4通道照常从动作画, 可部署口径).
+    每列都算 obj_lpips_audit + agent_lpips_audit(agent 区从 robot 骨架 sidecar, 与 run_eval 同口径).
+    metrics 只追加 {c}_v{v}_lp(新列) / {c}_a{v}_lp(全列) / agent_det_rate_v{v}(数据侧,与列无关), 既有 key 不动;
+    summary.txt 出紧凑表(每列 obj/agent v0/v1)+② ADE 行."""
     from viz_combined import save_combined_gif, build_flow_cols
     import exp_scel_dualview_wm as DW
     import __main__ as _m                                   # wm_dual.pt 由 exp_scel_dualview_wm 作为 __main__ 保存
@@ -565,11 +575,17 @@ def run_e2e():
     wm = torch.load(WM_PT, map_location=device, weights_only=False).eval()
     mf = torch.load(f"{ROOT}/flow_cv1_s0/dvdit.pt", map_location=device, weights_only=False).eval()
     me = torch.load(f"{ROOT}/eeffilm_cv1_s0/dvdit.pt", map_location=device, weights_only=False).eval()
+    ms_p = f"{ROOT}/flowskel_cv1_s0/dvdit.pt"                                # optional flowskel arm (adopted replay winner)
+    ms = torch.load(ms_p, map_location=device, weights_only=False).eval() if os.path.exists(ms_p) else None
+    if ms is None: print(f"run_e2e: missing {ms_p}, skipping skel-gtflow/skel-e2e columns", flush=True)
     P = R["tr"][0].shape[2]
     outd = os.environ.get("E2E_DIR", f"{ROOT}/e2e"); os.makedirs(f"{outd}/gifs", exist_ok=True)   # 长 HORIZON 走独立目录, 不覆盖发布版 H=20
     from interactive_world_sim.algorithms.common.metrics.lpips import LearnedPerceptualImagePatchSimilarity
     lp = LearnedPerceptualImagePatchSimilarity(net_type="vgg", normalize=False).to(device).eval()
-    cols_lp = {c: {0: [], 1: []} for c in ["gtflow", "e2e", "eef"]}; ades = []
+    arms = ["gtflow", "e2e", "eef"] + (["skelgt", "skele2e"] if ms is not None else [])
+    cols_lp = {c: {0: [], 1: []} for c in arms}; cols_alp = {c: {0: [], 1: []} for c in arms}; ades = []
+    adet = {0: [0, 0], 1: [0, 0]}                                              # agent det-rate: data-side, column-independent
+    skR = _load_skel()["robot"]
     vname = {0: "high", 1: "low"}
     for gi, si in enumerate(chosen):
         trD = np.concatenate([R["tr"][0][si], np.nan_to_num(trB_raw[si], nan=0.5)], 1)[None]  # (1,L,2P,2)
@@ -582,27 +598,47 @@ def run_e2e():
         rr = {"gtflow": render_formal(mf, R, si, "flow"),
               "e2e": render_formal(mf, R, si, "flow", pred_tr=pred_tr),
               "eef": render_formal(me, R, si, "eeffilm")}
+        if ms is not None:
+            rr["skelgt"] = render_formal(ms, R, si, "flowskel")               # flowskel replay ceiling (GT tracks)
+            rr["skele2e"] = render_formal(ms, R, si, "flowskel", pred_tr=pred_tr)  # same ② rollout, deployable
         for v in range(2):
             gtf = R["fr"][v][si, K:K + H].astype(np.float32) / 255.0
             objm = np.stack([_fp(R["tr"][v][si, K + h]) for h in range(H)])
-            for c in rr:
+            skel_pts = skR["skel2d_high" if v == 0 else "skel2d_low"][si, K:K + H]
+            for ci, c in enumerate(rr):
                 lpv, _, _ = obj_lpips_audit(lp, rr[c][v].astype(np.float32), gtf, objm)
                 cols_lp[c][v].append(lpv)
+                alv, av, at = agent_lpips_audit(lp, rr[c][v].astype(np.float32), gtf, skel_pts)
+                cols_alp[c][v].append(alv)
+                if ci == 0: adet[v][0] += av; adet[v][1] += at                 # validity depends only on skel_pts -> count once
             if gi < 6:                                                                # gif 只出前 6 条固定 seq
                 gt = R["fr"][v][si, K:K + H].astype(np.uint8)
-                cols = np.stack([gt, u8(rr["gtflow"][v]), u8(rr["e2e"][v]), u8(rr["eef"][v])])
-                fc = build_flow_cols(gt, R["tr"][v][si, K:K + H], [None] * 4, R["ef"][v][si, K:K + H])
-                save_combined_gif(f"{outd}/gifs/seq{si}_cam{vname[v]}.gif", cols, fc,
-                                  [f"GT {vname[v]}", "GT-flow(③ceiling)", "②pred-flow(e2e)", "eef-FiLM(naive)"],
-                                  [None] * 4, K, caption=f"end-to-end ②→③ | cam_{vname[v]} | {VERSIONS[:60]}")
+                arm_cols = [gt, u8(rr["gtflow"][v]), u8(rr["e2e"][v]), u8(rr["eef"][v])]
+                labels = [f"GT {vname[v]}", "GT-flow(③ceiling)", "②pred-flow(e2e)", "eef-FiLM(naive)"]
+                if ms is not None:
+                    arm_cols += [u8(rr["skelgt"][v]), u8(rr["skele2e"][v])]
+                    labels += ["skel-gtflow(replay ceil)", "skel-e2e(②pred+skel)"]
+                cols = np.stack(arm_cols)
+                fc = build_flow_cols(gt, R["tr"][v][si, K:K + H], [None] * len(arm_cols), R["ef"][v][si, K:K + H])
+                save_combined_gif(f"{outd}/gifs/seq{si}_cam{vname[v]}.gif", cols, fc, labels,
+                                  [None] * len(arm_cols), K, caption=f"end-to-end ②→③ | cam_{vname[v]} | {VERSIONS[:60]}")
     a = np.array(ades)
     res = {f"{c}_v{v}_lp": float(np.nanmean(cols_lp[c][v])) for c in cols_lp for v in range(2)}
+    res.update({f"{c}_a{v}_lp": float(np.nanmean(cols_alp[c][v])) for c in cols_alp for v in range(2)})
+    res.update({f"agent_det_rate_v{v}": adet[v][0] / max(adet[v][1], 1) for v in range(2)})
     res.update({"ade_v0_px": float(a[:, 0].mean()), "ade_v1_px": float(a[:, 1].mean()), "n_eval": len(chosen)})
     json.dump(res, open(f"{outd}/metrics.json", "w"), indent=2)
+    NAMES = {"gtflow": "GT-flow (flow model, GT tracks = ceiling)", "e2e": "pred-flow e2e (flow model, 2-pred tracks)",
+             "eef": "eef-FiLM (naive action baseline)", "skelgt": "skel-gtflow (flowskel model, GT tracks = ceiling)",
+             "skele2e": "skel-e2e (flowskel, 2-pred tracks + action skel, deploy)"}
+    hdr = f"{'column':58s} {'obj v0':>7s} {'obj v1':>7s} {'agt v0':>7s} {'agt v1':>7s}"
+    rows = [f"{NAMES[c]:58s} {res[f'{c}_v0_lp']:7.3f} {res[f'{c}_v1_lp']:7.3f} "
+            f"{res[f'{c}_a0_lp']:7.3f} {res[f'{c}_a1_lp']:7.3f}" for c in arms]
     lines = [f"E2E ②→③ | {VERSIONS}",
              f"② ADE: cam_high {res['ade_v0_px']:.2f}px | cam_low {res['ade_v1_px']:.2f}px",
-             f"obj-LPIPS v0: GT-flow {res['gtflow_v0_lp']:.3f} | e2e {res['e2e_v0_lp']:.3f} | eef {res['eef_v0_lp']:.3f}",
-             f"obj-LPIPS v1: GT-flow {res['gtflow_v1_lp']:.3f} | e2e {res['e2e_v1_lp']:.3f} | eef {res['eef_v1_lp']:.3f}"]
+             "LPIPS (lower better), obj = object-region crop, agt = agent-region crop:",
+             hdr] + rows + [
+             f"agent det-rate: v0 {res['agent_det_rate_v0']:.2f} | v1 {res['agent_det_rate_v1']:.2f} | n_eval {res['n_eval']}"]
     open(f"{outd}/summary.txt", "w").write("\n".join(lines) + "\n"); print("\n".join(lines) + "\n=== DONE ===", flush=True)
 
 
