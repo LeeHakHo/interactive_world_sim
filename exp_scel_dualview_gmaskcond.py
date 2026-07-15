@@ -335,9 +335,8 @@ def e2e_g():
             fc = build_flow_cols(gt, gt_obj, [None, gt_obj, arms["A"][1][n][:, v*P:(v+1)*P], arms["B"][1][n][:, v*P:(v+1)*P]],
                                  R["ef"][v][si, DIT.K:DIT.K + H])
             save_combined_gif(f"{OUT}/gifs/seq{si}_cam{vname[v]}.gif", cols, fc,
-                              ["1 real video", "2 TRUE motion->render", "3 PRED motion (align_wm)", "4 PRED motion (dummy5)"],
-                              [None] * 4, DIT.K,
-                              caption=f"col2=renderer ceiling; col3/4=full pipeline (WM predicts motion) | cam_{vname[v]}")
+                              ["1 REAL", "2 CEILING", "3 PRED-A", "4 PRED-B"], [None] * 4, DIT.K,
+                              caption=f"2=render w/ TRUE motion | 3=WM align_wm pred | 4=WM dummy5 pred | cam_{vname[v]}")
         print(f"  seq{si} done", flush=True)
     mn = lambda k: float(np.nanmean(agg[k]))
     lines = [f"E2E sharp-III | III={os.environ['E2E_CKPT']} | (2)A={arms['A'][0]} B={arms['B'][0]} | n={len(chosen)}"]
