@@ -498,10 +498,10 @@ def run_reeval():
     okr = np.where(R["ok"])[0]; perm = np.random.default_rng(0).permutation(okr); ho = perm[:150]
     chosen = _eval_seqs_persisted(R, ho)
     m = torch.load(f"{OUT}/dvdit.pt", map_location=device, weights_only=False).eval()
-    res = run_eval(m, R, chosen, CONDM, out=None)
+    res = run_eval(m, R, chosen, CONDM, out=OUT)                        # 存渲染 npy 供对比 gif 复用
     res.update({"cond": CONDM, "crossview": int(CROSSVIEW), "mix": MIX, "seed": SEED,
                 "n_eval": len(chosen), "reeval": 1})
-    json.dump(res, open(f"{OUT}/metrics_reeval.json", "w"), indent=2)
+    json.dump(res, open(f"{OUT}/metrics_reeval_H{H}.json", "w"), indent=2)   # H 入文件名, 44帧压测不覆盖20帧
     print(json.dumps(res, indent=1), flush=True)
 
 
