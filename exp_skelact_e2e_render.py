@@ -53,13 +53,14 @@ def main():
     vname = {0: "high", 1: "low"}
     for si in chosen:
         trD = torch.from_numpy(trD_all[si:si + 1]).float().to(device)
-        rr = {}
+        rr = {}; pred_all = {}
         for d, lab, act in ARMS:
             efA, efB = W.load_action_tokens(act, "r", z, sk_r if act == "skel" else None)
             ea = torch.from_numpy(efA[si:si + 1]).float().to(device); eb = torch.from_numpy(efB[si:si + 1]).float().to(device)
             with torch.no_grad():
                 pr = W.rollout_dual(wms[d], trD, ea, eb, HR).cpu().numpy()[0]     # (HR,2P,2)
             pred_tr = np.stack([pr[:, :P], pr[:, P:]])                            # (2,HR,P,2)
+            pred_all[d] = pred_tr
             rr[d] = render_formal(ren, R, si, "flowskel", pred_tr=pred_tr)        # (2,HR,128,128,3)
         for v in range(2):
             gtf = R["fr"][v][si, K:K + HR].astype(np.float32) / 255.0
@@ -74,7 +75,9 @@ def main():
             gt = R["fr"][v][si, K:K + HR].astype(np.uint8)
             cols = np.stack([gt] + [u8(rr[d][v]) for d, _, _ in ARMS])
             labels = [f"GT {vname[v]}"] + [lab for _, lab, _ in ARMS]
-            fc = build_flow_cols(gt, R["tr"][v][si, K:K + HR], [None] * 5, R["ef"][v][si, K:K + HR])
+            # flow 行: GT 列只画绿(真值); 各臂列画红=该臂 ② 预测点 over 绿真值 -> 看 can 是否跟着动
+            col_preds = [None] + [pred_all[d][v] for d, _, _ in ARMS]
+            fc = build_flow_cols(gt, R["tr"][v][si, K:K + HR], col_preds, R["ef"][v][si, K:K + HR])
             save_combined_gif(f"{OUT}/gifs/seq{si}_cam{vname[v]}.gif", cols, fc, labels, [None] * 5, K,
                               caption=f"② human-helps -> flowskel ③ ({REN}) | H={HR} | cam_{vname[v]}")
         print(f"seq{si} done", flush=True)
