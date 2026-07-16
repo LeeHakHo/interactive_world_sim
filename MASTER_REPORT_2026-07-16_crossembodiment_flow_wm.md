@@ -447,13 +447,22 @@ slot 2 = 指尖/夹爪指 2
 `outputs/cross_embodiment_wm/{combine_action,dualview_comb,dualview_e2e,dualview_gmask,data_equiv}/`
 每目录含 summary.txt / metrics.json / res.json / render_cache / gifs。
 
-## 12.6 Google Drive（gif 主交付）
-- `iws_evals/2026-07-15_gmask_agent_cond/`：**定版 e2e H=20 + H=44 四列 gif（可读标题）** ← 最新以此为准
-- `iws_evals/2026-07-13_combine_alignwm_e2e/`：帕累托图、汇率曲线、眼检图
-- `iws_evals/2026-07-13_gmask_agent_cond/`：治糊三列消融 gif
-- **gif 列说明表（务必附）**：`1 REAL`=真实视频；`2 CEILING`=真实运动→③（渲染器天花板）；
-  `3 PRED-A`=②align_wm 预测运动→③（完整管线）；`4 PRED-B`=②dummy5 预测运动→③。
-  Flow 行点：绿=物体真实位置、红=模型预测位置、黄=机械臂动作输入。
+## 12.6 Google Drive（★单一完整交付包，用于异地下载分析）
+**`iws_evals/2026-07-16_MASTER_交付包/`** —— 本报告引用的全部产物一处齐全（75 文件，216 MiB）：
+- `00_报告/` — 本报告 + SESSION_LOG + COMBINE_ACTION_LOG（markdown）
+- `01_端到端gif/` — 定版四列端到端 gif，H20（20步）+ H44（44步长程），可读标题
+- `02_治糊消融gif/` — 剪影开关对比 + warp 开关对比（两个消融）
+- `03_图表/` — 机制Pareto图 / 数据汇率曲线(v3+can) / metric审计 / 腕点bug核验 / gif标题示例
+- `04_数字表_summary/` — 所有 summary 汇总 txt + 逐 seed 原始 res.json（供异地重算显著性）
+- `05_论文PDF/` — LaST-HD / EgoWAM / OSCAR 全文
+- `README_先读这个.md` — 目录结构 + gif 列图例（下载后先读）
+
+**gif 列说明表**：`1 REAL`=真实视频；`2 CEILING`=真实运动→③（渲染器天花板）；
+`3 PRED-A`=②align_wm 预测运动→③（完整管线）；`4 PRED-B`=②dummy5 预测运动→③。
+Flow 行点：绿=物体真实位置、红=模型预测位置、黄=机械臂动作输入。
+
+（历史散包，已被上面单一包覆盖，可忽略）：`2026-07-15_gmask_agent_cond/`、
+`2026-07-13_combine_alignwm_e2e/`、`2026-07-13_gmask_agent_cond/`。
 
 ## 12.7 论文 PDF（仓库根）
 `2606.23685.pdf`（LaST-HD）、`2607.08436.pdf`（EgoWAM）、`2606.04463v2.pdf`（OSCAR）；
