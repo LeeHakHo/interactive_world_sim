@@ -14,6 +14,8 @@ _m.DualLWC = W.DualLWC                                # skelact ckpt 由 wm 作 
 import exp_scel_dualview_dit_formal as F
 from exp_scel_dualview_dit_formal import (render_formal, obj_lpips_audit, agent_lpips_audit,
                                           load_dual, _fp, u8, K, H, ROOT, device)
+for _c in ("DualViewDiTSkel", "DualViewDiTFormal", "DualViewDiTWarp"):   # 渲染器 ckpt 由 formal 作 __main__ 保存
+    if hasattr(F, _c): setattr(_m, _c, getattr(F, _c))
 from viz_combined import save_combined_gif, build_flow_cols
 
 HR = int(os.environ.get("HORIZON", "44"))
