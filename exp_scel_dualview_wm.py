@@ -55,8 +55,10 @@ ACTION = os.environ.get("ACTION", "dummy5")                   # dummy5 (default,
 MIX = os.environ.get("MIX", "r")                               # r (default, robot-only) | rh (human co-train)
 NROB = os.environ.get("NROB", "")                               # "" = full robot pool | int = robot-scarce N
 _NROB_TAG = NROB if NROB else "all"
-_DEFAULT_OUT = ("outputs/cross_embodiment_wm/dualview_wm" if (ACTION == "dummy5" and MIX == "r" and not NROB)
-                else f"outputs/cross_embodiment_wm/dualview_wm_skelact/{ACTION}_{MIX}_n{_NROB_TAG}")
+SEED = int(os.environ.get("SEED", "0"))                         # 训练种子; seed=0 保持原路径(向后兼容)
+_SEED_TAG = "" if SEED == 0 else f"_s{SEED}"
+_DEFAULT_OUT = ("outputs/cross_embodiment_wm/dualview_wm" if (ACTION == "dummy5" and MIX == "r" and not NROB and SEED == 0)
+                else f"outputs/cross_embodiment_wm/dualview_wm_skelact/{ACTION}_{MIX}_n{_NROB_TAG}{_SEED_TAG}")
 OUT = os.environ.get("OUT_DIR", _DEFAULT_OUT)
 os.makedirs(OUT, exist_ok=True)
 H = 40; HELDOUT = 150; IMG = 128; VEL_HALF = 0.06
@@ -83,6 +85,85 @@ def dummy5(eef3):
 # skel_sidecar_human.npz's verbatim [wrist, fingertip1, fingertip2, forearm_stub] (idx 0..3, used as-is).
 SKEL_ROBOT_IDX = [5, 6, 7, 4]
 
+# --- skel-v3: 尺度不变的结构表示 (2026-07-19) ---
+# 动机: v2 的"同构"只对齐了拓扑(槽位配对), 几何上三项失配, 已量化确证:
+#   (a) 两指对称比  robot 1.04 [1.00,1.11] vs human 1.27 [1.18,1.40]  分布几乎不重叠
+#       -> 模型光靠"两指是否等长"就能区分域, 与"两域落同一空间"的目标相反
+#   (b) 槽位3        human 腕->前臂根长度恒为 19.2px (stub_2d 写死 FOREARM_STUB_D),
+#       robot link_5 是真实连杆 8px 且随姿态 6-10.6px 变化 -> 长度维度无跨域信息
+#   (c) 整体量纲     指尖间距中位 robot 9.3px vs human 15.8px (~1.7x)
+# v3 的做法: 只保留跨域可比的量, 丢掉本来就不可比的量. token 数与维度不变 (4x2),
+# 模型结构无需改动.
+#   t0 = 腕绝对位置        (保留! 定位精度必需 —— 丢绝对定位会输, 见 velocity_action 教训)
+#   t1 = 手轴单位向量      腕->指尖中点, 归一化 -> 消 (c)
+#   t2 = 前臂单位向量      只留方向丢长度       -> 消 (b)
+#   t3 = (归一化开合度, 归一化手尺度)          -> 消 (a), 不再暴露两指是否等长
+# 无泄漏: 全部由当前帧的 joints/eef/手部关键点导出, 不碰未来帧.
+# 常数 = 各域各视角的训练数据分位数(scratchpad/calc_const.py 算出, 域内动作统计, 不涉未来帧).
+SKELV3_GAP = {("r", 0): (0.00006, 0.10143), ("r", 1): (0.00005, 0.09592),      # 指尖间距 (p05,p95)
+              ("h", 0): (0.06055, 0.19641), ("h", 1): (0.03752, 0.21329)}
+SKELV3_SCALE = {("r", 0): 0.22421, ("r", 1): 0.23576,                          # 手尺度 p95
+                ("h", 0): 0.28508, ("h", 1): 0.23231}
+
+
+def skelv3_tokens(P, dom, view):
+    """(N,L,4,2) 原始骨架点 [腕,指尖A,指尖B,前臂根] -> (N,L,4,2) 尺度不变结构 token."""
+    w, f1, f2, fa = P[..., 0, :], P[..., 1, :], P[..., 2, :], P[..., 3, :]
+    axis = (f1 + f2) / 2.0 - w                                        # 腕 -> 指尖中点
+    an = np.linalg.norm(axis, axis=-1, keepdims=True)
+    axis_u = axis / np.maximum(an, 1e-6)
+    fv = fa - w
+    fore_u = fv / np.maximum(np.linalg.norm(fv, axis=-1, keepdims=True), 1e-6)
+    gap = np.linalg.norm(f1 - f2, axis=-1)
+    g0, g1 = SKELV3_GAP[(dom, view)]
+    grip = np.clip((gap - g0) / max(g1 - g0, 1e-6), 0.0, 1.0)          # 开合度 [0,1], 两域同尺度
+    scale = np.clip(an[..., 0] / SKELV3_SCALE[(dom, view)], 0.0, 2.0)  # 手尺度, 各域按自身 p95 归一
+    t3 = np.stack([grip, scale], -1)
+    return np.stack([w, axis_u, fore_u, t3], 2).astype(np.float32)
+
+
+# --- ACTION=raster: OSCAR 式局部光栅图 + 绝对位置向量 (2026-07-19) ---
+# 设计依据: OSCAR(2606.04463v2 §3.2) 把两域各自的完整运动链光栅化成同格式线画图,
+# 格式统一在**像素空间**而非向量槽位, 因此**点数不必相同** —— 解除了 skel-v2 被迫
+# "robot 9 关节 / human 21 关节削成 4 点强行配对"的约束(该配对已量化证明失败)。
+# 我们与 OSCAR 的关键差异: 他们的相机看得到整个机器人, 我们的 crop 只框工作区,
+# robot 的 link_1/2/3 画内率 0%、链包围盒 1.12 幅 vs human 手 0.23 幅(差 5x)。
+# 故改为 **agent-centric 局部光栅化**(末端为中心, 半径 0.30): robot 基座自动出窗被排除,
+# 窗口内 robot 5 关节 / human 21 关节, 尺度可比(白像素占比 0.048 vs 0.068, 原为 5x 差)。
+# 绝对定位不靠图, 由单独的末端位置向量提供(OSCAR 证明绝对坐标不能丢: 他们的
+# frame-to-frame delta baseline 大幅落后 PSNR 19.22 vs 23.48)。
+# 打包: (N,L,513,2) = [末端位置(1,2)] + [32x32 光栅图 reshape(512,2)],
+# 这样完全复用现有的 [:, h:h+K+F] 窗口索引与末帧填充逻辑, 主训练循环零改动。
+RASTER_SIZE = 32
+
+
+def load_raster_action(dom, z, ras):
+    """-> (N,L,1+512,2) per view. [:,:,0]=末端绝对位置, [:,:,1:]=局部光栅图."""
+    out = []
+    for view, key in ((0, "raster_v0"), (1, "raster_v1")):
+        R = ras[key].astype(np.float32) / 255.0                    # (N,L,S,S)
+        N, L = R.shape[:2]
+        # 末端绝对位置: robot=link_6(eef 的 wrist 槽), human=wrist —— 两域都取 z['eef'] 的第 0 点
+        e = z["eef"] if view == 0 else z["eef_low"]
+        pos = np.nan_to_num(e.astype(np.float32)[:, :, 0:1], nan=0.5)   # (N,L,1,2)
+        out.append(np.concatenate([pos, R.reshape(N, L, -1, 2)], 2))
+    return out[0], out[1]
+
+
+class RasterAct(nn.Module):
+    """(B, 2*Lw, S, S) 双视角光栅图栈 -> (B, Dm). 时间维当通道, 与原 Linear 把 Lw 展平同构."""
+
+    def __init__(s, in_ch, Dm):
+        super().__init__()
+        s.net = nn.Sequential(
+            nn.Conv2d(in_ch, 64, 3, 2, 1), nn.GroupNorm(8, 64), nn.SiLU(),      # 32->16
+            nn.Conv2d(64, 128, 3, 2, 1), nn.GroupNorm(8, 128), nn.SiLU(),       # 16->8
+            nn.Conv2d(128, 128, 3, 2, 1), nn.GroupNorm(8, 128), nn.SiLU(),      # 8->4
+            nn.AdaptiveAvgPool2d(1), nn.Flatten(), nn.Linear(128, Dm))
+
+    def forward(s, x):
+        return s.net(x)
+
 
 def load_action_tokens(mode, dom, z, sk=None):
     """Per-view raw action-point arrays (N,L,n_raw,2), windowed downstream exactly like the original
@@ -98,10 +179,16 @@ def load_action_tokens(mode, dom, z, sk=None):
         efA = z["eef"].astype(np.float32)
         efB = np.nan_to_num(z["eef_low"].astype(np.float32), nan=0.5)
         return efA, efB
-    assert sk is not None, "ACTION=skel requires the skeleton sidecar npz"
+    if mode == "raster":                                    # OSCAR 式局部光栅图, 见上方注释
+        return load_raster_action(dom, z, sk)               # sk 此处传 raster_sidecar_*.npz
+    assert sk is not None, "ACTION=skel/skelv3 requires the skeleton sidecar npz"
     a, b = sk["skel2d_high"], sk["skel2d_low"]
     if dom == "r":
         a, b = a[:, :, SKEL_ROBOT_IDX], b[:, :, SKEL_ROBOT_IDX]
+    if mode == "skelv3":                                    # 尺度不变结构表示, 见上方注释
+        a = skelv3_tokens(np.nan_to_num(a.astype(np.float32), nan=0.5), dom, 0)
+        b = skelv3_tokens(np.nan_to_num(b.astype(np.float32), nan=0.5), dom, 1)
+        return a, b
     efA = np.nan_to_num(a.astype(np.float32), nan=0.5)
     efB = np.nan_to_num(b.astype(np.float32), nan=0.5)
     return efA, efB
@@ -115,6 +202,9 @@ class DualLWC(FlowWM_LWC):
         s.n_tok = 5 if action == "dummy5" else 4                # dummy5: 3->5 virtual pts | skel: 4 tokens as-is
         s.view_emb = nn.Parameter(torch.zeros(2, s.Dm))
         s.act = nn.Linear((K + F) * s.n_tok * 2 * 2, s.Dm)      # action tokens x 2 views
+        if action == "raster":                                   # OSCAR 式: 光栅图(CNN) + 末端位置(Linear)
+            s.act_ras = RasterAct(2 * (K + F), s.Dm)             # 双视角 x Lw 帧当通道
+            s.act_pos = nn.Linear((K + F) * 2 * 2, s.Dm)         # 双视角末端位置(相对物体质心)
 
     def _act_pts(s, eef):
         """eef (B,Lw,n_raw,2) -> (B,Lw,n_tok,2) action tokens. dummy5: DexWM virtual constellation.
@@ -131,8 +221,25 @@ class DualLWC(FlowWM_LWC):
                                s.view_emb[1].expand(B, s.P1, s.Dm)], 1)
         oc_a = anchor[:, :s.P1].mean(1, keepdim=True)          # per-view object centroid
         oc_b = anchor[:, s.P1:].mean(1, keepdim=True)
-        d5a = s._act_pts(eef_a) - oc_a[:, :, None]
-        d5b = s._act_pts(eef_b) - oc_b[:, :, None]
+        # skelv3: 只有 t0(腕绝对位置) 是位置量, 该减物体质心变成相对坐标;
+        # t1/t2 是单位向量、t3 是标量对(开合度,尺度) —— 减质心会破坏它们的语义, 保持原样.
+        if getattr(s, "action", "dummy5") == "raster":
+            S_ = RASTER_SIZE
+            pa = eef_a[:, :, 0] - oc_a; pb = eef_b[:, :, 0] - oc_b          # (B,Lw,2) 末端相对物体
+            ra = eef_a[:, :, 1:].reshape(B, -1, S_, S_)                     # (B,Lw,S,S) 光栅图
+            rb = eef_b[:, :, 1:].reshape(B, -1, S_, S_)
+            act = (s.act_pos(torch.cat([pa.reshape(B, -1), pb.reshape(B, -1)], -1))
+                   + s.act_ras(torch.cat([ra, rb], 1)))[:, None]
+            x = s.tf(torch.cat([obj, act], 1))[:, :P2]
+            logits = s.head(x).reshape(B, P2, F, s.W * s.W)
+            return logits, anchor
+        if getattr(s, "action", "dummy5") == "skelv3":
+            d5a = s._act_pts(eef_a).clone(); d5b = s._act_pts(eef_b).clone()
+            d5a[:, :, 0] = d5a[:, :, 0] - oc_a
+            d5b[:, :, 0] = d5b[:, :, 0] - oc_b
+        else:
+            d5a = s._act_pts(eef_a) - oc_a[:, :, None]
+            d5b = s._act_pts(eef_b) - oc_b[:, :, None]
         act = s.act(torch.cat([d5a.reshape(B, -1), d5b.reshape(B, -1)], -1))[:, None]
         x = s.tf(torch.cat([obj, act], 1))[:, :P2]
         logits = s.head(x).reshape(B, P2, F, s.W * s.W)
@@ -257,7 +364,9 @@ def subsample_robot_pool(pool, nrob):
     n = int(nrob)
     if n >= len(pool):
         return pool
-    return np.random.default_rng(0).choice(pool, size=n, replace=False)
+    # rng(SEED): 同一 seed 下所有 arm 共享同一子集(控制变量), 换 seed 才换"挑哪 N 条"
+    # (稀缺协议下子集选择本身是主要方差来源). SEED=0 时与原 rng(0) 行为完全一致.
+    return np.random.default_rng(SEED).choice(pool, size=n, replace=False)
 
 
 def split_okfirst(ok, heldout=HELDOUT):
@@ -282,7 +391,8 @@ def main():
     vsD = np.concatenate([vsA, vsB], 2)
 
     ds_dir = os.path.dirname(DS)
-    sk_r = np.load(f"{ds_dir}/skel_sidecar_robot_v2.npz") if ACTION == "skel" else None
+    sk_r = (np.load(f"{ds_dir}/raster_sidecar_robot.npz") if ACTION == "raster"
+            else np.load(f"{ds_dir}/skel_sidecar_robot_v2.npz") if ACTION in ("skel", "skelv3") else None)
     efA, efB = load_action_tokens(ACTION, "r", z, sk_r)
 
     print(f"split={SPLIT} action={ACTION} mix={MIX} nrob={NROB or 'all'}", flush=True)
@@ -305,7 +415,8 @@ def main():
         vsAh = zh["vis"].astype(np.float32); vsBh = zh["vis_low"].astype(np.float32)
         trDh = np.concatenate([trAh, np.nan_to_num(trBh, nan=0.5)], 2)
         vsDh = np.concatenate([vsAh, vsBh], 2)
-        sk_h = np.load(f"{ds_dir}/skel_sidecar_human.npz") if ACTION == "skel" else None
+        sk_h = (np.load(f"{ds_dir}/raster_sidecar_human.npz") if ACTION == "raster"
+                else np.load(f"{ds_dir}/skel_sidecar_human.npz") if ACTION in ("skel", "skelv3") else None)
         efAh, efBh = load_action_tokens(ACTION, "h", zh, sk_h)
         idxh_np = np.where(okh)[0]
         if SMOKE: idxh_np = idxh_np[:200]
@@ -313,7 +424,7 @@ def main():
         n_human = len(idxh)
         print(f"human co-train clips: {n_human}/{len(okh)} (L={trDh.shape[1]})", flush=True)
 
-    m = train_dual(trD, vsD, efA, efB, torch.from_numpy(pool), action=ACTION,
+    m = train_dual(trD, vsD, efA, efB, torch.from_numpy(pool), action=ACTION, seed=SEED,
                    trDh=trDh, vsDh=vsDh, efAh=efAh, efBh=efBh, idxh=idxh)
     torch.save(m, f"{OUT}/wm_dual.pt")
 
