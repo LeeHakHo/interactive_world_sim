@@ -5,7 +5,7 @@ import numpy as np
 from augment_clips_fullchain import rasterize_local
 
 DS = "outputs/flow_render_dataset_can_dual"
-SIZE = 32
+SIZE = 64
 
 for dom, src, out in (("r", "chain_sidecar_robot", "raster_sidecar_robot"),
                       ("h", "chain_sidecar_human", "raster_sidecar_human")):

@@ -134,19 +134,36 @@ def skelv3_tokens(P, dom, view):
 # frame-to-frame delta baseline 大幅落后 PSNR 19.22 vs 23.48)。
 # 打包: (N,L,513,2) = [末端位置(1,2)] + [32x32 光栅图 reshape(512,2)],
 # 这样完全复用现有的 [:, h:h+K+F] 窗口索引与末帧填充逻辑, 主训练循环零改动。
-RASTER_SIZE = 32
+RASTER_SIZE = 64
 
 
-def load_raster_action(dom, z, ras):
-    """-> (N,L,1+512,2) per view. [:,:,0]=末端绝对位置, [:,:,1:]=局部光栅图."""
+def load_raster_action(dom, z, ras, with_grip=False):
+    """-> (N,L, 1[+1]+S*S/2, 2) per view.
+    [:,:,0]=末端绝对位置; with_grip 时 [:,:,1]=(归一化抓握程度,0); 其余=局部光栅图。
+
+    with_grip(ACTION=rasterg, 2026-07-20): 诊断证明 grip 在光栅图里弱不是 2D 投影的锅
+    (两域到相机深度 0.68 vs 0.66m 几乎相同, 投影比 0.27px/mm 相同), 而是 robot 夹爪
+    3D 开合(28mm)本就只有 human(60mm≈罐径)的一半 —— 取点几何(URDF fingertip link vs
+    MANO 指尖)+ 机械尺度决定。两域"抓握程度"(各自从张到合)是相近动作, 差的是绝对尺度。
+    故显式补一个**归一化抓握程度**标量: 2D 指尖间距按各域各视角的 p05-p95 映射到 [0,1]
+    (复用 SKELV3_GAP 常量), 抓住罐子时两域 ≈ 同一值。不动位置(skelv3 归一化位置丢精度已判死)。
+    """
     out = []
     for view, key in ((0, "raster_v0"), (1, "raster_v1")):
         R = ras[key].astype(np.float32) / 255.0                    # (N,L,S,S)
         N, L = R.shape[:2]
-        # 末端绝对位置: robot=link_6(eef 的 wrist 槽), human=wrist —— 两域都取 z['eef'] 的第 0 点
         e = z["eef"] if view == 0 else z["eef_low"]
-        pos = np.nan_to_num(e.astype(np.float32)[:, :, 0:1], nan=0.5)   # (N,L,1,2)
-        out.append(np.concatenate([pos, R.reshape(N, L, -1, 2)], 2))
+        e = np.nan_to_num(e.astype(np.float32), nan=0.5)
+        pos = e[:, :, 0:1]                                          # (N,L,1,2) 末端绝对位置
+        parts = [pos]
+        if with_grip:
+            gap = np.linalg.norm(e[:, :, 1] - e[:, :, 2], axis=-1)  # (N,L) 2D 指尖间距
+            g0, g1 = SKELV3_GAP[(dom, view)]
+            grip = np.clip((gap - g0) / max(g1 - g0, 1e-6), 0.0, 1.0)
+            gtok = np.stack([grip, np.zeros_like(grip)], -1)[:, :, None]   # (N,L,1,2)
+            parts.append(gtok)
+        parts.append(R.reshape(N, L, -1, 2))
+        out.append(np.concatenate(parts, 2))
     return out[0], out[1]
 
 
@@ -179,8 +196,8 @@ def load_action_tokens(mode, dom, z, sk=None):
         efA = z["eef"].astype(np.float32)
         efB = np.nan_to_num(z["eef_low"].astype(np.float32), nan=0.5)
         return efA, efB
-    if mode == "raster":                                    # OSCAR 式局部光栅图, 见上方注释
-        return load_raster_action(dom, z, sk)               # sk 此处传 raster_sidecar_*.npz
+    if mode in ("raster", "rasterg"):                       # OSCAR 式局部光栅图 (rasterg 加归一化 grip 标量)
+        return load_raster_action(dom, z, sk, with_grip=(mode == "rasterg"))
     assert sk is not None, "ACTION=skel/skelv3 requires the skeleton sidecar npz"
     a, b = sk["skel2d_high"], sk["skel2d_low"]
     if dom == "r":
@@ -202,9 +219,10 @@ class DualLWC(FlowWM_LWC):
         s.n_tok = 5 if action == "dummy5" else 4                # dummy5: 3->5 virtual pts | skel: 4 tokens as-is
         s.view_emb = nn.Parameter(torch.zeros(2, s.Dm))
         s.act = nn.Linear((K + F) * s.n_tok * 2 * 2, s.Dm)      # action tokens x 2 views
-        if action == "raster":                                   # OSCAR 式: 光栅图(CNN) + 末端位置(Linear)
+        if action in ("raster", "rasterg"):                      # OSCAR 式: 光栅图(CNN) + 末端位置(+grip)(Linear)
             s.act_ras = RasterAct(2 * (K + F), s.Dm)             # 双视角 x Lw 帧当通道
-            s.act_pos = nn.Linear((K + F) * 2 * 2, s.Dm)         # 双视角末端位置(相对物体质心)
+            _posdim = (K + F) * 2 * (3 if action == "rasterg" else 2)   # rasterg: 每视角每帧 (x,y,grip)
+            s.act_pos = nn.Linear(_posdim, s.Dm)                 # 双视角末端位置(+归一化 grip)
 
     def _act_pts(s, eef):
         """eef (B,Lw,n_raw,2) -> (B,Lw,n_tok,2) action tokens. dummy5: DexWM virtual constellation.
@@ -223,13 +241,19 @@ class DualLWC(FlowWM_LWC):
         oc_b = anchor[:, s.P1:].mean(1, keepdim=True)
         # skelv3: 只有 t0(腕绝对位置) 是位置量, 该减物体质心变成相对坐标;
         # t1/t2 是单位向量、t3 是标量对(开合度,尺度) —— 减质心会破坏它们的语义, 保持原样.
-        if getattr(s, "action", "dummy5") == "raster":
+        if getattr(s, "action", "dummy5") in ("raster", "rasterg"):
             S_ = RASTER_SIZE
+            g = (s.action == "rasterg"); off = 2 if g else 1               # rasterg 多一个 grip token
             pa = eef_a[:, :, 0] - oc_a; pb = eef_b[:, :, 0] - oc_b          # (B,Lw,2) 末端相对物体
-            ra = eef_a[:, :, 1:].reshape(B, -1, S_, S_)                     # (B,Lw,S,S) 光栅图
-            rb = eef_b[:, :, 1:].reshape(B, -1, S_, S_)
-            act = (s.act_pos(torch.cat([pa.reshape(B, -1), pb.reshape(B, -1)], -1))
-                   + s.act_ras(torch.cat([ra, rb], 1)))[:, None]
+            ra = eef_a[:, :, off:].reshape(B, -1, S_, S_)                   # (B,Lw,S,S) 光栅图
+            rb = eef_b[:, :, off:].reshape(B, -1, S_, S_)
+            if g:                                                          # 末端位置 + 归一化 grip 标量
+                ga = eef_a[:, :, 1, 0:1]; gb = eef_b[:, :, 1, 0:1]          # (B,Lw,1)
+                pos_in = torch.cat([pa.reshape(B, -1), ga.reshape(B, -1),
+                                    pb.reshape(B, -1), gb.reshape(B, -1)], -1)
+            else:
+                pos_in = torch.cat([pa.reshape(B, -1), pb.reshape(B, -1)], -1)
+            act = (s.act_pos(pos_in) + s.act_ras(torch.cat([ra, rb], 1)))[:, None]
             x = s.tf(torch.cat([obj, act], 1))[:, :P2]
             logits = s.head(x).reshape(B, P2, F, s.W * s.W)
             return logits, anchor
@@ -391,7 +415,7 @@ def main():
     vsD = np.concatenate([vsA, vsB], 2)
 
     ds_dir = os.path.dirname(DS)
-    sk_r = (np.load(f"{ds_dir}/raster_sidecar_robot.npz") if ACTION == "raster"
+    sk_r = (np.load(f"{ds_dir}/raster_sidecar_robot.npz") if ACTION in ("raster", "rasterg")
             else np.load(f"{ds_dir}/skel_sidecar_robot_v2.npz") if ACTION in ("skel", "skelv3") else None)
     efA, efB = load_action_tokens(ACTION, "r", z, sk_r)
 
@@ -415,7 +439,7 @@ def main():
         vsAh = zh["vis"].astype(np.float32); vsBh = zh["vis_low"].astype(np.float32)
         trDh = np.concatenate([trAh, np.nan_to_num(trBh, nan=0.5)], 2)
         vsDh = np.concatenate([vsAh, vsBh], 2)
-        sk_h = (np.load(f"{ds_dir}/raster_sidecar_human.npz") if ACTION == "raster"
+        sk_h = (np.load(f"{ds_dir}/raster_sidecar_human.npz") if ACTION in ("raster", "rasterg")
                 else np.load(f"{ds_dir}/skel_sidecar_human.npz") if ACTION in ("skel", "skelv3") else None)
         efAh, efBh = load_action_tokens(ACTION, "h", zh, sk_h)
         idxh_np = np.where(okh)[0]

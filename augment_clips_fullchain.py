@@ -84,26 +84,36 @@ CHAIN_CENTER = {"r": 5, "h": 0}          # robot=link_6, human=wrist
 LOCAL_R = 0.30                            # 窗口半径, crop-norm
 
 
-def rasterize_local(pts, segments, dom, size=32, r=LOCAL_R, lw=1, dot=1):
+def rasterize_local(pts, segments, dom, size=64, r=LOCAL_R, lw=2, dot_r=1.3):
     """(...,J,2) crop-norm 关节 -> (...,size,size) 以末端为中心的局部线画图。
-    窗口 = 末端 ± r, 映射到 [0,size)。窗口外的关节被裁掉(robot 基座即由此排除)。"""
+    窗口 = 末端 ± r, 映射到 [0,size)。窗口外的关节被裁掉(robot 基座即由此排除)。
+
+    质量(2026-07-20 用户指出 32px 版太糙):
+    - 抗锯齿 LINE_AA + 亚像素定位(SHIFT=4, 1/16 像素)-> 线/点平滑, 不再是阶梯
+    - 点用抗锯齿实心圆(旧版 cv2.circle(半径1,实心) 在整数坐标下退化成"加号/十字")
+    - size 64(旧 32): human 21 关节挤在手掌区, 32px 下每关节<1.5px 糊成一坨;
+      grip=两指尖间距, robot 开合约 10px, 64px 下映射到 ~11px 可辨(32px 下仅 ~5px)
+    """
     import cv2
+    SHIFT = 4; SC = 1 << SHIFT
     ctr = CHAIN_CENTER[dom]
     flat = pts.reshape(-1, pts.shape[-2], 2)
     out = np.zeros((len(flat), size, size), np.float32)
+    dot = max(int(round(dot_r * SC)), 1)
     for i, P in enumerate(flat):
         c = P[ctr]
         if not np.isfinite(c).all():
             continue
         uv = (P - c + r) / (2 * r) * size                      # 局部归一化 -> 像素
-        keep = np.isfinite(uv).all(-1) & (uv > -size).all(-1) & (uv < 2 * size).all(-1)
+        keep = np.isfinite(uv).all(-1) & (uv > -1).all(-1) & (uv < size + 1).all(-1)
+        pix = np.round(uv * SC).astype(np.int64)               # 亚像素定点
         img = out[i]
         for a, b in segments:
             if keep[a] and keep[b]:
-                cv2.line(img, tuple(np.int32(uv[a])), tuple(np.int32(uv[b])), 1.0, lw)
-        for j, p in enumerate(uv):
+                cv2.line(img, tuple(pix[a]), tuple(pix[b]), 1.0, lw, cv2.LINE_AA, SHIFT)
+        for j in range(len(pix)):
             if keep[j]:
-                cv2.circle(img, tuple(np.int32(p)), dot, 1.0, -1)
+                cv2.circle(img, tuple(pix[j]), dot, 1.0, -1, cv2.LINE_AA, SHIFT)
     return out.reshape(*pts.shape[:-2], size, size)
 
 
