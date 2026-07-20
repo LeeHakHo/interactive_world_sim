@@ -816,3 +816,28 @@ raster/rasterg 的 Δ 更大是"基线烂"假象(同 skel 陷阱), rh 绝对精�
 5 列(dummy5/skel-v2/skelv3/raster/rasterg)× cam_high 帧 + action-rep overlay(青)+ ②rollout
 预测(红) vs GT(绿), r-only n100, H=40, 6 个 held-out seq。
 输出 outputs/cross_embodiment_wm/action_reps_compare/。
+
+---
+
+## 2026-07-20 ★重大反转: action 表示优劣依赖数据量(全量推翻 n100 结论)
+
+之前基于 n100 pilot 下"dummy5 完胜"的结论**错了**(又是单点下结论)。补全量 r-only 后完全反转:
+
+| 表示 | 稀缺 n100 (H=20) | 全量 nall (H=20) |
+|---|---|---|
+| dummy5 | **7.78** ← 最好 | 2.32 |
+| skel-v2 | 8.66 | 2.56 |
+| skelv3 | 10.50 | 3.73 |
+| raster | 9.01 | 2.13 |
+| rasterg | 10.00 ← 最差 | **1.96** ← 最好 |
+
+**稀缺: dummy5(精确坐标)赢, 光栅化最差; 全量: rasterg(光栅+grip)反超, dummy5 第三。**
+
+机制: 光栅化的量化噪声(±0.6px)在稀缺时主导 -> dummy5 精确坐标数据高效更稳;
+充足时大数据把噪声压下去, 光栅化更丰富的构型信息发挥作用。
+**印证 OSCAR: 他们用光栅化正是因为有大规模数据(85k+95k episodes)。光栅化不是坏表示, 是数据饥渴。**
+
+对项目: human-helps 只在 robot 稀缺时有用(全量耗尽), 稀缺时 dummy5 最优 -> **human-helps 场景用 dummy5**。
+但这是比"dummy5 完胜"更有价值的 finding: 表示选择依赖数据规模, 稀缺用精确坐标/充足用光栅化, 与 OSCAR 互为印证。
+
+教训(第 N 次): 单个数据点(n100)下结论不可靠, 必须多条件(稀缺+充足)才能判。

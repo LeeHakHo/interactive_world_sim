@@ -11,7 +11,7 @@ _m.DualLWC = W.DualLWC; _m.RasterAct = W.RasterAct
 import imageio.v2 as imageio
 from augment_clips_fullchain import rasterize_local
 
-dev = "cuda"; K = W.K; HR = int(os.environ.get("HORIZON", "40"))
+dev = "cuda"; K = W.K; HR = int(os.environ.get("HORIZON", "24"))   # 合法上限(clip L48, 动作窗口 24)
 DS = "outputs/flow_render_dataset_can_dual"
 OUT = "outputs/cross_embodiment_wm/action_reps_compare"; os.makedirs(OUT, exist_ok=True)
 base = "outputs/cross_embodiment_wm/dualview_wm_skelact"
@@ -27,11 +27,12 @@ mot = np.array([np.linalg.norm(np.diff(trA[si, K:K + HR].mean(1), 0), axis=-1).s
 NSEQ = int(os.environ.get("NSEQ", "6"))
 chosen = [int(x) for x in ho[np.argsort(-mot)[:NSEQ]]]
 
-REPS = [("dummy5", "PILOT_dummy5_r_n100", "dummy5", 7.78),
-        ("skel-v2", "skel_r_n100", "skel", 8.66),
-        ("skelv3", "skelv3_r_n100", "skelv3", 10.50),
-        ("raster", "PILOT_raster_r_n100", "raster", 9.01),
-        ("rasterg", "PILOT_rasterg_r_n100", "rasterg", 10.00)]
+# 全量 r-only 模型(预测好, 公平对比表示; 5点/4点/光栅各是真实输入)
+REPS = [("dummy5(5pt)", "dualview_wm", "dummy5", 2.32),
+        ("skel-v2(4pt)", "skel_r_nall", "skel", 2.56),
+        ("skelv3(scale-inv)", "skelv3_r_nall", "skelv3", 3.73),
+        ("raster(local)", "FULL_raster_r_nall", "raster", 2.13),
+        ("rasterg(+grip)", "FULL_rasterg_r_nall", "rasterg", 1.96)]
 SKEL_IDX = [5, 6, 7, 4]
 
 
@@ -48,31 +49,36 @@ def load_act(act, si):
 def draw_actrep(img, act, si, t):
     """在帧上 overlay 该 action representation 的输入形式(青色)。"""
     im = img.copy()
-    if act in ("dummy5", "skel", "skelv3"):
-        if act == "dummy5":
-            pts = eef[si, t] * 128                                  # 3 点(wrist,fin1,fin2)
-            segs = [(0, 1), (0, 2)]
-        else:
-            pts = sk2["skel2d_high"][si, t][SKEL_IDX] * 128         # 4 点骨架
-            segs = [(3, 0), (0, 1), (0, 2)]
-        for a, b in segs:
-            if np.isfinite(pts[[a, b]]).all():
-                cv2.line(im, tuple(pts[a].astype(int)), tuple(pts[b].astype(int)), (0, 255, 255), 1)
-        for p in pts:
-            if np.isfinite(p).all():
-                cv2.circle(im, tuple(p.astype(int)), 3, (0, 255, 255), -1)
-    else:                                                          # raster/rasterg: 角落放真实光栅输入
-        R = ras["raster_v0"][si, t].astype(np.uint8)               # 模型真实看到的 64px 局部光栅图
+    if act == "dummy5":
+        e3 = eef[si, t]                                            # (3,2) wrist,fin1,fin2
+        w, t1, t2 = e3[0], e3[1], e3[2]
+        c = (t1 + t2) / 2; ax = (t1 - t2) / 2; perp = np.array([-ax[1], ax[0]])
+        pts = np.stack([w, c, c + ax, c - ax, c + perp]) * 128     # ★ dummy5 真正的 5 点虚拟星座
+        segs = [(0, 1), (1, 2), (1, 3), (1, 4)]
+    elif act in ("skel", "skelv3"):
+        pts = sk2["skel2d_high"][si, t][SKEL_IDX] * 128            # 4 点骨架(v2/v3 信息来源相同)
+        segs = [(3, 0), (0, 1), (0, 2)]
+    else:                                                         # raster/rasterg: 角落放真实光栅输入
+        R = ras["raster_v0"][si, t].astype(np.uint8)              # 模型真实看到的 64px 局部光栅图(夹爪居中)
         thumb = cv2.cvtColor(cv2.resize(R, (44, 44), interpolation=cv2.INTER_NEAREST), cv2.COLOR_GRAY2RGB)
         im[2:46, 2:46] = thumb
         cv2.rectangle(im, (2, 2), (46, 46), (0, 255, 255), 1)
+        cv2.putText(im, "local/EE-ctr", (2, 56), cv2.FONT_HERSHEY_SIMPLEX, 0.3, (0, 255, 255), 1)
+        return im
+    for a, b in segs:
+        if np.isfinite(pts[[a, b]]).all():
+            cv2.line(im, tuple(pts[a].astype(int)), tuple(pts[b].astype(int)), (0, 255, 255), 1)
+    for p in pts:
+        if np.isfinite(p).all():
+            cv2.circle(im, tuple(p.astype(int)), 3, (0, 255, 255), -1)
     return im
 
 
 def main():
     models = {}
     for _, d, act, _ in REPS:
-        models[d] = torch.load(f"{base}/{d}/wm_dual.pt", map_location=dev, weights_only=False).eval()
+        p = "outputs/cross_embodiment_wm/dualview_wm/wm_dual.pt" if d == "dualview_wm" else f"{base}/{d}/wm_dual.pt"
+        models[d] = torch.load(p, map_location=dev, weights_only=False).eval()
     for si in chosen:
         trD = torch.from_numpy(trD_all[si:si + 1]).float().to(dev)
         preds = {}
@@ -104,12 +110,16 @@ def main():
         imageio.mimsave(f"{OUT}/seq{si}.gif", fr, duration=0.15, loop=0)
         print(f"seq{si} done", flush=True)
     open(f"{OUT}/README.txt", "w").write(
-        "5 种 action representation 的 ② rollout 对比 (r-only n100, cam_high, H=40)\n"
-        "列: dummy5 / skel-v2 / skelv3 / raster / rasterg (标题含 r-only drift px)\n"
-        "青=该表示输入(点/骨架线 or 角落光栅缩略); 绿=GT物体点; 红=②预测物体点\n"
-        "★ 判据: 红点跟绿点越紧越好. dummy5(精确坐标)预测最准; 其余引入噪声/失配基线更烂\n"
-        "h>=24 标 extrap(clip L48 动作窗口 K+F=24, 之后动作填充, 对所有列一样)\n"
-        "结论: 5 种 action 表示 dummy5 完胜, rh 绝对精度 3.03 < raster 3.54 < rasterg 3.72\n")
+        "5 种 action representation 的 ② rollout 对比 (★全量 robot-only, cam_high, H=24)\n"
+        "列: dummy5(5pt) / skel-v2(4pt) / skelv3(scale-inv) / raster(local) / rasterg(+grip)\n"
+        "  标题 r数字 = 该表示全量 robot-only 的 H=20 drift px\n"
+        "青=该表示输入(dummy5 5点星座/skel 4点骨架/光栅角落缩略图, 局部夹爪居中);\n"
+        "绿=GT物体点; 红=②预测物体点。红跟绿越紧越好。\n"
+        "★★重大发现: 表示优劣依赖数据量, 稀缺与充足完全反转:\n"
+        "  稀缺 n100:  dummy5 7.78 < raster 9.01 < rasterg 10.00  (精确坐标赢, 光栅化噪声主导)\n"
+        "  全量 nall:  rasterg 1.96 < raster 2.13 < dummy5 2.32 < skel 2.56 < skelv3 3.73\n"
+        "              (光栅化反超! 大数据压下噪声, 丰富构型信息发挥作用, 印证 OSCAR 大数据用光栅)\n"
+        "→ human-helps 场景是 robot 稀缺 -> dummy5 最优; 若有大规模 robot 数据 -> 光栅化(OSCAR式)更好\n")
     print("=== DONE ===")
 
 
