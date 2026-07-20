@@ -776,3 +776,43 @@ robot-only 路径保持 byte-identical。取消所有基于旧 bug 的 raster/ra
   dummy5 本就有的精度 -> raster 的价值在"格式统一免配对"帮 human, 不在精度碾压。
 - 128 内存: 按现打包法(塞进 action token (...,2)) robot 单视角 34GB 会爆; 须改单独 uint8 存+训练切片。
   建议先验证 64 修复后能否帮 human, 再决定是否付 128 工程成本。
+
+---
+
+## 2026-07-20 action 表示 pilot 定论 + 综合可视化对比
+
+### ★最终判决: dummy5 完胜, 4 种 agent 表示全部不赢
+pilot (修好混训, H=20, N=100, drift px cam_high):
+
+| 表示 | robot-only | +human(判据) | Δ |
+|---|---|---|---|
+| **dummy5** | 7.78 | **3.03** ← 最好 | +4.74 |
+| raster | 9.01 | 3.54 | +5.47 |
+| rasterg | 10.00 | 3.72 | +6.28 |
+
+skel-v2/skelv3 之前已判负。**rh 绝对精度 dummy5(3.03) < raster(3.54) < rasterg(3.72)。**
+raster/rasterg 的 Δ 更大是"基线烂"假象(同 skel 陷阱), rh 绝对精度全输。
+
+### 用户洞察被量化坐实: 光栅化的"噪声"是根因
+- raster 局部光栅图(64px, 窗口半径 0.30)的构型量化噪声 = **±0.60px@128**(一个像素跨 1.2px)
+- dummy5 是精确连续坐标, **零量化噪声**
+- robot-only 代价正好对上: raster 9.01 vs dummy5 7.78(差 1.23px = 噪声的账)
+- rasterg(加 grip 标量)比 raster 还差 -> grip 诊断对但补标量没帮上("修 artifact ≠ 帮下游"第三次: canon5/skelv3/rasterg)
+
+### 干净结论(4 种表示全试完)
+| 表示 | 输的原因 |
+|---|---|
+| skel-v2(同构) | 几何失配(两指不对称/槽位3常数) |
+| skelv3(尺度不变) | 归一化位置毁精度 |
+| raster(光栅) | 量化噪声 |
+| rasterg(光栅+grip) | 噪声 + grip 标量无用 |
+
+**human-helps 不需要 agent 表示同构/对齐**(dummy5 本身两域不对齐也赢)。
+表示越精确越好; 任何为"对齐/同构"牺牲精度或引入噪声的改造都是负的。
+与既有发现自洽: probe 说同域非必要 / AMPLIFY 网格 probe 红灯但下游帮 / human-helps 走 object-flow。
+**action 表示这条线到头 -> dummy5 定为最终 action 表示。**
+
+### 综合可视化: viz_all_action_reps.py
+5 列(dummy5/skel-v2/skelv3/raster/rasterg)× cam_high 帧 + action-rep overlay(青)+ ②rollout
+预测(红) vs GT(绿), r-only n100, H=40, 6 个 held-out seq。
+输出 outputs/cross_embodiment_wm/action_reps_compare/。
