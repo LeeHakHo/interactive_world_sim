@@ -736,3 +736,43 @@ raster = 光栅图(构型,免配对) + 末端位置(定位) + 归一化 grip(开
 | rasterg-64px | 跑中(53673+) | +归一化 grip 标量 |
 
 待 raster-64px / rasterg-64px 出结果: 看 (a) 64px 是否修好 rh 不稳 (b) grip 标量净贡献。
+
+---
+
+## 2026-07-20 (关键修正) human-helps 混训 bug + 最终 scaling 曲线
+
+### 我来回翻转的根因: exp_scel_dualview_wm 混训有 bug
+原实现 `train_dual` 的 MIX=rh: 先训完**所有** robot batch, 再单独训**所有** human batch。
+稀缺时 robot 300 条(~5 batch) vs human 1795 条(~28 batch), human batch 全堆在每个 epoch 结尾
+-> 梯度被 human 主导 -> robot heldout drift 变差 -> **假的"human 有害"**。
+我的 nrob_scaling 全部基于此 bug, 得出"human helps 站不住"的错误结论并来回翻转。
+
+**正确答案一直在另一个 session 的 curves.json**(exp_scel_dualview_comb, 统一批, 多 seed)。
+
+### ★human-helps 最终结论(can_dual, drift px@128, H=20, 多 seed, 统一批)
+
+| robot N | 占全量 | ro | rh | Δ=ro−rh |
+|---|---|---|---|---|
+| 50 | 2% | 9.86 | 4.95 | **+4.91** |
+| 100 | 4% | 8.68 | 3.98 | **+4.70** |
+| 400 | 16% | 4.78 | 3.44 | **+1.34** |
+| 800 | 33% | 3.15 | 2.57 | +0.58 |
+| 1600 | 65% | 2.43 | 2.26 | +0.17 |
+| 2460 | 100% | 1.98 | 2.10 | **−0.12(耗尽)** |
+
+**human-helps 真实, 但"稀缺专属": 随 robot 数据量单调衰减, 全量耗尽(≈0)。**
+用户 N=400 不够的直觉正确(才 16%, 还在稀缺区)。图 `humanhelps_scaling_FINAL.png`(已发用户)。
+命题定位: 不是"human 让 robot WM 更好"(全量不成立), 而是"robot 稀缺时 human 高效替代"(数据效率)。
+
+### 修复(2026-07-20)
+`_ss_batch_step` 拆出 `_ss_loss`(不 step); MIX=rh 改成**每个 optimizer step 同时含
+1 robot batch + 1 human batch 的梯度**(robot batch 少则 cycle 复用, 稀缺 robot 不被淹没)。
+robot-only 路径保持 byte-identical。取消所有基于旧 bug 的 raster/rasterg job。
+验证 job: FIX_dummy5_{r,rh}_n300 -> 预期 rh-n300 从(bug)5.4 恢复到 ~3.4(对齐 curves.json)。
+
+### 表示分辨率澄清(用户问)
+- dummy5/skel/skelv3 = **坐标点向量(float, 无分辨率概念)**, 精确无量化。
+- raster/rasterg = 光栅**图**, 有分辨率(32/64/128)。上 128 本质是减少量化损失去**追赶**
+  dummy5 本就有的精度 -> raster 的价值在"格式统一免配对"帮 human, 不在精度碾压。
+- 128 内存: 按现打包法(塞进 action token (...,2)) robot 单视角 34GB 会爆; 须改单独 uint8 存+训练切片。
+  建议先验证 64 修复后能否帮 human, 再决定是否付 128 工程成本。

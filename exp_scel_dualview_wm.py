@@ -270,10 +270,8 @@ class DualLWC(FlowWM_LWC):
         return logits, anchor
 
 
-def _ss_batch_step(m, opt, G, Vv, Ea, Eb, R_SS, pteach):
-    """One optimizer step of scheduled-sampling rollout over R_SS steps for one batch. Domain-agnostic
-    (robot or human -- caller picks the matching R_SS/tensors); verbatim body of the original
-    train_dual inner loop, factored out so MIX=rh can reuse it unchanged for the human pass."""
+def _ss_loss(m, G, Vv, Ea, Eb, R_SS, pteach):
+    """Scheduled-sampling rollout CE loss for one batch (NO optimizer step). Domain-agnostic."""
     buf = G[:, :K].clone(); losses = []
     for h in range(R_SS):
         wa = Ea[:, h:h + K + F]; wb = Eb[:, h:h + K + F]
@@ -293,7 +291,12 @@ def _ss_batch_step(m, opt, G, Vv, Ea, Eb, R_SS, pteach):
         nxt = buf[:, -1] + m.expected_vel(lg0)
         use_gt = (torch.rand(len(G), 1, 1, device=device) < pteach)
         buf = torch.cat([buf, torch.where(use_gt, G[:, K + h], nxt.detach())[:, None]], 1)
-    loss = torch.stack(losses).mean()
+    return torch.stack(losses).mean()
+
+
+def _ss_batch_step(m, opt, G, Vv, Ea, Eb, R_SS, pteach):
+    """One optimizer step for one batch (robot-only path, byte-identical to original)."""
+    loss = _ss_loss(m, G, Vv, Ea, Eb, R_SS, pteach)
     opt.zero_grad(); loss.backward(); opt.step()
     return float(loss)
 
@@ -323,18 +326,30 @@ def train_dual(trD, vsD, efA, efB, idx, seed=0, R_SS=32, action="dummy5",
         pteach = 1.0 + (0.3 - 1.0) * ep / max(epochs - 1, 1)
         m.train(); pe = idx[torch.randperm(len(idx), generator=g)]
         loss = 0.0
-        for i in range(0, len(pe), SSm.WM_BS):
-            b = pe[i:i + SSm.WM_BS]
-            G = trT[b].to(device); Vv = vsT[b].to(device)
-            Ea = eAT[b].to(device); Eb = eBT[b].to(device)
-            loss = _ss_batch_step(m, opt, G, Vv, Ea, Eb, R_SS, pteach)
-        if mix_human:
+        if not mix_human:                                    # robot-only: 原路径, byte-identical
+            for i in range(0, len(pe), SSm.WM_BS):
+                b = pe[i:i + SSm.WM_BS]
+                G = trT[b].to(device); Vv = vsT[b].to(device)
+                Ea = eAT[b].to(device); Eb = eBT[b].to(device)
+                loss = _ss_batch_step(m, opt, G, Vv, Ea, Eb, R_SS, pteach)
+        else:
+            # 修复(2026-07-20): 原实现先训完所有 robot batch 再单独训所有 human batch,
+            # 稀缺时 human batch 数是 robot 的 ~6x, 全堆在 epoch 结尾 -> 梯度被 human 主导
+            # -> robot heldout drift 变差 -> 假的"human 有害"(推翻 curves.json 已验证的 human-helps)。
+            # 修成: 每个 optimizer step 同时含 1 个 robot batch + 1 个 human batch 的梯度(一次 backward),
+            # robot batch 少则 cycle 复用 -> 稀缺 robot 信号不被淹没, 两域梯度每步均衡。
+            rb = [pe[i:i + SSm.WM_BS] for i in range(0, len(pe), SSm.WM_BS)]
             peh = idxh[torch.randperm(len(idxh), generator=gh)]
-            for i in range(0, len(peh), SSm.WM_BS):
-                b = peh[i:i + SSm.WM_BS]
-                G = trTh[b].to(device); Vv = vsTh[b].to(device)
-                Ea = eATh[b].to(device); Eb = eBTh[b].to(device)
-                loss = _ss_batch_step(m, opt, G, Vv, Ea, Eb, R_SS_h, pteach)
+            hb = [peh[i:i + SSm.WM_BS] for i in range(0, len(peh), SSm.WM_BS)]
+            for s in range(max(len(rb), len(hb))):
+                br = rb[s % len(rb)]; bh = hb[s % len(hb)]
+                lr = _ss_loss(m, trT[br].to(device), vsT[br].to(device),
+                              eAT[br].to(device), eBT[br].to(device), R_SS, pteach)
+                lh = _ss_loss(m, trTh[bh].to(device), vsTh[bh].to(device),
+                              eATh[bh].to(device), eBTh[bh].to(device), R_SS_h, pteach)
+                loss = lr + lh
+                opt.zero_grad(); loss.backward(); opt.step()
+                loss = float(loss)
         print(f"ep{ep} loss {loss:.4f}", flush=True)
     return m.eval()
 
