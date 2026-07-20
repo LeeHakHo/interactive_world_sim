@@ -48,10 +48,10 @@ PATHS = {
     ("dummy5", 2460): ("outputs/cross_embodiment_wm/dualview_wm/wm_dual.pt", f"{B}/SWEEP_dummy5_rh_nall/wm_dual.pt"),
     ("raster", 100): (f"{B}/PILOT_raster_r_n100/wm_dual.pt", f"{B}/PILOT_raster_rh_n100/wm_dual.pt"),
     ("raster", 300): (f"{B}/SWEEP_raster_r_n300/wm_dual.pt", f"{B}/SWEEP_raster_rh_n300/wm_dual.pt"),
-    ("raster", 2460): (f"{B}/FULL_raster_r_nall/wm_dual.pt", f"{B}/SWEEP_raster_rh_nall/wm_dual.pt"),
+    ("raster", 2460): (f"{B}/FULL_raster_r_nall/wm_dual.pt", f"{B}/SWEEP_raster_rh_nnall/wm_dual.pt"),
     ("rasterg", 100): (f"{B}/PILOT_rasterg_r_n100/wm_dual.pt", f"{B}/PILOT_rasterg_rh_n100/wm_dual.pt"),
     ("rasterg", 300): (f"{B}/SWEEP_rasterg_r_n300/wm_dual.pt", f"{B}/SWEEP_rasterg_rh_n300/wm_dual.pt"),
-    ("rasterg", 2460): (f"{B}/FULL_rasterg_r_nall/wm_dual.pt", f"{B}/SWEEP_rasterg_rh_nall/wm_dual.pt"),
+    ("rasterg", 2460): (f"{B}/FULL_rasterg_r_nall/wm_dual.pt", f"{B}/SWEEP_rasterg_rh_nnall/wm_dual.pt"),
 }
 COL = {"dummy5": "#1f77b4", "raster": "#2ca02c", "rasterg": "#d62728"}
 Ns = [100, 300, 2460]
@@ -80,8 +80,8 @@ for a in ax:
 ax[0].set_ylabel("绝对 Δ = ro − rh (px, ↑帮更多)")
 ax[0].set_title("human-helps 绝对量: 随 N 衰减\n(光栅表示 Δ 更大=基线烂假象)", fontsize=10)
 ax[1].set_ylabel("相对改善 % = Δ/ro (↑帮更多)")
-ax[1].set_title("★human-helps 相对量: 三表示曲线接近\n(human 作用与表示基本无关, 稀缺大→全量耗尽)", fontsize=10)
-fig.suptitle("human-helps by (action 表示 × robot 数据量) | 修好混训, can_dual, H=20", fontsize=12)
+ax[1].set_title("human-helps 相对量: N=100 三表示相似(~61%)\n高 N 分叉(⚠️单seed噪声, 需多seed); 主趋势=随N衰减至耗尽", fontsize=10)
+fig.suptitle("human-helps by (action 表示 × robot 数据量) | 修好混训, can_dual, H=20, ⚠️单seed", fontsize=12)
 fig.tight_layout()
 OUT = "outputs/cross_embodiment_wm/humanhelps_2d.png"
 fig.savefig(OUT, dpi=150, bbox_inches="tight")
