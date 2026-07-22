@@ -23,12 +23,12 @@ def pool16(x):                                    # (C,128,128) -> (C,16,16) avg
     return torch.nn.functional.avg_pool2d(t, POOL)[0].numpy()
 
 
-def build_clip(z, n, tL, L, low_ok):
-    """clip n -> cond (V=2, 7, tL, 16,16)。NaN(未跟踪点)-> 0; low 无效则该视角全 0。"""
+def build_clip(A, n, tL, L, low_ok):
+    """clip n -> cond (V=2, 7, tL, 16,16)。A=已读进内存的数组 dict(避免 npz 反复解压)。"""
     f32 = lambda a: np.nan_to_num(np.asarray(a, np.float32), nan=0.0)
-    tr = [f32(z["tracks"][n]), f32(z["tracks_low"][n])]; ef = [f32(z["eef"][n]), f32(z["eef_low"][n])]
-    vs = [f32(z["vis"][n]), f32(z["vis_low"][n])]; fr = [z["frames"][n], z["frames_low"][n]]
-    jt = f32(z["joint"][n])                        # (L,7)
+    tr = [f32(A["tracks"][n]), f32(A["tracks_low"][n])]; ef = [f32(A["eef"][n]), f32(A["eef_low"][n])]
+    vs = [f32(A["vis"][n]), f32(A["vis_low"][n])]; fr = [A["frames"][n], A["frames_low"][n]]
+    jt = f32(A["joint"][n])                        # (L,7)
     out = np.zeros((2, 7, tL, GRID, GRID), np.float32)
     for k in range(tL):
         rf = 0 if k == 0 else min(4 * k, L - 1)
@@ -56,11 +56,16 @@ def main():
         vids = set(int(x) for x in os.environ["VIDS"].split(","))
         rows = [n for n in range(N) if z["vid"][n] in vids]
     low_valid = z["low_valid"] if "low_valid" in z.files else np.ones(N, bool)
+    # ★一次性把数组读进内存(否则 npz 每次 z[key][n] 都全量解压 -> 0.6s/clip)
+    print("loading arrays into RAM ...", flush=True)
+    A = {k: z[k][:] for k in ["tracks", "tracks_low", "eef", "eef_low", "vis", "vis_low",
+                              "frames", "frames_low", "joint"]}
     cond = np.zeros((N, 2, 7, tL, GRID, GRID), np.float16)
     rows = list(rows)
+    import time; t0 = time.time()
     for i, n in enumerate(rows):
-        cond[n] = build_clip(z, n, tL, L, bool(low_valid[n]))
-        if i % 100 == 0: print(f"cond {i}/{len(rows)} (clip {n})", flush=True)
+        cond[n] = build_clip(A, n, tL, L, bool(low_valid[n]))
+        if i % 100 == 0: print(f"cond {i}/{len(rows)} (clip {n})  {(time.time()-t0)/max(i,1):.3f}s/clip", flush=True)
     tag = "smoke" if os.environ.get("SMOKE") == "1" else (os.environ.get("VIDS", "all").replace(",", "_"))
     np.savez(f"{OUTDIR}/cond_{tag}.npz", cond=cond, tL=np.array(tL))
     print(f"saved {OUTDIR}/cond_{tag}.npz  cond{cond.shape} tL={tL}", flush=True)
