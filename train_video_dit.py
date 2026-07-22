@@ -14,6 +14,7 @@ OUT = os.environ.get("OUT", "outputs/video_arch_wm/m4_video_dit"); os.makedirs(O
 STEPS = int(os.environ.get("STEPS", "40000")); BS = int(os.environ.get("BS", "16"))
 LR = float(os.environ.get("LR", "1e-4")); DEPTH = int(os.environ.get("DEPTH", "12")); D = int(os.environ.get("D", "512"))
 OVERFIT = int(os.environ.get("OVERFIT", "0"))                 # >0: 只用前 N clip (sanity)
+CCOND = int(os.environ.get("CCOND", "0"))                     # >0: 只用 cond 前 CCOND 通道 (ablation A warp-off=4)
 EVAL_EVERY = int(os.environ.get("EVAL_EVERY", "2000")); dev = "cuda"
 
 
@@ -60,7 +61,9 @@ def sample(model, z0_anchor, cond, steps=20):
 
 def main():
     lat, lat_low, cond, idx, tL = load_data()
+    if CCOND: cond = cond[:, :, :CCOND]                        # ablation: 截断条件通道(warp-off=4)
     C = lat.shape[1]; Ccond = cond.shape[2]
+    print(f"Ccond={Ccond} (CCOND env={CCOND})", flush=True)
     model = VideoDiT(C=C, Ccond=Ccond, V=2, gh=16, gw=16, D=D, depth=DEPTH, heads=8, patch=2).to(dev)
     ema = VideoDiT(C=C, Ccond=Ccond, V=2, gh=16, gw=16, D=D, depth=DEPTH, heads=8, patch=2).to(dev)
     ema.load_state_dict(model.state_dict()); [p.requires_grad_(False) for p in ema.parameters()]
