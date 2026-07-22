@@ -83,3 +83,34 @@ agent 条件通道两种表示,对比渲染质量(尤其 agent 区):
 - 不微调 Wan2.2-TI2V-5B(排除,基建重、非我们卖点)。
 - 不改 ② object-flow 表示(dummy5 相对已定论最优,见 `project_can_zlift_keyboard` abs/rel)。
 - 不做无关重构;v3 数据集本次不迁移(集中 can)。
+
+## 10. ③ 视频 DiT backbone —— ground 到强 related work(2026-07-22 补,4篇并行精读)
+
+用户准则:迁移目的=**更好渲染质量**,backbone 必须参考强 work,不能随手搭小 DiT(见 `feedback_video_backbone_ground_in_refs`)。精读 OSCAR(2606.04463)/WEAVER(2606.13672)/DexWM(2512.13644)/IWS 自建 ③,提取"他们在我们独特方法之外靠什么拿到渲染质量",综合如下。
+
+### 10.1 共识(定我们 backbone 的地基)
+- **自训中小 DiT 预测 latent + 冻结 codec 管外观** 是三家共同架构。★WEAVER 928M **从头训**明确打赢微调的 1.5B(Ctrl-World)→ **坐实我们选项 A(自训,不微调 5B)是对的**,且可比 WEAVER 更小(object-flow 条件比自由动作生成强约束得多)。
+- **条件注入 = token 级(加/拼),非 cross-attn/adaLN**:OSCAR=条件当"第二路视频"过同一 VAE 后 latent token **相加**(parallel patch embedder);WEAVER=flow/action **token 拼接** in-context;DexWM=AdaLN(唯一用 adaLN 的,但它条件是 132 维向量非空间图)。→ 我们现 DualViewDiTG 的 **spatial-add flow cond 正确**,保留。
+
+### 10.2 他们"额外"拿到渲染质量/长 rollout 的机制(我们要借的)
+1. **★Diffusion Forcing(WEAVER 首要)**:chunk 内**逐帧独立噪声 level** 训练 → rollout 容忍自己不完美的过去预测,FID 40+ 自回归步不涨。**最高杠杆抗漂移,backbone 无关,首先采纳。**
+2. **★首帧 I₀ 锚点(OSCAR)**:首个时序 latent 用真首帧的干净编码覆盖,只预测未来帧 → 外观/场景接地、具身无关。**我们无大先验,这个锚点尤其关键**(补偿"预训练先验填细节"我们没有)。
+3. **★agent/物体辅助定位 loss(DexWM HC,λ=100)**:全局 latent/像素 loss 会低估小 agent+物体区;加一个预测 object-flow 点/agent 骨架 heatmap 的辅助头重罚。**直接服务"渲染质量在 agent+物体区"**,与我们 measure-real-deliverable 准则一拍即合。
+4. **稀疏长记忆 + 短历史双上下文(WEAVER)**:每 k 帧留一个 memory + 最近若干帧 history → 任意 horizon 有界开销。视频 VAE 已时间压缩,故在 **latent chunk 粒度**上定义 memory/history。
+5. **flow-matching + cosine schedule + ReFlow 少步蒸馏(WEAVER/OSCAR)**:长 rollout 质量 + 交互速度(keyboard/policy 用)。
+6. **warm-start human 混训(OSCAR:robot-only 先训再混 human,warm-start > from-scratch)**:接我们 human-helps 线。
+7. **数据过滤防 freeze-frame 塌缩(OSCAR:最短长度/有意义动作/静态相机)**:小模型无强先验更易塌缩,便宜采纳。
+
+### 10.3 关键张力 + 裁决
+- **flow-matching(WEAVER/OSCAR 视频 WM 都用)vs 确定性回归(DexWM direct-regress + 我们 detmem 发现确定性更锐)**。裁决:**主路 = flow-matching + Diffusion Forcing**(真·视频 WM、长 rollout 抗漂移的证据在 WEAVER;detmem 那个"确定性更锐"是逐帧 ③ 结论,不含长 rollout),**辅以 agent/物体定位 loss + decode-LPIPS(agent 区)保锐**。detmem 确定性作为 M4 备选 ablation(若 flow-matching 太糊)。
+- **无大先验补偿**:OSCAR 质量主要来自 2B Cosmos 先验,我们没有 → 靠(a)首帧 I₀ 锚点强接地 (b)prev-memory/warp 搬运真像素(我们 detmem/flow-warp 线)(c)必要时条件加密(object-flow 网格化)。
+
+### 10.4 我们最终 ③ backbone(grounded)
+- **小视频 DiT 从头训**:D≈512 depth≈12 heads≈8(介于自建 384/8 与 WEAVER 1536/32);操作 Wan latent chunk(48ch, tL 帧, 16×16)。
+- **每 block:空间 attn + causal 时序 attn**(WEAVER/IWS-stage2);**dual-view cross-view joint attention**(我们 DualViewDiTG 差异化,保留)。
+- **条件**:object-flow(splat 256→降到 latent 16×16 spatial-add)+ agent 通道(mask/skel = ablation B)+ warp(ablation A)+ per-view 相机 extrinsic(DexWM dual-view)。token 级拼/加,非 adaLN。
+- **首帧 I₀ 锚点**(OSCAR):首 latent = 真首帧编码,只预测未来。
+- **目标 = 3rectified-flow + Diffusion Forcing**(逐帧独立噪声)+ 辅助 agent/物体定位 loss(DexWM HC 式)+ agent 区 decode-LPIPS。
+- **chunk 自回归 + 稀疏 memory/短 history**(WEAVER)→ 任意 horizon;cosine 采样;后续 ReFlow 蒸馏提速。
+- 差异化不变:② object-flow 跨具身接口、dual-view cross-view attn、human-helps、object-centric。
+- 参考出处:OSCAR §3.1-3.2、WEAVER §3.1-3.2/Table2、DexWM §3.2-3.3、IWS `exp_scel_dualview_gmaskcond.py`/`cm_latent_dynamics.py`。综合细节存 `docs/.../2026-07-22-video-backbone-grounding.md`(reader 原始提取)。
