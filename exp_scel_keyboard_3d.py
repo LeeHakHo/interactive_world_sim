@@ -86,25 +86,26 @@ def precompute_script(si, script, R):
     valid0 = z["tracks3d_valid"][si, 0]
     z0 = eef3d0[:, 2].mean()
     BOX3D = (-0.5, 0.5, -0.5, 0.5, 0.0, z0 + Z_LIFT_CAP)
-    # 纯运动帧 (F=0), 再 hold-pad 到 K+RENDER_H+Lw (够 rollout 窗口 + K-lead)
+    # 纯运动帧 (F=0), 再 hold-pad 到 RENDER_H+Lw (世界帧 0..H-1 渲染 + rollout 前瞻窗口)
     traj_m, grip_m, Hm = script_eef3d(eef3d0, grip0, script, DELTA, GRIP_DELTA, REPEAT, 0, BOX3D)
-    Ltot = K + RENDER_H + Lw
+    Ltot = RENDER_H + Lw
     pad = max(0, Ltot - len(traj_m))
     traj3d = np.concatenate([traj_m, np.repeat(traj_m[-1:], pad, 0)], 0)[:Ltot]
     grip_traj = np.concatenate([grip_m, np.repeat(grip_m[-1:], pad)], 0)[:Ltot]
-    efA, efB = project_eef_dual(traj3d)                                   # (Ltot,3,2)
-    # ② rollout: 初始 tracks 两视角 repeat K 当历史
-    tr0 = np.concatenate([np.nan_to_num(z["tracks"][si, 0].astype(np.float32)),
-                          np.nan_to_num(z["tracks_low"][si, 0].astype(np.float32))], 0)   # (2P,2)
-    trDseq = np.repeat(tr0[None], K, 0)[None]                             # (1,K,2P,2)
+    efA, efB = project_eef_dual(traj3d)                                   # (Ltot,3,2), efA[f]=世界帧f
+    # ② rollout: 初始 tracks 两视角 repeat K 当历史; 预测世界帧 K..H-1, 前 K 帧 object=静止起始(与 za 世界帧0锚对齐, 照 eval_e2e_combined)
+    trA0 = np.nan_to_num(z["tracks"][si, 0].astype(np.float32))          # (P,2)
+    trB0 = np.nan_to_num(z["tracks_low"][si, 0].astype(np.float32))
+    trDseq = np.repeat(np.concatenate([trA0, trB0], 0)[None], K, 0)[None]  # (1,K,2P,2)
     t2 = lambda a: torch.from_numpy(a[None]).float().to(dev)
     with torch.no_grad():
-        predtr = W.rollout_dual(wm, torch.from_numpy(trDseq).float().to(dev),
-                                t2(efA), t2(efB), RENDER_H)[0].cpu().numpy()  # (H,2P,2)
-    pred2_A, pred2_B = predtr[:, :P], predtr[:, P:2*P]
-    # 渲染帧 = efA[K:K+H] (K-lead 对齐 cond loop 的 f=K+h)
-    efA_r, efB_r = efA[K:K+RENDER_H], efB[K:K+RENDER_H]                   # (H,3,2)
-    traj3d_r, grip_r = traj3d[K:K+RENDER_H], grip_traj[K:K+RENDER_H]
+        pr = W.rollout_dual(wm, torch.from_numpy(trDseq).float().to(dev),
+                            t2(efA), t2(efB), RENDER_H - K)[0].cpu().numpy()   # (H-K,2P,2) 世界帧 K..H-1
+    pred2_A = np.concatenate([np.repeat(trA0[None], K, 0), pr[:, :P]], 0)      # (H,P,2) 世界帧 0..H-1
+    pred2_B = np.concatenate([np.repeat(trB0[None], K, 0), pr[:, P:2*P]], 0)
+    # 渲染帧 = 世界帧 0..H-1 (与 za 锚对齐, cond rf 直接索引世界帧)
+    efA_r, efB_r = efA[:RENDER_H], efB[:RENDER_H]                         # (H,3,2)
+    traj3d_r, grip_r = traj3d[:RENDER_H], grip_traj[:RENDER_H]
     objA, objB, grasp = object_track_dual(traj3d_r, grip_r, obj3d0, valid0)   # (H,48,2),(H,),
     trajA, trajB, fb = blend_predtr(pred2_A, pred2_B, objA, objB, grasp, efA_r, efB_r)
     with torch.no_grad():
@@ -193,7 +194,7 @@ def stage_render():
                 Fl = np.stack([ov(Rr[t], ref0[v], traj[v][t], ef[v][t], sk=skel[v][t]) for t in range(Tp)])
                 rcols.append(Rr); fcols.append(Fl)
             cmdstr = " ".join(f"{n}{_AR.get(c, c)}" for c, n in script)
-            gstate = "grip %d->%d%%" % (100 * d["grip"][0] / 0.04, 100 * d["grip"][-1] / 0.04)
+            gstate = "grip %d->%d%%" % (100 * d["grip"][0] / 0.04, 100 * d["grip"][Tp-1] / 0.04)
             save_combined_gif(f"{OUT}/gifs/{name}_si{si}.gif", np.stack(rcols), np.stack(fcols),
                               ["cam_high", "cam_low"], [None, None], K,
                               caption=f"{name} | {cmdstr} | {gstate} | grasp{grasp[:Tp].mean():.0%} | H={Tp}")

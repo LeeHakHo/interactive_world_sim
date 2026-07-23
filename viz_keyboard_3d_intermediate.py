@@ -51,8 +51,7 @@ def main():
         segs = sk["segments"]; skel = [sk["skel2d_high"], sk["skel2d_low"]]
         traj = [d["trajA"], d["trajB"]]; ef = [d["efA"], d["efB"]]
         fr0 = [z["frames"][si, 0], z["frames_low"][si, 0]]
-        # z 高度时间线 (从 grip 无法取 z, 用 eef cam_low 竖直分量近似展示 + grip)
-        efA_y = ef[0][:, :, 1].mean(1); grip = d["grip"]
+        grip = d["grip"]
         frames = []
         for t in range(H):
             ch = draw(fr0[0], traj[0][t], ef[0][t], skel[0][t], segs)
