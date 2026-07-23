@@ -14,7 +14,7 @@ import exp_scel_dualview_gmaskcond as G          # gmask_low_imgs, warp_preview,
 import exp_v3_human_helps_pixels as HP           # gmask_imgs, load_gmask
 
 DS = "outputs/flow_render_dataset_can_dual/clips_robot.npz"
-SKELF = "outputs/flow_render_dataset_can_dual/skel_sidecar_robot.npz"
+SKELF = os.environ.get("SKELF", "outputs/flow_render_dataset_can_dual/skel_sidecar_robot.npz")
 OUTDIR = "outputs/video_arch_wm/cond_can_dual"; os.makedirs(OUTDIR, exist_ok=True)
 GRID = 16; POOL = 128 // GRID
 SKEL = os.environ.get("SKEL", "0") == "1"        # ablation B: agent 通道用骨架线画替代 gmask 剪影
@@ -86,8 +86,9 @@ def main():
         if i % 100 == 0: print(f"cond {i}/{len(rows)} (clip {n})  {(time.time()-t0)/max(i,1):.3f}s/clip", flush=True)
     tag = "smoke" if os.environ.get("SMOKE") == "1" else (os.environ.get("VIDS", "all").replace(",", "_"))
     if SKEL: tag = "skel_" + tag
-    np.savez(f"{OUTDIR}/cond_{tag}.npz", cond=cond, tL=np.array(tL))
-    print(f"saved {OUTDIR}/cond_{tag}.npz  cond{cond.shape} tL={tL}", flush=True)
+    outname = os.environ.get("COND_NAME", f"cond_{tag}")
+    np.savez(f"{OUTDIR}/{outname}.npz", cond=cond, tL=np.array(tL))
+    print(f"saved {OUTDIR}/{outname}.npz  cond{cond.shape} tL={tL}", flush=True)
     print("=== cond DONE ===", flush=True)
 
 
