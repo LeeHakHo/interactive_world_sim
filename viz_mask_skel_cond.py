@@ -12,7 +12,7 @@ import exp_scel_dualview_gmaskcond as G
 DS = "outputs/flow_render_dataset_can_dual/clips_robot.npz"
 SK = "outputs/flow_render_dataset_can_dual/skel_sidecar_robot.npz"
 OUT = "outputs/video_arch_wm/m5_cond_intermediate"; os.makedirs(OUT, exist_ok=True)
-SEQS = [332, 418, 442]; IMG = 128
+SEQS = [int(x) for x in os.environ.get("SEQS", "332,442").split(",")]; IMG = 128
 COL = [(255,80,80),(255,160,60),(255,230,60),(150,255,60),(60,255,160),(60,200,255),(120,120,255),(220,100,255),(255,100,180)]
 
 
@@ -42,7 +42,7 @@ def main():
                 gm3 = (np.stack([gm]*3,-1)*255).astype(np.uint8)
                 gmov = fr.copy(); gmov[gm>0.4] = (0.5*gmov[gm>0.4]+0.5*np.array([255,80,80])).astype(np.uint8)
                 sk = zs[skk][si,t]; skimg = skel_draw(np.zeros_like(fr), sk, segs); skov = skel_draw(fr, sk, segs)
-                row = np.concatenate([lab(fr,"原帧"), lab(gm3,"mask剪影"), lab(gmov,"mask叠加"), lab(skimg,"skel线画"), lab(skov,"skel叠加")], 1)
+                row = np.concatenate([lab(fr,"orig"), lab(gm3,"mask(gmask)"), lab(gmov,"mask overlay"), lab(skimg,"skel lines"), lab(skov,"skel overlay")], 1)
                 frames.append(row)
             imageio.mimsave(f"{OUT}/seq{si}_cam{vn}.gif", frames, fps=8, loop=0)
             print(f"seq{si} cam{vn}: cond intermediate gif", flush=True)
