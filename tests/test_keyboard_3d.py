@@ -60,3 +60,16 @@ def test_grasp_and_object_follow():
     # 抓取抬起 -> cam_low 物体质心竖直上移(跟随 eef)
     dy_low = objB[-1,valid0,1].mean() - objB[0,valid0,1].mean()
     assert abs(dy_low) > 0.03, f"抓取抬起物体应在cam_low竖直动 {dy_low:.3f}"
+
+def test_fallback_when_under_follow():
+    from exp_scel_keyboard_3d import blend_predtr
+    H = 24
+    # ② 预测物体几乎不动(under-follow), eef 抬起明显
+    pA = np.zeros((H,48,2), np.float32); pB = np.zeros((H,48,2), np.float32)
+    objA = np.zeros((H,48,2), np.float32)
+    objB = np.tile(np.linspace(0.6,0.4,H)[:,None,None],(1,48,2)).astype(np.float32)  # 刚体跟随:cam_low 上移
+    grasp = np.ones(H, bool)
+    efA = np.zeros((H,3,2),np.float32); efB = np.tile(np.linspace(0.6,0.4,H)[:,None,None],(1,3,2)).astype(np.float32)
+    tA,tB,fb = blend_predtr(pA,pB,objA,objB,grasp,efA,efB)
+    assert fb.mean() > 0.5, "抓取相②不跟随应触发兜底"
+    assert abs(tB[-1,:,1].mean() - 0.4) < 0.05, "兜底应采用刚体投影(cam_low上移)"
