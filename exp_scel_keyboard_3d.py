@@ -1,6 +1,47 @@
-import os, sys, numpy as np
+"""Keyboard 3D 交互 demo (视频架构③). 三阶段:
+  A precompute(.venv_wan, GPU): 键盘脚本→世界系3D eef(script_eef3d)→双视角REAL标定投影→②rollout
+     +物体3D刚体跟随(object_track_dual)+②驱动兜底(blend_predtr)+IK joint. 存 precompute/<name>_si<si>.npz。
+  B fk_skel2d.py(conda phantom): joint→skel2d 两视角(见该文件)。存 skel2d/<name>_si<si>.npz。
+  C render(.venv_wan, GPU): 读 precompute+skel2d → skel cond(flow3+skel1+warp3) → VideoDiT(skel③)sample
+     → 双视角标准 save_combined_gif(Rendered行 + Flow+Skel overlay行 + caption)。
+控制=世界系3D(水平x/y + z上下, 修lift_high漂移: cam非top-down→纯z两视角一致投影)。抓取=功能性(grip闭+近物体→刚体跟随)。
+组件: ②=wm_dummy5_rh_N3000 ③=m4_ablB_skel(skel, 消融赢家) IK=ik_adapter_can VAE=官方AutoencoderKLWan。
+跑: .venv_wan/bin/python exp_scel_keyboard_3d.py --stage precompute
+    conda run -n phantom python fk_skel2d.py
+    .venv_wan/bin/python exp_scel_keyboard_3d.py --stage render
+"""
+import os, sys, argparse, numpy as np
+sys.path.insert(0, ".")
 
 FOLLOW_TH = float(os.environ.get("FOLLOW_TH", "0.4"))
+
+# ---- 控制标度 (spec: DELTA0.012/帧, REPEAT3, z幅度≤~0.25m; cam_low>0.5m投影发散) ----
+DELTA = float(os.environ.get("DELTA", "0.012"))
+GRIP_DELTA = float(os.environ.get("GRIP_DELTA", "0.006"))
+REPEAT = int(os.environ.get("REPEAT", "3"))
+RENDER_H = 48                    # 视频块固定 48 帧 (tL=12)
+Z_LIFT_CAP = 0.28                # BOX3D z 上限 = z0 + 此值
+GRID, POOL, tL = 16, 8, 12
+DS = "outputs/flow_render_dataset_can_dual/clips_robot.npz"
+OUT = os.environ.get("OUT", "outputs/video_arch_wm/keyboard_3d")
+WM_CKPT = os.environ.get("WM_CKPT", "outputs/cross_embodiment_wm/abs_vs_rel_humanhelps/wm_dummy5_rh_N3000.pt")
+IK_CKPT = os.environ.get("IK_CKPT", "outputs/cross_embodiment_wm/ik_adapter_can/ik_adapter.pt")
+CK_SKEL = os.environ.get("CK_SKEL", "outputs/video_arch_wm/m4_ablB_skel/video_dit_ema.pt")
+SEQS = [int(x) for x in os.environ.get("SEQS", "332,59,418").split(",")]
+
+# 多命令组合 (每条 Σn·REPEAT 运动帧, precompute hold-pad 到 48; grip: gclose/gopen)
+SCRIPTS = {
+    "translate_LR":         [("left", 6), ("right", 6)],
+    "square_xy":            [("left", 3), ("fwd", 3), ("right", 3), ("back", 3)],
+    "lift_high":            [("up", 6), ("up", 6)],
+    "z_wave":               [("up", 3), ("down", 3), ("up", 3), ("down", 3)],
+    "grip_cycle":           [("gclose", 3), ("gopen", 3), ("gclose", 3), ("gopen", 3)],
+    "pick_place_left":      [("gclose", 2), ("up", 3), ("left", 3), ("down", 2), ("gopen", 2)],
+    "pick_place_right":     [("gclose", 2), ("up", 3), ("right", 3), ("down", 2), ("gopen", 2)],
+    "carry_square":         [("gclose", 2), ("up", 2), ("left", 2), ("fwd", 2), ("down", 2), ("gopen", 2)],
+    "lift_translate_lower": [("gclose", 1), ("up", 3), ("left", 4), ("down", 3), ("gopen", 1)],
+}
+
 
 def blend_predtr(pred2_A, pred2_B, objA, objB, grasp, efA, efB):
     H = len(pred2_A); trajA = pred2_A.copy(); trajB = pred2_B.copy(); fb = np.zeros(H, bool)
@@ -11,3 +52,159 @@ def blend_predtr(pred2_A, pred2_B, objA, objB, grasp, efA, efB):
             if ef_disp > 1e-3 and pr_disp / ef_disp < FOLLOW_TH:
                 trajA[h] = objA[h]; trajB[h] = objB[h]; fb[h] = True
     return trajA, trajB, fb
+
+
+# ======================= 阶段 A: precompute =======================
+def load_control():
+    """加载 ②(rollout) + IK; register WM 类到 __main__。返回 R dict。"""
+    import torch
+    import exp_scel_dualview_wm as W
+    import exp_scel_dualview_comb as DC
+    import exp_scel_dualview_dit as DIT
+    import exp_scel_dualview_gmaskcond as G
+    from exp_scel_ik_adapter import IKAdapter
+    from video_dit import VideoDiT
+    for _c in [W.DualLWC, DC.DualCombLWC, G.DualViewDiTG, DIT.DualViewDiT, IKAdapter, VideoDiT]:
+        setattr(sys.modules["__main__"], _c.__name__, _c)
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    wm = torch.load(WM_CKPT, map_location=dev, weights_only=False).eval()
+    ik = torch.load(IK_CKPT, map_location=dev, weights_only=False).eval()
+    z = np.load(DS)
+    return dict(wm=wm, ik=ik, W=W, z=z, dev=dev)
+
+
+def precompute_script(si, script, R):
+    """键盘脚本 → 世界系3D控制 → ②rollout + 物体刚体跟随 + 兜底 + IK。返回 dict(存 npz)。"""
+    import torch
+    from keyboard_3d_control import script_eef3d, project_eef_dual, object_track_dual
+    from amplify_wm import K, F
+    wm, ik, W, z, dev = R["wm"], R["ik"], R["W"], R["z"], R["dev"]
+    P = 48; Lw = K + F
+    eef3d0 = z["eef3d"][si, 0].astype(np.float64)
+    grip0 = float(z["grip"][si, 0])
+    obj3d0 = np.nan_to_num(z["tracks3d"][si, 0].astype(np.float64))
+    valid0 = z["tracks3d_valid"][si, 0]
+    z0 = eef3d0[:, 2].mean()
+    BOX3D = (-0.5, 0.5, -0.5, 0.5, 0.0, z0 + Z_LIFT_CAP)
+    # 纯运动帧 (F=0), 再 hold-pad 到 K+RENDER_H+Lw (够 rollout 窗口 + K-lead)
+    traj_m, grip_m, Hm = script_eef3d(eef3d0, grip0, script, DELTA, GRIP_DELTA, REPEAT, 0, BOX3D)
+    Ltot = K + RENDER_H + Lw
+    pad = max(0, Ltot - len(traj_m))
+    traj3d = np.concatenate([traj_m, np.repeat(traj_m[-1:], pad, 0)], 0)[:Ltot]
+    grip_traj = np.concatenate([grip_m, np.repeat(grip_m[-1:], pad)], 0)[:Ltot]
+    efA, efB = project_eef_dual(traj3d)                                   # (Ltot,3,2)
+    # ② rollout: 初始 tracks 两视角 repeat K 当历史
+    tr0 = np.concatenate([np.nan_to_num(z["tracks"][si, 0].astype(np.float32)),
+                          np.nan_to_num(z["tracks_low"][si, 0].astype(np.float32))], 0)   # (2P,2)
+    trDseq = np.repeat(tr0[None], K, 0)[None]                             # (1,K,2P,2)
+    t2 = lambda a: torch.from_numpy(a[None]).float().to(dev)
+    with torch.no_grad():
+        predtr = W.rollout_dual(wm, torch.from_numpy(trDseq).float().to(dev),
+                                t2(efA), t2(efB), RENDER_H)[0].cpu().numpy()  # (H,2P,2)
+    pred2_A, pred2_B = predtr[:, :P], predtr[:, P:2*P]
+    # 渲染帧 = efA[K:K+H] (K-lead 对齐 cond loop 的 f=K+h)
+    efA_r, efB_r = efA[K:K+RENDER_H], efB[K:K+RENDER_H]                   # (H,3,2)
+    traj3d_r, grip_r = traj3d[K:K+RENDER_H], grip_traj[K:K+RENDER_H]
+    objA, objB, grasp = object_track_dual(traj3d_r, grip_r, obj3d0, valid0)   # (H,48,2),(H,),
+    trajA, trajB, fb = blend_predtr(pred2_A, pred2_B, objA, objB, grasp, efA_r, efB_r)
+    with torch.no_grad():
+        joint = ik(torch.from_numpy(efA_r).float().to(dev)).cpu().numpy()    # (H,7)
+    # VAE 首帧锚 (256 GT)
+    from eval_e2e_combined import gt256
+    vid = int(z["vid"][si]); fidx = z["fidx"][si]
+    f0_high = gt256(vid, fidx[:1], 0)[0]; f0_low = gt256(vid, fidx[:1], 1)[0]
+    return dict(si=si, efA=efA_r.astype(np.float32), efB=efB_r.astype(np.float32),
+                trajA=trajA.astype(np.float32), trajB=trajB.astype(np.float32),
+                joint=joint.astype(np.float32), grip=grip_r.astype(np.float32),
+                grasp=grasp, fb=fb, f0_high=f0_high, f0_low=f0_low, H=RENDER_H)
+
+
+def stage_precompute():
+    os.makedirs(f"{OUT}/precompute", exist_ok=True)
+    R = load_control()
+    for si in SEQS:
+        for name, script in SCRIPTS.items():
+            d = precompute_script(si, script, R)
+            np.savez(f"{OUT}/precompute/{name}_si{si}.npz", **d)
+            print(f"[precompute] {name}_si{si}: H={d['H']} grasp={d['grasp'].mean():.2f} "
+                  f"fallback={d['fb'].mean():.2f}", flush=True)
+    print("=== precompute DONE ===", flush=True)
+
+
+# ======================= 阶段 C: render =======================
+def render_from_precompute(pre_npz, skel_npz, models):
+    """读 precompute + skel2d → skel cond → VideoDiT sample → rend(2,H,128,128,3)。models=(m3S,vae,z)。"""
+    import torch
+    from eval_e2e_combined import sample, cond_v
+    m3S, vae, z = models
+    dev = next(m3S.parameters()).device
+    d = np.load(pre_npz); sk = np.load(skel_npz)
+    si = int(d["si"]); H = int(d["H"]); P = 48
+    skel = [sk["skel2d_high"], sk["skel2d_low"]]                          # (H,9,2)
+    traj = [d["trajA"], d["trajB"]]; ef = [d["efA"], d["efB"]]
+    tr0 = [np.nan_to_num(z["tracks"][si, 0].astype(np.float32)), np.nan_to_num(z["tracks_low"][si, 0].astype(np.float32))]
+    fr0 = [z["frames"][si, 0], z["frames_low"][si, 0]]
+    joint = d["joint"]; f0 = [d["f0_high"], d["f0_low"]]
+    vis = np.ones(P, np.float32)
+    za = torch.stack([vae.encode(torch.from_numpy(f0[v].astype(np.float32).transpose(2, 0, 1)[None, :, None] / 255.).to(dev))[0, :, :1]
+                      for v in range(2)])[None]
+    cond = np.zeros((2, 7, tL, GRID, GRID), np.float32)
+    for k in range(tL):
+        rf = 0 if k == 0 else min(4 * k, H - 1)
+        for v in range(2):
+            cond[v, :, k] = cond_v(v, tr0[v], traj[v][rf], ef[v][0], ef[v][rf], vis, joint[rf], fr0[v], skel[v][rf], "skel")
+    with torch.no_grad():
+        xs = sample(m3S, za, torch.from_numpy(cond[None]).float().to(dev))
+        rend = np.stack([vae.decode(xs[:, v])[0].permute(1, 2, 3, 0).cpu().numpy() for v in range(2)])  # (2,H,128,128,3)
+    return rend, d, skel
+
+
+def stage_render():
+    import torch, cv2
+    from eval_e2e_combined import ov
+    from wan_vae import WanVAE
+    from viz_combined import save_combined_gif
+    import exp_scel_dualview_wm as W, exp_scel_dualview_comb as DC, exp_scel_dualview_dit as DIT
+    import exp_scel_dualview_gmaskcond as G
+    from video_dit import VideoDiT
+    from keyboard_3d_control import _AR
+    dev = "cuda" if torch.cuda.is_available() else "cpu"
+    for _c in [W.DualLWC, DC.DualCombLWC, G.DualViewDiTG, DIT.DualViewDiT, VideoDiT]:
+        setattr(sys.modules["__main__"], _c.__name__, _c)
+    m3S = torch.load(CK_SKEL, map_location=dev, weights_only=False).eval()
+    vae = WanVAE(device=dev); z = np.load(DS)
+    os.makedirs(f"{OUT}/gifs", exist_ok=True)
+    u8 = lambda a: (np.clip(a, 0, 1) * 255).astype(np.uint8); r128 = lambda im: cv2.resize(im, (128, 128))
+    K = W.K
+    for si in SEQS:
+        for name, script in SCRIPTS.items():
+            pre = f"{OUT}/precompute/{name}_si{si}.npz"; skf = f"{OUT}/skel2d/{name}_si{si}.npz"
+            if not (os.path.exists(pre) and os.path.exists(skf)):
+                print(f"[render] skip {name}_si{si} (missing precompute/skel2d)", flush=True); continue
+            rend, d, skel = render_from_precompute(pre, skf, (m3S, vae, z))
+            # Wan 因果VAE: 12 latent 帧 decode -> 45 像素帧 (1+(12-1)*4), 非 48 -> 取实际长度 Tp 对齐 overlay
+            Tp = min(rend[0].shape[0], rend[1].shape[0]); traj = [d["trajA"], d["trajB"]]; ef = [d["efA"], d["efB"]]
+            grasp = d["grasp"]; ref0 = [np.nan_to_num(z["tracks"][si, 0].astype(np.float32)),
+                                        np.nan_to_num(z["tracks_low"][si, 0].astype(np.float32))]
+            rcols, fcols = [], []
+            for v in range(2):
+                Rr = np.stack([r128(u8(rend[v][t])) for t in range(Tp)])
+                # overlay: 静态起始(绿) + ②/兜底物体(红) + eef(黄) + skel(白)
+                Fl = np.stack([ov(Rr[t], ref0[v], traj[v][t], ef[v][t], sk=skel[v][t]) for t in range(Tp)])
+                rcols.append(Rr); fcols.append(Fl)
+            cmdstr = " ".join(f"{n}{_AR.get(c, c)}" for c, n in script)
+            gstate = "grip %d->%d%%" % (100 * d["grip"][0] / 0.04, 100 * d["grip"][-1] / 0.04)
+            save_combined_gif(f"{OUT}/gifs/{name}_si{si}.gif", np.stack(rcols), np.stack(fcols),
+                              ["cam_high", "cam_low"], [None, None], K,
+                              caption=f"{name} | {cmdstr} | {gstate} | grasp{grasp[:Tp].mean():.0%} | H={Tp}")
+            print(f"[render] {name}_si{si} done (Tp={Tp} grasp {grasp[:Tp].mean():.0%} fb {d['fb'].mean():.0%})", flush=True)
+    open(f"{OUT}/README.txt", "w").write(
+        "keyboard 3D demo (视频架构skel③). 双视角并列: Rendered行 + Flow+Skel overlay行(②/兜底物体红+静态起始绿+eef黄+skel白线).\n"
+        f"scripts={list(SCRIPTS)} seqs={SEQS} DELTA={DELTA} REPEAT={REPEAT}. ②wm_dummy5_rh_N3000 ③m4_ablB_skel IK=ik_adapter_can.\n")
+    print("=== render DONE ===", flush=True)
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(); ap.add_argument("--stage", choices=["precompute", "render"], required=True)
+    a = ap.parse_args()
+    (stage_precompute if a.stage == "precompute" else stage_render)()
