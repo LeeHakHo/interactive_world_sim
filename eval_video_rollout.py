@@ -15,7 +15,7 @@ COND = os.environ.get("COND", "outputs/video_arch_wm/cond_can_dual/cond_all.npz"
 DS = "outputs/flow_render_dataset_can_dual/clips_robot.npz"
 OUT = os.environ.get("OUT", "outputs/video_arch_wm/m5_replay"); os.makedirs(OUT, exist_ok=True)
 SEQS = [int(x) for x in os.environ.get("SEQS", "332,59,418,442").split(",")]
-NS = int(os.environ.get("STEPS_SAMPLE", "20")); dev = "cuda"
+NS = int(os.environ.get("STEPS_SAMPLE", "20")); CCOND = int(os.environ.get("CCOND", "0")); dev = "cuda"
 CROPS = {0: (60, 60, 390, 390), 1: (0, 0, 640, 480)}
 VID = {v: f"human_play_data/play_robot_can_{{}}_eef/videos/chunk-000/observation.images.cam_{n}/episode_000000.mp4"
        for v, n in [(0, "high"), (1, "low")]}
@@ -56,6 +56,7 @@ def main():
     for si in SEQS:
         z = torch.from_numpy(np.stack([lat[si], lat_low[si]])[None].astype(np.float32)).to(dev)  # (1,2,48,tL,16,16)
         c = torch.from_numpy(cond[si][None].astype(np.float32)).to(dev)
+        if CCOND: c = c[:, :, :CCOND]                                   # ablation A: warp-off 4ch
         xs = sample(model, z[:, :, :, :1], c, NS)                        # (1,2,48,tL,16,16)
         # decode 两视角
         rend = []; gts = []
