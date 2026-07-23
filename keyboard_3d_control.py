@@ -44,3 +44,37 @@ def project_eef_dual(eef3d_traj):
     efA = np.stack([[project_norm(eef3d_traj[t,k],Th,Kh,CROP["high"]) for k in range(3)] for t in range(T)]).astype(np.float32)
     efB = np.stack([[project_norm(eef3d_traj[t,k],Tl,Kl,CROP["low"]) for k in range(3)] for t in range(T)]).astype(np.float32)
     return efA, efB
+
+GRASP_TH = 0.033
+NEAR_TH = 0.174
+
+def grasp_timeline(eef3d_traj, grip_traj, obj3d0):
+    ec = eef3d_traj.mean(1); oc = obj3d0.mean(0)      # 物体初始质心
+    near = np.linalg.norm(ec - oc[None], axis=1) < NEAR_TH
+    grip_low = grip_traj < GRASP_TH
+    # 状态机:enter when near+low, stay while low, exit when grip opens
+    grasp = np.zeros(len(eef3d_traj), dtype=bool)
+    grasping = False
+    for t in range(len(eef3d_traj)):
+        if grip_low[t] and near[t]:
+            grasping = True
+        elif not grip_low[t]:
+            grasping = False
+        grasp[t] = grasping
+    return grasp
+
+def object_track_dual(eef3d_traj, grip_traj, obj3d0, valid0):
+    Th,Kh = can_KT("high"); Tl,Kl = can_KT("low"); T = len(eef3d_traj)
+    grasp = grasp_timeline(eef3d_traj, grip_traj, obj3d0)
+    ec = eef3d_traj.mean(1)
+    obj3d = np.repeat(obj3d0[None], T, 0).astype(np.float64)   # (T,48,3)
+    g0 = None
+    for t in range(1, T):
+        if grasp[t]:
+            if g0 is None: g0 = t                                # 抓取起点:锁 offset
+            obj3d[t] = obj3d[g0] + (ec[t] - ec[g0])[None]        # 平移刚体跟随
+        else:
+            g0 = None; obj3d[t] = obj3d[t-1]                     # 释放:停在原地
+    objA = np.stack([[project_norm(obj3d[t,p],Th,Kh,CROP["high"]) for p in range(48)] for t in range(T)]).astype(np.float32)
+    objB = np.stack([[project_norm(obj3d[t,p],Tl,Kl,CROP["low"]) for p in range(48)] for t in range(T)]).astype(np.float32)
+    return objA, objB, grasp

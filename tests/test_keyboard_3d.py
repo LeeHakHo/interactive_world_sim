@@ -46,3 +46,17 @@ def test_pure_z_triangulates_to_vertical():
     # 且两视角图像运动以竖直为主(透视水平分量小)
     dyA = abs(efA[-1,:,1].mean()-efA[0,:,1].mean()); dxA = abs(efA[-1,:,0].mean()-efA[0,:,0].mean())
     assert dyA > 2*dxA, f"cam_high 应竖直为主 dy{dyA*128:.1f} dx{dxA*128:.1f}px"
+
+def test_grasp_and_object_follow():
+    from keyboard_3d_control import object_track_dual, script_eef3d
+    z = _clip(); si = 332
+    e30 = z["eef3d"][si,0].astype(np.float64)
+    obj3d0 = z["tracks3d"][si,0].astype(np.float64)      # (48,3)
+    valid0 = z["tracks3d_valid"][si,0]
+    # 抓紧(grip 低)后抬起
+    traj, grip, H = script_eef3d(e30, 0.029, [("up",6)], DELTA=0.03, GRIP_DELTA=0.01, REPEAT=4, F=0, BOX3D=(-1,1,-1,1,0,1))
+    objA, objB, grasp = object_track_dual(traj, grip, obj3d0, valid0)
+    assert grasp.mean() > 0.8, "grip低+近物体应判定抓取"
+    # 抓取抬起 -> cam_low 物体质心竖直上移(跟随 eef)
+    dy_low = objB[-1,valid0,1].mean() - objB[0,valid0,1].mean()
+    assert abs(dy_low) > 0.03, f"抓取抬起物体应在cam_low竖直动 {dy_low:.3f}"
