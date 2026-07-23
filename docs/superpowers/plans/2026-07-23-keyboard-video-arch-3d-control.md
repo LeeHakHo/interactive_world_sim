@@ -15,7 +15,9 @@
 - GPU job 走 **sbatch**(partition-1),不 nohup。sbatch 内按阶段切 `.venv_wan/bin/python` 与 `conda run -n phantom python`。
 - 数据 = `outputs/flow_render_dataset_can_dual/clips_robot.npz`(L=48);标定 = `calib/rgb_cam_calib_can_{REAL,low_REAL}.json`。
 - 组件 ckpt(端到端声明):② `wm_dummy5_rh_N3000.pt`;③ **`outputs/video_arch_wm/m4_ablB_skel/video_dit_ema.pt`(skel agent,消融赢家,60000)**;IK `ik_adapter_can/ik_adapter.pt`。mask ③ `m4_video_dit` 作 fallback。
-- H=48 单视频块(tL=12,rf=min(4k,H-1));脚本总帧数必须=48。
+- H=48 单视频块(tL=12,rf=min(4k,H-1));**脚本 = 运动帧(Σn·REPEAT)+ hold-pad 补满 48**(运动可 <48,末尾保持最后位姿)。
+- **控制标度**:`DELTA=0.012`/帧(世界米),`REPEAT=3`;`BOX3D=(x_lo,x_hi,y_lo,y_hi,z_lo,z_hi)`,z 上限≈z0+0.28(cam_low 在 +0.5m 以上投影发散)。lift 幅度 ≤ ~0.25m。
+- **相机几何(实测,勿假设 top-down)**:cam_high 光轴偏世界竖直 24.1°、cam_low 42.4°。纯 z 抬起在两视角以竖直为主 + **小的透视正确水平分量**(非零)。真 3D 的修复=两视角是同一 3D 轨迹的一致投影,不是「cam_high x 零位移」。
 - CROP:cam_high=(60,60,390,390),cam_low=(0,0,640,480);GRID=16,POOL=8。
 - 交付走标准 `save_combined_gif`(双视角并列,Rendered 行 + Flow overlay 行 + caption);**overlay 同叠 flow+skel**(参照 `eval_e2e_combined.py:ov()`);禁自造 PIL 布局。
 - 输出独立目录 `outputs/video_arch_wm/keyboard_3d/`,不覆盖已有 eval。中间产物必须可视化。
@@ -62,17 +64,33 @@ def test_reproj_matches_stored():
                     errs.append(np.linalg.norm(uv - e2[t,k]))
         assert np.mean(errs)*128 < 0.2, f"{view} reproj {np.mean(errs)*128:.3f}px"
 
-def test_pure_z_no_horizontal_drift():
+def _triangulate(uvA, uvB):
+    """两视角 crop-norm 2D -> 世界 3D (pixel-space DLT, float32 下稳). 验'纯z投影三角化回来纯竖直'。"""
+    from keyboard_3d_control import can_KT, CROP
+    rows = []
+    for uv, view in [(uvA,"high"), (uvB,"low")]:
+        T,K = can_KT(view); P = K @ T[:3]            # 3x4 world->pixel
+        x,y,w,h = CROP[view]; px = np.array([uv[0]*w+x, uv[1]*h+y])  # norm->pixel
+        rows.append(px[0]*P[2]-P[0]); rows.append(px[1]*P[2]-P[1])
+    _,_,Vt = np.linalg.svd(np.stack(rows).astype(np.float64)); X = Vt[-1]; return X[:3]/X[3]
+
+def test_pure_z_triangulates_to_vertical():
     z = _clip(); si = 332
     e30 = z["eef3d"][si,0].astype(np.float64)   # (3,3)
-    traj, grip, H = script_eef3d(e30, 0.029, [("up",6)], DELTA=0.03, GRIP_DELTA=0.01, REPEAT=4, F=0, BOX3D=(-1,1,-1,1,0,1))
-    efA, efB = project_eef_dual(traj)           # (H,3,2) each
-    # cam_high: pure-z lift -> object x 基本不动 (< 0.02 norm ~ 2.5px @128)
-    dx_high = np.abs(efA[:,:,0].mean(1) - efA[0,:,0].mean()).max()
-    # cam_low: 竖直方向应显著移动
-    dy_low = np.abs(efB[:,:,1].mean(1) - efB[0,:,1].mean()).max()
-    assert dx_high < 0.02, f"cam_high 纯z水平漂移 {dx_high*128:.2f}px 太大"
-    assert dy_low > 0.03, f"cam_low z抬起竖直位移 {dy_low*128:.2f}px 太小"
+    # 现实幅度 lift (~0.22m): up 6键*REPEAT3*DELTA0.012
+    z0 = e30[:,2].mean()
+    traj, grip, H = script_eef3d(e30, 0.029, [("up",6)], DELTA=0.012, GRIP_DELTA=0.005, REPEAT=3, F=0,
+                                 BOX3D=(-1,1,-1,1,0.0,z0+0.28))
+    efA, efB = project_eef_dual(traj)           # (H,3,2)
+    # 三角化 eef 质心 首帧 vs 末帧 -> 世界位移应为纯 +z
+    w0 = _triangulate(efA[0].mean(0), efB[0].mean(0))
+    wT = _triangulate(efA[-1].mean(0), efB[-1].mean(0))
+    d = wT - w0
+    assert d[2] > 0.15, f"世界z位移应显著为正 {d[2]:.3f}"
+    assert abs(d[0]) < 0.02 and abs(d[1]) < 0.02, f"世界水平位移应≈0 (dx{d[0]:.3f} dy{d[1]:.3f})"
+    # 且两视角图像运动以竖直为主(透视水平分量小)
+    dyA = abs(efA[-1,:,1].mean()-efA[0,:,1].mean()); dxA = abs(efA[-1,:,0].mean()-efA[0,:,0].mean())
+    assert dyA > 2*dxA, f"cam_high 应竖直为主 dy{dyA*128:.1f} dx{dxA*128:.1f}px"
 ```
 
 - [ ] **Step 2: 运行确认失败**
@@ -121,6 +139,8 @@ def script_eef3d(eef3d0, grip0, script, DELTA, GRIP_DELTA, REPEAT, F, BOX3D):
     H = len(traj)
     traj = np.concatenate([traj, np.repeat(traj[-1:],F,0)],0); gs = np.concatenate([gs, np.repeat(gs[-1:],F)])
     return traj, gs, H
+# 注:渲染阶段(Task4 precompute)把 eef/grip 轨迹 hold-pad 到恰好 RENDER_H=48(运动 H≤48,末尾保持最后位姿);
+#     script_eef3d 只产运动帧(+F 滑窗未来 pad),不负责补到 48。
 
 def project_eef_dual(eef3d_traj):
     Th,Kh = can_KT("high"); Tl,Kl = can_KT("low"); T = len(eef3d_traj)
@@ -427,7 +447,7 @@ def test_render_from_precompute():
 
 - [ ] **Step 3: 实现 render_from_precompute + SCRIPTS(多组合)+ 标准 gif(flow+skel overlay)**
 
-SCRIPTS(每条 Σn·REPEAT=48,REPEAT=4→Σn=12):
+SCRIPTS(REPEAT=3,每条 Σn·REPEAT ≤48 的运动帧,precompute 再 hold-pad 到 48;Σn=12→36 运动+12 hold):
 ```python
 SCRIPTS = {
   "translate_LR":         [("left",6),("right",6)],
