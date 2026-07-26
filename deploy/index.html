@@ -66,6 +66,41 @@
 
     #task-panel button{ cursor: pointer; }
 
+    #record-panel{
+      position: absolute;
+      top: 60px;
+      left: 18px;
+      background: rgba(0,0,0,0.55);
+      color: rgba(255,255,255,0.85);
+      padding: 8px 10px;
+      border-radius: 8px;
+      font-size: 12px;
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      user-select: none;
+    }
+    #record-panel button{
+      background: rgba(0,0,0,1.0);
+      color: rgba(255,255,255,0.9);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 6px;
+      padding: 4px 8px;
+      font-family: inherit;
+      font-size: 12px;
+      cursor: pointer;
+      outline: none;
+    }
+    #record-panel button:disabled{ opacity: 0.4; cursor: default; }
+    #recStart.active{ color:#ff5b5b; border-color:#ff5b5b; }
+    #recDot{
+      width:10px; height:10px; border-radius:50%;
+      background:#ff3b3b; box-shadow:0 0 8px #ff3b3b;
+      display:none; animation: recpulse 1s infinite;
+    }
+    #recDot.on{ display:inline-block; }
+    @keyframes recpulse { 50% { opacity: 0.25; } }
+
     h1 {
       font-size: 14px;
       text-transform: uppercase;
@@ -130,17 +165,27 @@
   <div id="ui-layer">
     <h1>World Model Demo</h1>
     <p>WASD / IJKL: MOVE</p>
+    <p>KEYS: <span id="keysDown">—</span></p>
     <p>LATENCY: <span id="latency">0</span>ms</p>
   </div>
 
   <div id="task-panel">
     <label for="taskSelect">TASK</label>
     <select id="taskSelect">
-      <option value="pusht" selected>PushT</option>
+      <option value="pusht">PushT</option>
       <option value="bimanual_rope_cam_0">Bimanual Rope Routing</option>
       <option value="single_grasp_cam_0">Mug Grasping</option>
       <option value="bimanual_sweep_cam_0">Bimanual Sweeping</option>
+      <option value="redcube" selected>Red Cube (single-arm)</option>
     </select>
+  </div>
+
+  <div id="record-panel">
+    <span id="recDot"></span>
+    <button id="recStart">● REC</button>
+    <button id="recStop" disabled>■ STOP &amp; SAVE</button>
+    <button id="recDiscard" disabled>✕ DISCARD</button>
+    <span id="recStatus">idle</span>
   </div>
 
   <div id="status" title="connection status"></div>
@@ -204,6 +249,13 @@
       initImage: "real_bimanual_sweep_cam0/init.png",
       title: "BIMANUAL SWEEPING (THIRD-PERSON)",
       hint: "WASD: move left XY | IJKL: move right XY | Press keys to start",
+    },
+    redcube: {
+      initImage: "",
+      title: "RED CUBE (SINGLE-ARM)",
+      hint: [
+        "W/S: x   A/D: y   G/H: gripper",
+        "(Q/E z, U/O/I/K/J/L rotation are fixed in the data) | Press keys to start"],
     },
   };
 
@@ -387,14 +439,26 @@
   };
 
   ws.onmessage = async (event) => {
-    hasReceivedFrame = true;
-
-    if (lastSendTimeMs > 0) {
-      const latency = Date.now() - lastSendTimeMs;
-      latencyDisp.innerText = String(latency);
+    // Control messages (e.g. record_saved) arrive as text JSON; frames as binary.
+    if (typeof event.data === 'string') {
+      try {
+        const m = JSON.parse(event.data);
+        if (m.type === 'record_saved') onRecordSaved(m.path);
+      } catch (e) {}
+      return;
     }
 
-    const blob = new Blob([event.data], { type: 'image/jpeg' });
+    hasReceivedFrame = true;
+
+    // Frame = 8-byte big-endian float64 timestamp (echo of t_client) + encoded image.
+    // Strip the prefix before decoding, and use it for round-trip latency.
+    const buf = event.data;
+    if (buf.byteLength > 8) {
+      const tClient = new DataView(buf).getFloat64(0);
+      if (tClient > 0) latencyDisp.innerText = String(Math.round(performance.now() - tClient));
+    }
+    const imgBytes = buf.slice(8);
+    const blob = new Blob([imgBytes], { type: 'image/png' });
     const bitmap = await createImageBitmap(blob);
     ctx.drawImage(bitmap, 0, 0, canvas.width, canvas.height);
   };
@@ -407,7 +471,34 @@
     // tell backend to switch
     sendControl({ type: "set_task", task: taskSelect.value });
     lastSentActionJson = null;
+    setRecUI('idle');   // backend discards the in-progress recording on task reload
   });
+
+  // ===== Recording controls =====
+  const recStart = document.getElementById('recStart');
+  const recStop = document.getElementById('recStop');
+  const recDiscard = document.getElementById('recDiscard');
+  const recStatus = document.getElementById('recStatus');
+  const recDot = document.getElementById('recDot');
+
+  function setRecUI(state, info) {
+    const recording = (state === 'recording');
+    recStart.classList.toggle('active', recording);
+    recDot.classList.toggle('on', recording);
+    recStart.disabled = recording;
+    recStop.disabled = !recording;
+    recDiscard.disabled = !recording;
+    if (state === 'recording') recStatus.textContent = 'recording…';
+    else if (state === 'saving') recStatus.textContent = 'saving…';
+    else if (state === 'saved') recStatus.textContent = info ? ('saved ✓ ' + info.split('/').slice(-2).join('/')) : 'saved ✓';
+    else recStatus.textContent = 'idle';
+  }
+  function onRecordSaved(path) { setRecUI(path ? 'saved' : 'idle', path); }
+
+  recStart.onclick   = () => { sendControl({ type: 'record_start' });   setRecUI('recording'); recStart.blur(); };
+  recStop.onclick    = () => { sendControl({ type: 'record_stop' });    setRecUI('saving');    recStop.blur(); };
+  recDiscard.onclick = () => { sendControl({ type: 'record_discard' }); setRecUI('idle');      recDiscard.blur(); };
+  setRecUI('idle');
   ws.onerror = (e) => {
     console.error("WebSocket error:", e);
     setStatusDot("#f80");
@@ -436,12 +527,23 @@
     KeyL: false,
     KeyU: false,
     KeyO: false,
+    KeyG: false,
+    KeyH: false,
   };
+
+  const keysDownDisp = document.getElementById('keysDown');
+  function updateKeysDisplay() {
+    const down = Object.keys(keyState)
+      .filter((k) => keyState[k])
+      .map((k) => k.replace('Key', ''));
+    keysDownDisp.textContent = down.length ? down.join(' ') : '—';
+  }
 
   window.addEventListener('keydown', (e) => {
     if (e.code in keyState) {
       e.preventDefault();
       keyState[e.code] = true;
+      updateKeysDisplay();
     }
   });
 
@@ -449,6 +551,7 @@
     if (e.code in keyState) {
       e.preventDefault();
       keyState[e.code] = false;
+      updateKeysDisplay();
     }
   });
 
@@ -465,6 +568,8 @@
     const l = keyState.KeyL ? 1 : 0;
     const u = keyState.KeyU ? 1 : 0;
     const o = keyState.KeyO ? 1 : 0;
+    const g = keyState.KeyG ? 1 : 0;
+    const h = keyState.KeyH ? 1 : 0;
 
     return {
       w: w,
@@ -479,6 +584,8 @@
       l: l,
       u: u,
       o: o,
+      g: g,
+      h: h,
     };
   }
 
@@ -489,17 +596,13 @@
     if (ws.readyState !== WebSocket.OPEN) return;
 
     const action = buildActionPayload();
-    const msg = {
-      type: 'action',
-      action,
-      t_client: performance.now(),
-    };
-
-    const json = JSON.stringify(msg);
-    if (json !== lastSentActionJson) {
+    // Dedup on the key state only (NOT t_client) — otherwise every tick looks "new"
+    // and we flood the server at ~1000 Hz, starving its render/step loop.
+    const actionJson = JSON.stringify(action);
+    if (actionJson !== lastSentActionJson) {
       lastSendTimeMs = Date.now();
-      ws.send(json);
-      lastSentActionJson = json;
+      ws.send(JSON.stringify({ type: 'action', action, t_client: performance.now() }));
+      lastSentActionJson = actionJson;
     }
   }, TICK_MS);
 </script>

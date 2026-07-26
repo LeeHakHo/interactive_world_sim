@@ -19,7 +19,7 @@ Then convert (episode_000000 = val, rest = train):
       --src-robot data/play_robot_v3 \
       --val-stems episode_000000 \
       --dst data/play_robot_v3_hdf5 \
-      --crop 195 195 256 256 --size 128
+      --crop 190 225 210 205 --size 128
 """
 
 import argparse
@@ -30,8 +30,9 @@ from huggingface_hub import snapshot_download
 
 CAMS = [
     "observation.images.cam_high",
+    "observation.images.cam_low",
     "observation.images.cam_right_wrist",
-]
+]  # only cams present in each repo are copied (see guarded copy below)
 
 
 def main():
@@ -49,10 +50,10 @@ def main():
     tmp = Path(args.tmp) if args.tmp else dst / ".tmp_downloads"
     tmp.mkdir(parents=True, exist_ok=True)
 
-    n = 0
+    counter = 0
     for i in range(args.start, args.end + 1):
         repo = f"{args.prefix}{i}{args.suffix}"
-        repo_tmp = tmp / f"robot_{i}"
+        repo_tmp = tmp / f"repo_{i}"
 
         if args.resume and repo_tmp.exists() and any(repo_tmp.iterdir()):
             print(f"[SKIP] {repo} (already in {repo_tmp})")
@@ -60,29 +61,30 @@ def main():
             print(f"Downloading {repo} ...")
             snapshot_download(repo_id=repo, repo_type="dataset", local_dir=str(repo_tmp))
 
-        # each repo holds exactly one episode parquet
+        # a repo may hold one OR MORE episode parquets (e.g. eval repo has 5).
+        # emit each with a running global counter so all episodes get a unique stem.
         src_parquets = sorted((repo_tmp / "data" / "chunk-000").glob("episode_*.parquet"))
-        assert len(src_parquets) == 1, f"{repo}: expected 1 episode, found {len(src_parquets)}"
-        src_stem = src_parquets[0].stem
-        new_stem = f"episode_{i:06d}"
+        assert len(src_parquets) >= 1, f"{repo}: no episode parquet found"
+        for src_pq in src_parquets:
+            src_stem = src_pq.stem
+            new_stem = f"episode_{counter:06d}"
 
-        dst_pq = dst / "data" / "chunk-000" / f"{new_stem}.parquet"
-        dst_pq.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(src_parquets[0], dst_pq)
+            dst_pq = dst / "data" / "chunk-000" / f"{new_stem}.parquet"
+            dst_pq.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src_pq, dst_pq)
 
-        for cam in CAMS:
-            src_mp4 = repo_tmp / "videos" / "chunk-000" / cam / f"{src_stem}.mp4"
-            if src_mp4.exists():
-                dst_mp4 = dst / "videos" / "chunk-000" / cam / f"{new_stem}.mp4"
-                dst_mp4.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(src_mp4, dst_mp4)
+            for cam in CAMS:
+                src_mp4 = repo_tmp / "videos" / "chunk-000" / cam / f"{src_stem}.mp4"
+                if src_mp4.exists():
+                    dst_mp4 = dst / "videos" / "chunk-000" / cam / f"{new_stem}.mp4"
+                    dst_mp4.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(src_mp4, dst_mp4)
 
-        print(f"  {repo} -> {new_stem}")
-        n += 1
+            print(f"  {repo}:{src_stem} -> {new_stem}")
+            counter += 1
 
-    print(f"\nDone. {n} episodes merged into {dst}")
-    print(f"  val  : episode_{args.start:06d}")
-    print(f"  train: episode_{args.start+1:06d} ... episode_{args.end:06d}")
+    print(f"\nDone. {counter} episodes merged into {dst}")
+    print(f"  stems: episode_000000 ... episode_{counter-1:06d}")
 
 
 if __name__ == "__main__":

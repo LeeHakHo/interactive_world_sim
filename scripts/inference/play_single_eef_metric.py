@@ -1,17 +1,8 @@
 """
 Quantitative metric for IWS world models, over held-out GT action replay.
 
-Per held-out episode we replay the GT actions through the world model and report:
-
-1) mscore (signed temporal-change agreement) — custom single metric, no clustering.
-   dg_t = GT_t - GT_{t-1},  dp_t = Pred_t - Pred_{t-1}   (signed, per channel -> direction)
-   a_t  = ||normalize(act_t) - normalize(act_{t-1})||     action weight
-   mscore = sum_t a_t sum_p |dg_t - dp_t|  /  sum_t a_t sum_p |dg_t|
-   Pred should change the same pixels in the same DIRECTION and amount as GT.
-   Opposite-direction change penalized hardest; background (dg~0) auto-ignored.
-
-2) Standard video metrics (same as validation): fvd, mse, psnr, ssim, uiqi
-
+Per held-out episode we replay the GT actions through the world model and report the
+standard video metrics (same as validation): fvd, mse, psnr, ssim, uiqi.
 Lower is better except ssim/uiqi/psnr. Compares multiple checkpoints in one table.
 
 Usage:
@@ -92,48 +83,6 @@ def replay_rollout(model, cam0, cam1, actions, h, device, dtype):
     return preds0, preds1
 
 
-def motion_score(preds0, cam0, actions, model, device, dtype, eps=5.0 / 255.0):
-    """Signed temporal-change agreement over GT action replay. Lower = better.
-
-    Returns (mscore, track, hall), where mscore = track + hall (shared denominator).
-      dg_t = GT_t - GT_{t-1},  dp_t = Pred_t - Pred_{t-1}   (signed, per channel)
-      a_t  = || normalize(act_t) - normalize(act_{t-1}) ||
-      den  = sum_t a_t sum_p |dg_t|
-
-    Split each pixel by whether GT changed there (|dg| > eps):
-      track = sum a_t sum_{|dg|>eps} |dg - dp|   -> tracking/miss (failed to follow GT motion)
-      hall  = sum a_t sum_{|dg|<=eps} |dp|       -> hallucination (invented motion where GT static)
-    eps = noise floor so camera/codec jitter isn't counted as GT change.
-    """
-    a_norm = model.normalizer["action"].normalize(
-        torch.from_numpy(actions).to(device=device, dtype=dtype)
-    ).cpu().numpy()
-    num_track = num_hall = den = 0.0
-    prev_g = cam0[0].astype(np.float32) / 255.0
-    prev_p = None
-    for i, pred in enumerate(preds0):
-        t = i + 1
-        g = cam0[t].astype(np.float32) / 255.0
-        p = pred.astype(np.float32) / 255.0
-        if prev_p is None:               # first frame has no previous pred -> skip
-            prev_g, prev_p = g, p
-            continue
-        a_t = float(np.linalg.norm(a_norm[t] - a_norm[t - 1]))
-        dg = g - prev_g                              # (H,W,3) signed GT change
-        dp = p - prev_p                              # (H,W,3) signed pred change
-        dg_mag = np.abs(dg).mean(-1)                 # (H,W)
-        diff = np.abs(dg - dp).mean(-1)              # signed-change disagreement
-        dp_mag = np.abs(dp).mean(-1)
-        moved = dg_mag > eps                         # GT actually changed here
-        num_track += a_t * float((diff * moved).sum())       # tracking error in GT-changed region
-        num_hall += a_t * float((dp_mag * ~moved).sum())     # pred change in GT-static region
-        den += a_t * float(dg_mag.sum())
-        prev_g, prev_p = g, p
-    if den <= 0:
-        return float("nan"), float("nan"), float("nan")
-    return (num_track + num_hall) / den, num_track / den, num_hall / den
-
-
 def _to_video(frames0, frames1):
     """list of (H,W,3) uint8 x2 -> CPU (T,1,6,H,W) float in [-1,1]."""
     vid = [np.concatenate([f0, f1], axis=2) for f0, f1 in zip(frames0, frames1)]
@@ -208,8 +157,8 @@ def main():
             cam0, cam1, actions = cam0[:args.max_frames], cam1[:args.max_frames], actions[:args.max_frames]
         eps_data[ep] = (cam0, cam1, actions)
 
-    # metric columns: our motion_score (mscore) + standard video metrics for reference
-    cols = ["mscore", "track", "hall", "fvd", "mse", "psnr", "ssim", "uiqi"]
+    # standard video metrics
+    cols = ["fvd", "mse", "psnr", "ssim", "uiqi"]
     results = {}
     for ckpt in args.ckpts:
         print(f"\nEvaluating {ckpt} ...")
@@ -219,12 +168,9 @@ def main():
         for ep in args.episodes:
             cam0, cam1, actions = eps_data[ep]
             preds0, preds1 = replay_rollout(model, cam0, cam1, actions, h, args.device, dtype)
-            mscore, track, hall = motion_score(preds0, cam0, actions, model, args.device, dtype)
             vm = video_metrics(model, preds0, preds1, cam0, cam1, args.device)
 
-            row = {"mscore": mscore, "track": track, "hall": hall}
-            for k in ["fvd", "mse", "psnr", "ssim", "uiqi"]:
-                row[k] = vm.get(k, float("nan"))
+            row = {c: vm.get(c, float("nan")) for c in cols}
             for c in cols:
                 acc[c].append(row[c])
             print(f"  episode {ep}: " + "  ".join(f"{c}={row[c]:.4f}" for c in cols))
@@ -232,10 +178,10 @@ def main():
         del model
         torch.cuda.empty_cache()
 
-    print("\n=== Metric table (mscore/mse lower=better; psnr/ssim/uiqi higher=better) ===")
+    print("\n=== Metric table (mse/fvd lower=better; psnr/ssim/uiqi higher=better) ===")
     header = "  " + "".join(f"{c:>9}" for c in cols) + "   checkpoint"
     print(header)
-    for ckpt, row in sorted(results.items(), key=lambda kv: kv[1]["mscore"]):
+    for ckpt, row in sorted(results.items(), key=lambda kv: -kv[1]["psnr"]):
         line = "  " + "".join(f"{row[c]:9.3f}" for c in cols) + f"   {ckpt}"
         print(line)
 

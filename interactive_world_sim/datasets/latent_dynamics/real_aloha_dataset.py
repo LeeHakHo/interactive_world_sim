@@ -369,10 +369,14 @@ def load_replay_buffer(
     replay_buffer = None
     if use_cache:
         res = shape_meta["obs"]["camera_1_color"]["shape"][-1]
+        cache_info_str = ""
         if res != 128:
-            cache_info_str = f"_res_{res}"
-        else:
-            cache_info_str = ""
+            cache_info_str += f"_res_{res}"
+        # human_mode decides which episodes / masks get baked into the cache
+        # (see _convert_real_to_dp_replay), so it MUST be part of the cache key.
+        # Otherwise a robot_only run and an `all` run would share one cache and
+        # silently train on the wrong data.
+        cache_info_str += f"_{human_mode}"
         cache_zarr_path = os.path.join(dataset_dir, f"cache{cache_info_str}.zarr.zip")
         cache_lock_path = cache_zarr_path + ".lock"
         print("Acquiring lock on cache.")

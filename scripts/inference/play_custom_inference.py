@@ -56,29 +56,35 @@ def process_joint_pos(joint_pos: np.ndarray) -> np.ndarray:
 # ============================================================
 # Keyboard-to-action mapping
 #
-# Left arm  (indices 7-13): w=상 s=하 a=좌 d=우 f=그리퍼
-# Right arm (indices 0-6):  i=상 k=하 j=좌 l=우 h=그리퍼
+# Left arm  (joint indices 7-13):
+#   W / S  →  Y-axis  (joint 0, base rotation)   +/-
+#   A / D  →  X-axis  (joint 1, shoulder pitch)   +/-
+#   F      →  gripper toggle (open ↔ closed)
 #
-# 각 키 한 번 = step_size(rad) 만큼 해당 joint 이동
-# 그리퍼: 누를 때마다 open/closed 토글
+# Right arm (joint indices 0-6):
+#   I / K  →  Y-axis  (joint 0, base rotation)   +/-
+#   J / L  →  X-axis  (joint 1, shoulder pitch)   +/-
+#   H      →  gripper toggle (open ↔ closed)
 #
-# 사용법: --keys "wwwsssiikk" 형태로 키 시퀀스 입력
-#         각 문자 = 1 timestep
+# Each key = 1 timestep, moves joint by step_size (rad).
+# Usage:  --keys "wwwsssiikk"  (each character = 1 step)
+#
+# Label summary (matches PUSHT-style UI):
+#   Left arm:  AD → X-axis · WS → Y-axis · F → gripper
+#   Right arm: JL → X-axis · IK → Y-axis · H → gripper
 # ============================================================
 
-# joint index mapping: (arm_offset, joint_idx_within_arm)
-# 상/하 = joint 0 (base rotation), 좌/우 = joint 1 (shoulder pitch)
 _KEY_MAP = {
-    # left arm (offset 7)
-    "w": (7, 0, +1),   # 상
-    "s": (7, 0, -1),   # 하
-    "a": (7, 1, +1),   # 좌
-    "d": (7, 1, -1),   # 우
-    # right arm (offset 0)
-    "i": (0, 0, +1),   # 상
-    "k": (0, 0, -1),   # 하
-    "j": (0, 1, +1),   # 좌
-    "l": (0, 1, -1),   # 우
+    # left arm (joint offset 7): WS=Y-axis, AD=X-axis
+    "w": (7, 0, +1),
+    "s": (7, 0, -1),
+    "a": (7, 1, +1),
+    "d": (7, 1, -1),
+    # right arm (joint offset 0): IK=Y-axis, JL=X-axis
+    "i": (0, 0, +1),
+    "k": (0, 0, -1),
+    "j": (0, 1, +1),
+    "l": (0, 1, -1),
 }
 _GRIPPER_KEYS = {"f": 7 + 6, "h": 0 + 6}  # key -> gripper joint index
 
@@ -139,7 +145,7 @@ def load_episode(dataset_dir: str, episode_idx: int, resolution: int, n_frames: 
         actions:     (T, 14) float32
     """
     # try train/ subdir first, then root
-    for subdir in ["val", ""]:
+    for subdir in ["train", ""]:
         path = os.path.join(dataset_dir, subdir, f"episode_{episode_idx}.hdf5")
         if os.path.exists(path):
             break
@@ -219,7 +225,7 @@ def main():
     parser.add_argument("--hist_context", type=int, default=1)
     parser.add_argument("--dec_infer_steps", type=int, default=3)
     parser.add_argument("--use_gt_action", action="store_true", help="use GT actions from the episode")
-    parser.add_argument("--keys", type=str, default=None, help="key sequence e.g. 'wwwsssiikk' (w/s/a/d/f=left arm, i/k/j/l/h=right arm)")
+    parser.add_argument("--keys", type=str, default=None, help="key sequence e.g. 'wwwsssiikk'  Left: WS=Y-axis AD=X-axis F=gripper  Right: IK=Y-axis JL=X-axis H=gripper")
     parser.add_argument("--step_size", type=float, default=0.05, help="joint delta per keypress (radians)")
     parser.add_argument("--output_dir", default="outputs/inference")
     parser.add_argument("--device", default="cuda:0")

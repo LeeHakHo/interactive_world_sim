@@ -87,8 +87,11 @@ def load_model(algo_name: str, ckpt_path: str) -> pl.LightningModule:
     cfg = OmegaConf.create(cfg_str)
     dtype = torch.float32 if "dtype" not in cfg.algorithm else cfg.algorithm.dtype
     cfg.algorithm.load_ae = None
-    cfg.n_frames = 10
-    cfg.algorithm.n_frames = 10
+    # Match scripts/inference/play_single_eef_inference.py: set decoder infer steps and
+    # DO NOT override n_frames — the model must use its trained context window (n_tokens).
+    # Forcing n_frames=10 makes dynamics_forward run on a longer context than training,
+    # so the rollout ignores new actions / collapses once the latent window fills.
+    cfg.algorithm.dec_infer_steps = 3
     compatible_algorithms = {"latent_world_model": LatentWorldModel}
     algo = compatible_algorithms[algo_name].load_from_checkpoint(
         ckpt_path,
@@ -143,12 +146,21 @@ def load_task_config(
         )
         dataset_path = str(data_dir / "bimanual_sweep" / "val" / "episode_0.hdf5")
         obs_keys = ["camera_0_color"]
+    elif scene == "redcube":
+        # Single-arm red-cube (play_robot_v3). EEF task: 7-dim action stored directly
+        # ([x,y,z, rx,ry,rz, gripper]); obs_keys taken from the model after loading.
+        resolution = 128
+        ckpt_path = "/home/hyeonhoo/code/interactive_world_sim/outputs/2026-06-13/22-11-27/checkpoints/epoch=3-step=250000.ckpt"
+        dataset_path = "/home/hyeonhoo/code/interactive_world_sim/data/play_robot_v3_hdf5/val/episode_0.hdf5"
+        obs_keys = None
     else:
         raise ValueError(f"Unknown scene: '{scene}'")
 
     model: LatentWorldModel = load_model(algo_name=algo_name, ckpt_path=ckpt_path)
     normalizer = model.normalizer
     load_epi_data, _ = load_dict_from_hdf5(dataset_path)
+    if obs_keys is None:  # eef tasks: use whatever views the model was trained on
+        obs_keys = list(model.obs_keys)
 
     # Build initial latent from the first frame of the episode
     img_tensor_list = []
@@ -166,6 +178,18 @@ def load_task_config(
     img_tensor = torch.cat(img_tensor_list, dim=1)
     with torch.no_grad():
         curr_latent_tensor = model.encoder_forward(img_tensor)[None]
+
+    # EEF tasks store the action directly (7-dim [x,y,z,rx,ry,rz,gripper]); seed from
+    # frame t instead of recomputing via joint_pos_to_action_primitive.
+    if scene == "redcube":
+        # eef task: keep the raw 7-dim action and its per-dim data bounds (for clipping,
+        # exactly like scripts/inference/play_single_eef_inference.py). z / rotation are
+        # constant in the data so min==max and stay pinned. (1, A) leading dim.
+        acts = load_epi_data["action"][:]
+        model._redcube_bounds = (acts.min(axis=0).astype(np.float32),
+                                 acts.max(axis=0).astype(np.float32))
+        curr_action = load_epi_data["action"][t][None].astype(np.float32)
+        return resolution, model, normalizer, curr_latent_tensor, curr_action
 
     # Build initial action from joint positions
     joint_pos = load_epi_data["obs"]["joint_pos"][t]
@@ -202,9 +226,9 @@ def load_task_config(
 
 
 def encode_frame_jpeg(frame: np.ndarray) -> bytes:
-    # frame: uint8 HWC RGB — OpenCV expects BGR
-    bgr = frame[:, :, ::-1]
-    ok, buf = cv2.imencode(".png", bgr, [int(cv2.IMWRITE_PNG_COMPRESSION), 0])
+    # frame: uint8 HWC RGB — OpenCV expects BGR. JPEG (small + fast) for snappy streaming.
+    bgr = np.ascontiguousarray(frame[:, :, ::-1])
+    ok, buf = cv2.imencode(".jpg", bgr, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
     if not ok:
         return b""
     return buf.tobytes()
@@ -255,6 +279,25 @@ def parse_action(msg: Dict[str, Any], scene: str) -> np.ndarray:
             delta_action[5] = 1
         if msg["o"] == 1:
             delta_action[5] = -1
+    elif scene == "redcube":
+        # Single-arm: (x, y, z, gripper). WASD=XY, IK=Z, JL=gripper.
+        delta_action = np.zeros(4)
+        if msg["w"] == 1:
+            delta_action[1] = 1
+        if msg["s"] == 1:
+            delta_action[1] = -1
+        if msg["a"] == 1:
+            delta_action[0] = -1
+        if msg["d"] == 1:
+            delta_action[0] = 1
+        if msg["i"] == 1:
+            delta_action[2] = 1
+        if msg["k"] == 1:
+            delta_action[2] = -1
+        if msg["j"] == 1:
+            delta_action[3] = -1
+        if msg["l"] == 1:
+            delta_action[3] = 1
     return delta_action
 
 
@@ -288,6 +331,17 @@ def kybd_action_to_rob_action(delta_action: np.ndarray, scene: str) -> np.ndarra
                 -delta_action[3],
                 delta_action[5],
                 0.0,
+            ]
+        )
+    elif scene == "redcube":
+        # keyboard (x, y, z, gripper) -> 7-dim EEF action delta; rotation (3,4,5) fixed.
+        delta_action_rob = np.array(
+            [
+                delta_action[0],   # x
+                delta_action[1],   # y
+                delta_action[2],   # z
+                0.0, 0.0, 0.0,     # rx, ry, rz (held fixed)
+                delta_action[3],   # gripper
             ]
         )
     else:
@@ -393,6 +447,10 @@ async def ws_endpoint(ws: WebSocket) -> None:
                         / (50.0 * action_range_scale[:3])
                     )
                     delta_action[3] = delta_action[3] / 10.0
+                elif scene == "redcube":
+                    delta_action = delta_action.copy()
+                    delta_action[:3] = delta_action[:3] / 10.0
+                    delta_action[3] = delta_action[3] / 40.0
                 else:
                     raise NotImplementedError(f"scene '{scene}' not recognized")
 

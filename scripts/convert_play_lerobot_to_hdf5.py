@@ -144,7 +144,9 @@ def write_hdf5(
 
     if is_human:
         eef_action = np.zeros_like(eef_action)
-        cam_wrist  = np.zeros_like(cam_wrist)
+        # NOTE: do NOT zero the second view here. Older human data had no second
+        # camera (caller passes zeros), but the "can" human data has a real cam_low
+        # that we want to keep so camera_1 is consistent between robot and human.
     if action_mask is None:
         action_mask = np.zeros(T, dtype=np.float32) if is_human else np.ones(T, dtype=np.float32)
 
@@ -272,16 +274,18 @@ def convert_episode(
     crop: tuple[int, int, int, int] | None = None,
     size: int | None = None,
     mask_human: bool = False,
+    cam1_key: str = CAM_WRIST_KEY,
+    crop1: tuple[int, int, int, int] | None = None,
 ) -> None:
     parquet_path = src_dir / "data" / "chunk-000" / f"{stem}.parquet"
-    cam_high_path  = src_dir / "videos" / "chunk-000" / CAM_HIGH_KEY  / f"{stem}.mp4"
-    cam_wrist_path = src_dir / "videos" / "chunk-000" / CAM_WRIST_KEY / f"{stem}.mp4"
+    cam_high_path  = src_dir / "videos" / "chunk-000" / CAM_HIGH_KEY / f"{stem}.mp4"
+    cam_wrist_path = src_dir / "videos" / "chunk-000" / cam1_key     / f"{stem}.mp4"
 
     joint_action, eef_action, state, timestamp, eef_pos, eef_quat = read_parquet(parquet_path)
     cam_high  = decode_video_frames(cam_high_path, crop=crop, size=size)
 
     if cam_wrist_path.exists():
-        cam_wrist = decode_video_frames(cam_wrist_path, crop=None, size=size)
+        cam_wrist = decode_video_frames(cam_wrist_path, crop=crop1, size=size)
     else:
         T = len(cam_high)
         h = w = size if size else 128
@@ -305,12 +309,18 @@ def main():
                              "Remaining robot episodes go to train. Ignored if --src-robot-val is set.")
     parser.add_argument("--val-human", action="store_true", help="Use last human episode as val (only applies when --src-robot-val is not set)")
     parser.add_argument("--crop", type=int, nargs=4, metavar=("X", "Y", "W", "H"),
-                        default=None, help="Crop region for cam_high: x y w h (pixels)")
+                        default=None, help="Crop region for cam_high (camera_0): x y w h (pixels)")
+    parser.add_argument("--cam1-key", default=CAM_WRIST_KEY,
+                        help=f"Second-view camera key (default: {CAM_WRIST_KEY}). "
+                             f"Use {CAM_LOW_KEY} for the 'can' datasets.")
+    parser.add_argument("--crop1", type=int, nargs=4, metavar=("X", "Y", "W", "H"),
+                        default=None, help="Crop region for the second view (camera_1): x y w h (pixels)")
     parser.add_argument("--size", type=int, default=128, help="Output square size after crop (default: 128)")
     args = parser.parse_args()
 
     dst_dir = Path(args.dst)
     crop = tuple(args.crop) if args.crop else None
+    crop1 = tuple(args.crop1) if args.crop1 else None
 
     # collect robot episodes
     robot_dir = Path(args.src_robot)
@@ -372,7 +382,8 @@ def main():
             if is_human_eef:
                 convert_episode_human_eef(src_dir, stem, out_path, crop=crop, size=args.size)
             else:
-                convert_episode(src_dir, stem, out_path, crop=crop, size=args.size, mask_human=is_human)
+                convert_episode(src_dir, stem, out_path, crop=crop, size=args.size,
+                                mask_human=is_human, cam1_key=args.cam1_key, crop1=crop1)
 
     print(f"\nDone. Dataset written to: {dst_dir}")
     print(f"  train: {len(train_items)} episodes")
