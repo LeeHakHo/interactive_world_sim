@@ -85,6 +85,8 @@
 
 **★dummy5rt 判负 + 可视化坐实**(`outputs/cross_embodiment_wm/action_rep_viz/`):它把腕距/指开口冻成固定 canonical(W0/R0),只 c+朝向真实 → **robot OPEN(开口0.103)和 CLOSED(0.001)星座变一样大** → 抹掉夹爪抓取信号 → 最差。**mp 赢**因为:同样冻星座形状,但**把开口留成域中性显式标量**(grip 通道),不塞进几何里再一起抹掉。cpt 更差(3.199)证明纯接触点丢太多(mp≫cpt,mp 不是一个点,是转的小十字+朝向+grip)。
 
+**★dummy5rs('别冻死'几何 breathing)判决=没赢 mp(2026-07-29 夜, 干净 episode-split L24)**:drift_px_cam_high human帮(ro−rh): dummy5rs n100 +4.95/n300 +1.59 vs mp n100 **+5.36**/n300 **+2.18**。→ mp(开口留标量)human帮更大;绝对rh各赢一档(mp赢n100 3.15/dummy5rs赢n300 2.27)。**"开口留几何breathing"≈"留标量",无净增益,mp仍赢**。★附带: **干净split上human稀缺帮存活**(mp n100+5.36 vs 旧泄漏+6.62, 略小仍强正=方向性判决稳)。job 54835-842。
+
 **learning-based retarget(未做)**:MT-π 式学 human→robot 映射 / EgoWAM per-domain 输入 stem。是**输入侧对齐**(域头是输出侧,一枚硬币两面)。比几何 retarget 原则化(几何已判死)。**但同样别指望救满量**(数据天花板);价值在稀缺/迁移 + Do-As-I-Do BC。
 
 ---
