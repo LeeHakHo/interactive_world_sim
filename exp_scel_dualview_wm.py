@@ -128,6 +128,25 @@ def mp_constellation(eef3, view):
     return torch.stack([c, c + R0 * u, c - R0 * u, c + R0 * perp, c - R0 * perp], 2)
 
 
+# --- ACTION=dummy5rs: 几何 retarget "别冻死"修正 (2026-07-29) ---
+# dummy5rt 把开口冻成常数 R0 -> 抹掉抓取信号(可视化坐实, 下游最差)。mp 把开口塞进 grip 标量。
+# dummy5rs = 让星座跟真实开口张合(R=R0·ap/域中位数): 按域中位数归一 -> 域尺度对齐(去 2× 开口泄漏)
+#   + 开合变化保留在【几何】里。测"开口留几何(breathing)"是否 ≥ mp"开口留标量"。grip 仍走标量保 keyboard。
+DUMMY5RS_MED = {0: {"r": 0.0637, "h": 0.1229}, 1: {"r": 0.0498, "h": 0.0993}}   # per-view 每域开口中位数(fit)
+
+
+def dummy5rs(eef3, view, dom):
+    """(B,Lw,3,2)[wrist,t1,t2] -> (B,Lw,5,2) breathing 中点星座(丢腕)。R=R0·(真实开口/域中位数):
+    域尺度对齐 + 开合变化保留在几何。dom∈{r,h} 选域中位数。"""
+    R0 = MP_R0[view]; med = DUMMY5RS_MED[view].get(dom, DUMMY5RS_MED[view]["r"])
+    t1, t2 = eef3[:, :, 1], eef3[:, :, 2]
+    c = (t1 + t2) / 2
+    d = t1 - t2; ap = d.norm(dim=-1, keepdim=True).clamp_min(1e-4); u = d / ap
+    R = R0 * (ap / med)                                                        # breathing 半尺度(域归一)
+    perp = torch.stack([-u[..., 1], u[..., 0]], -1)
+    return torch.stack([c, c + R * u, c - R * u, c + R * perp, c - R * perp], 2)
+
+
 # --- ACTION=skel: isomorphic v2 skeleton action rep (module docstring §skeleton experiment) ---
 # skel_sidecar_robot_v2.npz joint order: [link_1,link_2,link_3,link_4,link_5,link_6,fingertipL',fingertipR']
 # (idx 0..7); we take [link_6, fingertipL', fingertipR', link_5] = idx [5,6,7,4], isomorphic to
@@ -245,8 +264,8 @@ def load_action_tokens(mode, dom, z, sk=None):
         efA = z["eef"].astype(np.float32) if mode == "dummy5" else np.nan_to_num(z["eef"].astype(np.float32), nan=0.5)
         efB = np.nan_to_num(z["eef_low"].astype(np.float32), nan=0.5)
         return efA, efB
-    if mode in ("mp", "dhc"):
-        # mp/dhc = eef 原始三点(_act_pts 内构造星座) + grip 第4槽(归一化指距, 两域[0,1]口径一致).
+    if mode in ("mp", "dhc", "dummy5rs"):
+        # mp/dhc/dummy5rs = eef 原始三点(_act_pts 内构造星座) + grip 第4槽(归一化指距, 两域[0,1]口径一致).
         # grip = 归一化指距(两域各自[0,1], 口径一致, 非 robot physical grip 避免域差)。
         efA = np.nan_to_num(z["eef"].astype(np.float32), nan=0.5)
         efB = np.nan_to_num(z["eef_low"].astype(np.float32), nan=0.5)
@@ -291,10 +310,10 @@ class DualLWC(FlowWM_LWC):
         s.P1 = P
         s.action = action
         s.head_mode = head_mode
-        s.n_tok = 1 if action == "cpt" else (5 if action in ("dummy5", "dummy5g", "dummy5rt", "mp", "dhc") else 4)   # cpt:1 | dummy5(g/rt)/mp/dhc:5 | skel:4
+        s.n_tok = 1 if action == "cpt" else (5 if action in ("dummy5", "dummy5g", "dummy5rt", "mp", "dhc", "dummy5rs") else 4)   # cpt:1 | dummy5(g/rt/rs)/mp/dhc:5 | skel:4
         s.view_emb = nn.Parameter(torch.zeros(2, s.Dm))
         s.act = nn.Linear((K + F) * s.n_tok * 2 * 2, s.Dm)      # action tokens x 2 views
-        if action in ("dummy5g", "mp", "dhc"):                  # 显式 grip 专属嵌入通道 (加到动作 embedding)
+        if action in ("dummy5g", "mp", "dhc", "dummy5rs"):      # 显式 grip 专属嵌入通道 (加到动作 embedding)
             s.act_grip = nn.Linear(K + F, s.Dm)                 # (B,Lw) 归一化 grip 序列 -> Dm
         if action == "dhc":                                     # ★DexWM Δ+HC: 输入喂Δ(同域), HC头从trunk预测绝对c(逼积分Δ→定位)
             s.hc = nn.Sequential(nn.Linear(s.Dm, s.Dm // 2), nn.ReLU(), nn.Linear(s.Dm // 2, 4))  # ->c(2视角×2)
@@ -316,13 +335,16 @@ class DualLWC(FlowWM_LWC):
             raise NotImplementedError("HEAD_MODE=film is Phase-2 (deferred)")
         return s.head(x)                              # single
 
-    def _act_pts(s, eef, view=0):
+    def _act_pts(s, eef, view=0, dom="r"):
         """eef (B,Lw,n_raw,2) -> (B,Lw,n_tok,2) action tokens. dummy5: DexWM virtual constellation.
         dummy5rt: retarget human->robot canonical 星座 (per-view 常数, 需 view). skel: identity.
+        dummy5rs: breathing 星座(R=R0·ap/域中位数, 需 view+dom)。
         getattr default covers unpickling checkpoints saved before this attribute existed."""
         a = getattr(s, "action", "dummy5")
         if a == "dummy5rt":
             return dummy5rt(eef[:, :, :3], view)
+        if a == "dummy5rs":
+            return dummy5rs(eef[:, :, :3], view, dom)                         # breathing 星座(域尺度对齐)
         if a == "mp":
             return mp_constellation(eef[:, :, :3], view)                      # 中点星座丢腕, 第4槽是grip(不入星座)
         if a == "cpt":                                                        # 纯接触点c(单点), 测"mp是否只是单点"
@@ -374,10 +396,10 @@ class DualLWC(FlowWM_LWC):
             d5a[:, :, 0] = d5a[:, :, 0] - oc_a
             d5b[:, :, 0] = d5b[:, :, 0] - oc_b
         else:
-            d5a = s._act_pts(eef_a, 0) - oc_a[:, :, None]
-            d5b = s._act_pts(eef_b, 1) - oc_b[:, :, None]
+            d5a = s._act_pts(eef_a, 0, dom) - oc_a[:, :, None]   # dom -> dummy5rs 选域中位数(其余 action 忽略)
+            d5b = s._act_pts(eef_b, 1, dom) - oc_b[:, :, None]
         act = s.act(torch.cat([d5a.reshape(B, -1), d5b.reshape(B, -1)], -1))[:, None]
-        if getattr(s, "action", "dummy5") in ("dummy5g", "mp"):  # 显式 grip: 读第4槽x, 加专属嵌入
+        if getattr(s, "action", "dummy5") in ("dummy5g", "mp", "dummy5rs"):  # 显式 grip: 读第4槽x, 加专属嵌入
             gr = eef_a[:, :, 3, 0]                              # (B,Lw) 归一化 grip (取 view0)
             act = act + s.act_grip(gr)[:, None]
         x = s.tf(torch.cat([obj, act], 1))[:, :P2]
