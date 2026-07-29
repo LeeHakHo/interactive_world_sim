@@ -38,6 +38,7 @@ Env additions (all default to byte-identical old behavior):
 """
 import json
 import os
+import copy
 
 import numpy as np
 import torch
@@ -282,10 +283,11 @@ def load_action_tokens(mode, dom, z, sk=None):
 
 
 class DualLWC(FlowWM_LWC):
-    def __init__(s, P, action="dummy5", **kw):
+    def __init__(s, P, action="dummy5", head_mode="single", **kw):
         super().__init__(P, **kw)
         s.P1 = P
         s.action = action
+        s.head_mode = head_mode
         s.n_tok = 1 if action == "cpt" else (5 if action in ("dummy5", "dummy5g", "dummy5rt", "mp", "dhc") else 4)   # cpt:1 | dummy5(g/rt)/mp/dhc:5 | skel:4
         s.view_emb = nn.Parameter(torch.zeros(2, s.Dm))
         s.act = nn.Linear((K + F) * s.n_tok * 2 * 2, s.Dm)      # action tokens x 2 views
@@ -298,6 +300,18 @@ class DualLWC(FlowWM_LWC):
             s.act_ras = RasterAct(2 * (K + F), s.Dm)             # 双视角 x Lw 帧当通道
             _posdim = (K + F) * 2 * (3 if action == "rasterg" else 2)   # rasterg: 每视角每帧 (x,y,grip)
             s.act_pos = nn.Linear(_posdim, s.Dm)                 # 双视角末端位置(+归一化 grip)
+        if head_mode == "two":
+            s.head_h = copy.deepcopy(s.head)          # human 头, init = robot 头(暖启)
+
+    def _readout(s, x, dom):
+        """trunk 特征 x (B,P,Dm) -> logits (B,P,F*W*W), 按域路由读出头。
+        getattr 默认 'single' 兼容改动前 pickle 的老 ckpt。"""
+        hm = getattr(s, "head_mode", "single")
+        if hm == "two":
+            return (s.head_h if dom == "h" else s.head)(x)
+        if hm == "film":
+            raise NotImplementedError("HEAD_MODE=film is Phase-2 (deferred)")
+        return s.head(x)                              # single
 
     def _act_pts(s, eef, view=0):
         """eef (B,Lw,n_raw,2) -> (B,Lw,n_tok,2) action tokens. dummy5: DexWM virtual constellation.
@@ -312,7 +326,7 @@ class DualLWC(FlowWM_LWC):
             return ((eef[:, :, 1] + eef[:, :, 2]) / 2)[:, :, None]            # (B,Lw,1,2)
         return dummy5(eef[:, :, :3]) if a in ("dummy5", "dummy5g", "dhc") else eef   # dummy5g/dhc: 前3点建星座, 第4槽grip
 
-    def fwd_dual(s, hist, eef_a, eef_b):
+    def fwd_dual(s, hist, eef_a, eef_b, dom="r"):
         """hist (B,2P,K,2) [view0 pts | view1 pts]; eef_a/b (B,K+F,n_raw,2) per view."""
         B, P2 = hist.shape[:2]
         anchor = hist[:, :, -1, :]
@@ -337,7 +351,7 @@ class DualLWC(FlowWM_LWC):
                 pos_in = torch.cat([pa.reshape(B, -1), pb.reshape(B, -1)], -1)
             act = (s.act_pos(pos_in) + s.act_ras(torch.cat([ra, rb], 1)))[:, None]
             x = s.tf(torch.cat([obj, act], 1))[:, :P2]
-            logits = s.head(x).reshape(B, P2, F, s.W * s.W)
+            logits = s._readout(x, dom).reshape(B, P2, F, s.W * s.W)
             return logits, anchor
         if getattr(s, "action", "dummy5") == "dhc":            # ★DexWM Δ+HC: 喂Δ星座(同域)+grip, HC头预测绝对c
             a5 = s._act_pts(eef_a, 0) - oc_a[:, :, None]        # (B,Lw,5,2) 对象相对绝对星座
@@ -350,7 +364,7 @@ class DualLWC(FlowWM_LWC):
             hc_pred = s.hc(x.mean(1))                           # (B,4) 从trunk预测绝对c
             gt_c = torch.cat([a5[:, K - 1, 1], b5[:, K - 1, 1]], -1)   # 对象相对c(dummy5 idx1=中点), anchor帧
             s._hc_aux = ((hc_pred - gt_c) ** 2).mean()          # HC辅助loss(_ss_loss读取)
-            logits = s.head(x).reshape(B, P2, F, s.W * s.W)
+            logits = s._readout(x, dom).reshape(B, P2, F, s.W * s.W)
             return logits, anchor
         if getattr(s, "action", "dummy5") == "skelv3":
             d5a = s._act_pts(eef_a, 0).clone(); d5b = s._act_pts(eef_b, 1).clone()
@@ -364,7 +378,7 @@ class DualLWC(FlowWM_LWC):
             gr = eef_a[:, :, 3, 0]                              # (B,Lw) 归一化 grip (取 view0)
             act = act + s.act_grip(gr)[:, None]
         x = s.tf(torch.cat([obj, act], 1))[:, :P2]
-        logits = s.head(x).reshape(B, P2, F, s.W * s.W)
+        logits = s._readout(x, dom).reshape(B, P2, F, s.W * s.W)
         return logits, anchor
 
 
