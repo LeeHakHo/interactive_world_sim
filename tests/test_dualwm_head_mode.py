@@ -65,3 +65,21 @@ def test_fwd_dual_accepts_dom_and_routes():
     lh, _ = m.fwd_dual(hist, eef, eef, dom="h")
     assert lr.shape == lh.shape
     assert torch.allclose(lr, lh, atol=1e-5)                   # 暖启 init 两头相等
+
+
+# --- 共享 rollout_dual 的 dom 契约回归 ---
+# rollout_dual 现在给 fwd_dual 传 dom=(域头改动); 任何复用 rollout_dual 的
+# DualLWC/FlowWM_LWC 子类的 fwd_dual override 必须接受 dom, 否则 eval-rollout 时 TypeError.
+# 锁住两个已知复用者(comb=paused combine 线, curriculum=human-help 脚本)。
+import inspect
+
+
+@pytest.mark.parametrize("modname,clsname", [
+    ("exp_scel_dualview_comb", "DualCombLWC"),
+    ("exp_scel_humanhelp_curriculum", "CurrDual"),
+])
+def test_sibling_fwd_dual_accepts_dom(modname, clsname):
+    mod = __import__(modname)
+    cls = getattr(mod, clsname)
+    params = inspect.signature(cls.fwd_dual).parameters
+    assert "dom" in params, f"{clsname}.fwd_dual 必须接受 dom(rollout_dual 会传 dom=)"

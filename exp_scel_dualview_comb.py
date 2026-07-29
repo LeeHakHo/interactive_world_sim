@@ -96,7 +96,7 @@ class DualCombLWC(W.DualLWC):
             s.aux["align"] = (1 - nn.functional.cosine_similarity(x, xt, dim=-1)).mean()
         return x, anchor
 
-    def fwd_dual(s, hist, eef_a, eef_b, is_h=None):
+    def fwd_dual(s, hist, eef_a, eef_b, is_h=None, dom="r"):    # dom 吞掉: 共享 rollout_dual 现传 dom= (域头改动), 本子类单头忽略
         x, anchor = s._trunk_dual(hist, eef_a, eef_b, is_h)
         B, P2 = x.shape[:2]
         logits = s.head(x).reshape(B, P2, F, s.W * s.W)
