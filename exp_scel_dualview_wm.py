@@ -54,12 +54,15 @@ DS = os.environ.get("DS", "outputs/flow_render_dataset_can_dual/clips_robot.npz"
 SPLIT = os.environ.get("SPLIT", "legacy")                     # legacy | okfirst (audit item5 leakage fix)
 ACTION = os.environ.get("ACTION", "dummy5")                   # dummy5 (default, unchanged) | skel (isomorphic v2)
 MIX = os.environ.get("MIX", "r")                               # r (default, robot-only) | rh (human co-train)
+HEAD_MODE = os.environ.get("HEAD_MODE", "single")             # single(默认,逐字节不变) | two(域头) | film(deferred)
 NROB = os.environ.get("NROB", "")                               # "" = full robot pool | int = robot-scarce N
 _NROB_TAG = NROB if NROB else "all"
 SEED = int(os.environ.get("SEED", "0"))                         # 训练种子; seed=0 保持原路径(向后兼容)
 _SEED_TAG = "" if SEED == 0 else f"_s{SEED}"
-_DEFAULT_OUT = ("outputs/cross_embodiment_wm/dualview_wm" if (ACTION == "dummy5" and MIX == "r" and not NROB and SEED == 0)
-                else f"outputs/cross_embodiment_wm/dualview_wm_skelact/{ACTION}_{MIX}_n{_NROB_TAG}{_SEED_TAG}")
+_HEAD_TAG = "" if HEAD_MODE == "single" else f"_{HEAD_MODE}"
+_DEFAULT_OUT = ("outputs/cross_embodiment_wm/dualview_wm"
+                if (ACTION == "dummy5" and MIX == "r" and not NROB and SEED == 0 and HEAD_MODE == "single")
+                else f"outputs/cross_embodiment_wm/dualview_wm_skelact/{ACTION}_{MIX}_n{_NROB_TAG}{_SEED_TAG}{_HEAD_TAG}")
 OUT = os.environ.get("OUT_DIR", _DEFAULT_OUT)
 os.makedirs(OUT, exist_ok=True)
 H = int(os.environ.get("H", "40")); HELDOUT = int(os.environ.get("HELDOUT_N", "150")); IMG = 128; VEL_HALF = 0.06
@@ -382,7 +385,7 @@ class DualLWC(FlowWM_LWC):
         return logits, anchor
 
 
-def _ss_loss(m, G, Vv, Ea, Eb, R_SS, pteach):
+def _ss_loss(m, G, Vv, Ea, Eb, R_SS, pteach, dom="r"):
     """Scheduled-sampling rollout CE loss for one batch (NO optimizer step). Domain-agnostic."""
     buf = G[:, :K].clone(); losses = []
     for h in range(R_SS):
@@ -391,7 +394,7 @@ def _ss_loss(m, G, Vv, Ea, Eb, R_SS, pteach):
             pad = K + F - wa.shape[1]
             wa = torch.cat([wa, wa[:, -1:].repeat(1, pad, 1, 1)], 1)
             wb = torch.cat([wb, wb[:, -1:].repeat(1, pad, 1, 1)], 1)
-        logits, _ = m.fwd_dual(buf[:, -K:].permute(0, 2, 1, 3), wa, wb)
+        logits, _ = m.fwd_dual(buf[:, -K:].permute(0, 2, 1, 3), wa, wb, dom=dom)
         lg0 = logits[:, :, 0, :]
         gt_vel = G[:, K + h] - buf[:, -1]
         cls = vel_to_class(gt_vel, m.W, m.vel_half)
@@ -416,14 +419,14 @@ def _ss_batch_step(m, opt, G, Vv, Ea, Eb, R_SS, pteach):
 
 
 def train_dual(trD, vsD, efA, efB, idx, seed=0, R_SS=32, action="dummy5",
-               trDh=None, vsDh=None, efAh=None, efBh=None, idxh=None):
+               trDh=None, vsDh=None, efAh=None, efBh=None, idxh=None, head_mode="single"):
     """SS training, robot pool (trD/.../idx). MIX=rh (trDh et al not None): after each robot epoch's
     batches, also SS-train on the human co-train pool with the SAME vis-weighted CE loss (no extra
     reweighting) -- rollout steps capped to the human clip length (R_SS_h = min(R_SS, L_human-K),
     since clips_human_L24.npz is L=24 vs the robot's L=48). Default args (action='dummy5', no *h)
     reproduce the original robot-only loop exactly (same rng call order/shapes -> byte-identical)."""
     torch.manual_seed(seed); P2 = trD.shape[2]
-    m = DualLWC(P2 // 2, action=action, Dm=384, layers=3, W=15, vel_half=VEL_HALF).to(device)
+    m = DualLWC(P2 // 2, action=action, head_mode=head_mode, Dm=384, layers=3, W=15, vel_half=VEL_HALF).to(device)
     # base __init__ sized inp for P; token count doesn't affect Linear dims -> fine
     opt = torch.optim.AdamW(m.parameters(), lr=SSm.WM_LR)
     g = torch.Generator().manual_seed(seed)
@@ -460,7 +463,7 @@ def train_dual(trD, vsD, efA, efB, idx, seed=0, R_SS=32, action="dummy5",
                 lr = _ss_loss(m, trT[br].to(device), vsT[br].to(device),
                               eAT[br].to(device), eBT[br].to(device), R_SS, pteach)
                 lh = _ss_loss(m, trTh[bh].to(device), vsTh[bh].to(device),
-                              eATh[bh].to(device), eBTh[bh].to(device), R_SS_h, pteach)
+                              eATh[bh].to(device), eBTh[bh].to(device), R_SS_h, pteach, dom="h")
                 loss = lr + lh
                 opt.zero_grad(); loss.backward(); opt.step()
                 loss = float(loss)
@@ -469,7 +472,7 @@ def train_dual(trD, vsD, efA, efB, idx, seed=0, R_SS=32, action="dummy5",
 
 
 @torch.no_grad()
-def rollout_dual(m, trD, efA, efB, Hn):
+def rollout_dual(m, trD, efA, efB, Hn, dom="r"):
     buf = trD[:, :K].clone(); Lw = K + F; preds = []
     for h in range(Hn):
         wa = efA[:, h:h + Lw]; wb = efB[:, h:h + Lw]
@@ -477,7 +480,7 @@ def rollout_dual(m, trD, efA, efB, Hn):
             pad = Lw - wa.shape[1]
             wa = torch.cat([wa, wa[:, -1:].repeat(1, pad, 1, 1)], 1)
             wb = torch.cat([wb, wb[:, -1:].repeat(1, pad, 1, 1)], 1)
-        logits, _ = m.fwd_dual(buf[:, -K:].permute(0, 2, 1, 3), wa, wb)
+        logits, _ = m.fwd_dual(buf[:, -K:].permute(0, 2, 1, 3), wa, wb, dom=dom)
         nxt = buf[:, -1] + m.expected_vel(logits[:, :, 0, :])
         preds.append(nxt); buf = torch.cat([buf, nxt[:, None]], 1)
     return torch.stack(preds, 1)                               # (B,H,2P,2)
@@ -597,7 +600,7 @@ def main():
         print(f"human co-train clips: {n_human}/{len(okh)} (L={trDh.shape[1]})", flush=True)
 
     m = train_dual(trD, vsD, efA, efB, torch.from_numpy(pool), action=ACTION, seed=SEED, R_SS=R_SS_ENV,
-                   trDh=trDh, vsDh=vsDh, efAh=efAh, efBh=efBh, idxh=idxh)
+                   trDh=trDh, vsDh=vsDh, efAh=efAh, efBh=efBh, idxh=idxh, head_mode=HEAD_MODE)
     torch.save(m, f"{OUT}/wm_dual.pt")
 
     pr = rollout_dual(m, torch.from_numpy(trD[ho]).float().to(device),
@@ -619,7 +622,7 @@ def main():
     zr = np.nanmax(t3[ho][..., 2], axis=(1, 2)) - np.nanmin(t3[ho][..., 2], axis=(1, 2))
     lift = zr > 0.08
     metrics = {
-        "action": ACTION, "mix": MIX, "nrob": int(NROB) if NROB else None,
+        "action": ACTION, "mix": MIX, "head_mode": HEAD_MODE, "nrob": int(NROB) if NROB else None,
         "n_train_robot": int(len(pool)), "n_human_cotrain": int(n_human), "n_heldout": int(len(ho)),
         "drift_px_cam_high": float(eA.mean()), "drift_px_cam_low": float(eB.mean()),
         "drift_px_cam_high_lift": float(eA[lift].mean()), "drift_px_cam_low_lift": float(eB[lift].mean()),
