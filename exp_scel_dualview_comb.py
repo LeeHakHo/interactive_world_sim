@@ -73,6 +73,9 @@ class DualCombLWC(W.DualLWC):
             is_h = torch.zeros(B, dtype=torch.bool, device=hist.device)
         if s.combine == "dummy5":
             act = s.act(d5)
+        elif s.combine == "abs":                               # 绝对 eef 星座(不减物体质心):相对 vs 绝对 消融
+            d5a_abs = W.dummy5(eef_a); d5b_abs = W.dummy5(eef_b)   # 唯一差别=去掉 oc 减法, 同 s.act 头/同 5 点
+            act = s.act(torch.cat([d5a_abs.reshape(B, -1), d5b_abs.reshape(B, -1)], -1))
         elif s.combine == "skel":
             act = s.act_shared(torch.cat([feat_skel(eef_a), feat_skel(eef_b)], -1))
         elif s.combine == "a1":
@@ -252,7 +255,7 @@ def main():
                 roH, roL = ade_dual(wm_ro, r_tr, r_eA, r_eB, ho)
                 rhH, rhL = ade_dual(wm_rh, r_tr, r_eA, r_eB, ho)
                 res[meth][N].append((roH, roL, rhH, rhL))
-                if meth in ("dummy5", "align_wm"):              # e2e 配对 ckpt:存 rh 臂(最后 seed 覆盖)
+                if meth in ("dummy5", "align_wm", "abs"):       # e2e 配对 ckpt:存 rh 臂(最后 seed 覆盖)
                     try:
                         torch.save(wm_rh, f"{OUT}/wm_{meth}_rh_N{N}.pt")
                     except Exception as e:                      # 磁盘满等:别让 ckpt 保存毁掉 metrics
