@@ -9,19 +9,35 @@ robot 已 L48 不动。新数据全进独立目录 `outputs/flow_render_dataset_
 - `build_human_realwrist_clips.py`: 加 env `BASE`, `HCLIP`(默认 clips_human_L24)。
 - `build_human_wrist_low.py`: 加 env `BASE`, `HCLIP`; 老 sidecar 校验缺失时跳过。
 
-## 阶段状态
-| 阶段 | 脚本 | job id | 状态 |
+## 阶段状态 — 全链 afterok 依赖已提交 (2026-07-29)
+阶段1冒烟 job 54843 COMPLETED 53s: clips_human.npz N=8 frames=(8,48,128,128,3) → **L=48确认**。
+全量链一次性提交(submit_L48_chain.sh), afterok 串联, 上游失败下游自动不跑。
+
+| 阶段 | 脚本/sbatch | job id | dep |
 |---|---|---|---|
-| 1 base human L48 (smoke) | sbatch_gen_human_L48.sbatch | 54843 | PENDING |
-| 1 base human L48 (full) | | | - |
-| 2 dualview cam_low | gen_dualview_aligned.py | | - |
-| 3 retrack GDINO+SAM2 (high/low) | retrack_sam2_full.py | | - |
-| 4 assemble | assemble_retrack_clips.py | | - |
-| 5 realwrist + wrist sidecar L48 | build_human_wrist_low.py + build_human_realwrist_clips.py | | - |
-| 6 wan latents L48 | build_can256_latents.py | | - |
-| 7 cond agent-skel L48 | build_can_cond.py | | - |
-| 8a 重训 ② {ro,rh,rh_two} | exp_scel_dualview_wm.py | | - |
-| 8b 重训 ③ {ro,rh} | train_multihead_wm.py | | - |
+| 1 base human L48 (full) | sbatch_gen_human_L48.sbatch | **54860** | - |
+| 2 dualview cam_low | sbatch_gen_dualview_L48.sbatch | **54861** | afterok:54860 |
+| 3a retrack high | sbatch_retrack.sbatch (BASE/HCLIP=human_L48) | **54862** | afterok:54861 |
+| 3b retrack low | sbatch_retrack.sbatch | **54863** | afterok:54861 |
+| 4 assemble | sbatch_assemble_L48.sbatch | **54864** | afterok:54862,54863 |
+| 5 realwrist + wrist sidecar | sbatch_realwrist_L48.sbatch | **54865** | afterok:54864 |
+| 6 wan latents L48 (.venv_wan) | sbatch_human_latents.sbatch (OUTDIR=..._L48) | **54866** | afterok:54865 |
+| 7 cond eef3 L48 | sbatch_cond_human_L48.sbatch | **54867** | afterok:54866 |
+| 8a ② ro full | sbatch_wm2_shard.sbatch (MIX=r single) | **54868** | afterok:54865 |
+| 8a ② rh full | sbatch_wm2_shard.sbatch (MIX=rh single) | **54869** | afterok:54865 |
+| 8a ② rh_two full ★判决 | sbatch_wm2_shard.sbatch (MIX=rh HEAD_MODE=two) | **54870** | afterok:54865 |
+| 8a ② ro n100 | | **54871** | afterok:54865 |
+| 8a ② rh n100 | | **54872** | afterok:54865 |
+| 8a ② ro n300 | | **54873** | afterok:54865 |
+| 8a ② rh n300 | | **54874** | afterok:54865 |
+| 8b ③ ro (robot-only) | sbatch_mh_train_L48.sbatch (MIX="") | **54875** | afterok:54867 |
+| 8b ③ rh (cotrain) | sbatch_mh_train_L48.sbatch (MIX=human) | **54876** | afterok:54867 |
+
+② 全量 OUT: outputs/cross_embodiment_wm/epsplit_L48/{mp_r_all,mp_rh_all,mp_rh_all_two,mp_r_n{100,300},mp_rh_n{100,300}}
+③ OUT: outputs/video_arch_wm/epsplit_L48_mh/{ro,rh}; summary=各 OUT/summary*.txt / mh eval log
+② env: DS=clips_robot_retrack DS_H=clips_human_L48_retrack_realwrist ACTION=mp HELDOUT_VIDS=100,102 HELDOUT_VIDS_H=0,1
+③ env: LAT/COND=robot旧, LAT_H/COND_H=L48新, HELDOUT_VIDS=100,102 STEPS=40000 CCOND=4 PRED=abs
+★注: ③ cond=eef3 7ch(匹配现有 cond_human_eef3_*), 非skel; human latents tL 6→12 修L不齐; 全在新目录不覆盖L24。
 
 ## 数据流 (L48, 全在 ..._L48/ 目录)
 - 1 → clips_human.npz (high view)
