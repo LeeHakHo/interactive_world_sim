@@ -61,7 +61,9 @@ _DEFAULT_OUT = ("outputs/cross_embodiment_wm/dualview_wm" if (ACTION == "dummy5"
                 else f"outputs/cross_embodiment_wm/dualview_wm_skelact/{ACTION}_{MIX}_n{_NROB_TAG}{_SEED_TAG}")
 OUT = os.environ.get("OUT_DIR", _DEFAULT_OUT)
 os.makedirs(OUT, exist_ok=True)
-H = 40; HELDOUT = 150; IMG = 128; VEL_HALF = 0.06
+H = int(os.environ.get("H", "40")); HELDOUT = int(os.environ.get("HELDOUT_N", "150")); IMG = 128; VEL_HALF = 0.06
+R_SS_ENV = int(os.environ.get("R_SS", "32"))          # human-only(L=24)须 R_SS<=L-K=20
+GRIP_MAX = 0.04          # obs_right_gripper 物理开口上限, 用于归一化 grip -> [0,1] (dummy5g 显式 grip 通道)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 CROPS = {0: (60, 60, 390, 390), 1: (0, 0, 640, 480)}          # view0=cam_high, view1=cam_low
@@ -77,6 +79,49 @@ def dummy5(eef3):
     c = (t1 + t2) / 2; ax = (t1 - t2) / 2
     perp = torch.stack([-ax[..., 1], ax[..., 0]], -1)
     return torch.stack([wrist, c, c + ax, c - ax, c + perp], 2)
+
+
+# --- ACTION=dummy5rt: DexWM 式 retarget (2026-07-28) ---
+# 动机: dummy5 星座形状/尺度域特有(眼检: robot 两指并排腕左侧 / human 两指从腕下张开,
+#   半开口 1.96x; 腕-接触点距离 robot 0.19 vs human 0.06 = 6x 拓扑不等价) -> 模型看星座形状就能分域.
+# 朴素相似变换桥不过(腕距/开口比值差 6x). DexWM 做法: 不 retarget 原始点, 而是两域用【同一构造函数】
+#   从功能参数(接触点 c + 指轴方向 + 腕方向)重建 canonical 星座, 腕距/半开口用固定常数归一化.
+#   -> 星座形状域一致(构造相同); 但 c(绝对接触位置)+朝向真实 -> 位置不丢(避开 velcontact/skelv3 陷阱).
+# 常数从 robot 域拟合(scratchpad/fit_retarget.py): (腕-c 距离 W0, 半开口 R0) 每视角.
+DUMMY5RT_CONST = {0: (0.194, 0.029), 1: (0.190, 0.024)}       # {view: (W0, R0)}
+
+
+def dummy5rt(eef3, view):
+    """(B,Lw,3,2) [wrist,t1,t2] -> (B,Lw,5,2) canonical-shape 星座 (retarget human->robot 几何).
+    两域同构造: c 绝对保留; 腕方向真实但距离归 W0; 指轴方向真实但半开口归 R0. 去形状/尺度域泄漏.
+    ★实证判死(diag_dummy5rt_separability.py probe 0.9994): 几何retarget没用, 保留当反例."""
+    W0, R0 = DUMMY5RT_CONST[view]
+    wrist, t1, t2 = eef3[:, :, 0], eef3[:, :, 1], eef3[:, :, 2]
+    c = (t1 + t2) / 2
+    d = t1 - t2; u = d / d.norm(dim=-1, keepdim=True).clamp_min(1e-4)          # 指轴单位向量
+    perp = torch.stack([-u[..., 1], u[..., 0]], -1)
+    wd = wrist - c; wu = wd / wd.norm(dim=-1, keepdim=True).clamp_min(1e-4)    # 腕方向单位向量
+    wrist_c = c + W0 * wu                                                      # 腕: 方向真实, 距离归一
+    return torch.stack([wrist_c, c, c + R0 * u, c - R0 * u, c + R0 * perp], 2)
+
+
+# --- ACTION=mp: Point-Policy 换锚 (2026-07-28, related-work grounded) ---
+# 3-agent 深读结论(AGENT_RETARGET_RELWORK): wrist 难题正解 = 丢解剖腕/link_6, 用【两指中点=接触功能点】
+#   当参考(Point Policy 2502.20391): 两域参考点都落接触区, 语义构造上一致 -> 消 6× 腕-指比值失配。
+#   + canonical 半尺度 R0 去 1.96× 开口泄漏; 指轴方向真实(carry 朝向); grip 走显式标量(dummy5g 管线)。
+# 与 dummy5rt 差别: 完全丢 wrist(dummy5rt 还保留一个 canonical 腕点仍泄漏方向)。判据=下游human-helps(非probe)。
+MP_R0 = {0: 0.029, 1: 0.024}       # canonical 半开口 per view (从 robot 拟合, 同 dummy5rt R0)
+
+
+def mp_constellation(eef3, view):
+    """(B,Lw,3,2) [wrist,t1,t2] -> (B,Lw,5,2) 中点参考星座(丢腕). c=两指中点(对象相对carry接触位置),
+    指轴方向真实, 半尺度归 canonical R0(去开口域泄漏). grip 另走 act_grip 标量, 不入星座尺度."""
+    R0 = MP_R0[view]
+    t1, t2 = eef3[:, :, 1], eef3[:, :, 2]                                      # 只用两指, 丢 wrist(eef3[:,:,0])
+    c = (t1 + t2) / 2
+    d = t1 - t2; u = d / d.norm(dim=-1, keepdim=True).clamp_min(1e-4)
+    perp = torch.stack([-u[..., 1], u[..., 0]], -1)
+    return torch.stack([c, c + R0 * u, c - R0 * u, c + R0 * perp, c - R0 * perp], 2)
 
 
 # --- ACTION=skel: isomorphic v2 skeleton action rep (module docstring §skeleton experiment) ---
@@ -192,10 +237,35 @@ def load_action_tokens(mode, dom, z, sk=None):
       8-pt robot_v2 sidecar; dom='h' uses the human sidecar's 4 points verbatim); nan_to_num(0.5) on
       both views (matches wm convention for track/action arrays with occasional NaN, e.g. undetected
       human hand frames or a view-1 fall-off)."""
-    if mode == "dummy5":
-        efA = z["eef"].astype(np.float32)
+    if mode in ("dummy5", "dummy5rt", "cpt"):                   # cpt: 纯接触点c(单点), 构造在 _act_pts
+        efA = z["eef"].astype(np.float32) if mode == "dummy5" else np.nan_to_num(z["eef"].astype(np.float32), nan=0.5)
         efB = np.nan_to_num(z["eef_low"].astype(np.float32), nan=0.5)
         return efA, efB
+    if mode in ("mp", "dhc"):
+        # mp/dhc = eef 原始三点(_act_pts 内构造星座) + grip 第4槽(归一化指距, 两域[0,1]口径一致).
+        # grip = 归一化指距(两域各自[0,1], 口径一致, 非 robot physical grip 避免域差)。
+        efA = np.nan_to_num(z["eef"].astype(np.float32), nan=0.5)
+        efB = np.nan_to_num(z["eef_low"].astype(np.float32), nan=0.5)
+
+        def gripslot(ef):
+            g = np.linalg.norm(ef[:, :, 1] - ef[:, :, 2], axis=-1)
+            g = g / (float(np.nanmax(g)) + 1e-6)
+            return np.stack([g, np.zeros_like(g)], -1)[:, :, None, :]        # (N,L,1,2)
+        return np.concatenate([efA, gripslot(efA)], 2), np.concatenate([efB, gripslot(efB)], 2)
+    if mode == "dummy5g":
+        # dummy5g = dummy5 三点 + 显式归一化物理 grip 作第4槽 (grip_norm, 0).
+        # grip 顺 eef 数组的加窗/pad 管线走 -> train_dual/rollout_dual/fwd_dual 签名零改动.
+        # fwd_dual 只读 [...,3,0] 当 grip, y 槽恒 0 (占位, 不被读). 星座只用前3点 (见 _act_pts).
+        efA = z["eef"].astype(np.float32)                              # (N,L,3,2)
+        efB = np.nan_to_num(z["eef_low"].astype(np.float32), nan=0.5)
+        if "grip" in z.files:                                          # robot: obs_right_gripper 物理开口
+            g = z["grip"].astype(np.float32) / GRIP_MAX                # (N,L) -> [0,1]
+        else:                                                         # human: 无夹爪, 用2D指尖开口当 grip 代理
+            ef = z["eef"].astype(np.float32)
+            g = np.linalg.norm(ef[:, :, 1] - ef[:, :, 2], axis=-1)     # (N,L) 指尖间距
+            g = g / (float(np.nanmax(g)) + 1e-6)
+        gpt = np.stack([g, np.zeros_like(g)], -1)[:, :, None, :]       # (N,L,1,2) grip 占位点
+        return np.concatenate([efA, gpt], 2), np.concatenate([efB, gpt], 2)   # (N,L,4,2) 两视角同 grip
     if mode in ("raster", "rasterg"):                       # OSCAR 式局部光栅图 (rasterg 加归一化 grip 标量)
         return load_raster_action(dom, z, sk, with_grip=(mode == "rasterg"))
     assert sk is not None, "ACTION=skel/skelv3 requires the skeleton sidecar npz"
@@ -216,19 +286,31 @@ class DualLWC(FlowWM_LWC):
         super().__init__(P, **kw)
         s.P1 = P
         s.action = action
-        s.n_tok = 5 if action == "dummy5" else 4                # dummy5: 3->5 virtual pts | skel: 4 tokens as-is
+        s.n_tok = 1 if action == "cpt" else (5 if action in ("dummy5", "dummy5g", "dummy5rt", "mp", "dhc") else 4)   # cpt:1 | dummy5(g/rt)/mp/dhc:5 | skel:4
         s.view_emb = nn.Parameter(torch.zeros(2, s.Dm))
         s.act = nn.Linear((K + F) * s.n_tok * 2 * 2, s.Dm)      # action tokens x 2 views
+        if action in ("dummy5g", "mp", "dhc"):                  # 显式 grip 专属嵌入通道 (加到动作 embedding)
+            s.act_grip = nn.Linear(K + F, s.Dm)                 # (B,Lw) 归一化 grip 序列 -> Dm
+        if action == "dhc":                                     # ★DexWM Δ+HC: 输入喂Δ(同域), HC头从trunk预测绝对c(逼积分Δ→定位)
+            s.hc = nn.Sequential(nn.Linear(s.Dm, s.Dm // 2), nn.ReLU(), nn.Linear(s.Dm // 2, 4))  # ->c(2视角×2)
+            s._hc_aux = None
         if action in ("raster", "rasterg"):                      # OSCAR 式: 光栅图(CNN) + 末端位置(+grip)(Linear)
             s.act_ras = RasterAct(2 * (K + F), s.Dm)             # 双视角 x Lw 帧当通道
             _posdim = (K + F) * 2 * (3 if action == "rasterg" else 2)   # rasterg: 每视角每帧 (x,y,grip)
             s.act_pos = nn.Linear(_posdim, s.Dm)                 # 双视角末端位置(+归一化 grip)
 
-    def _act_pts(s, eef):
+    def _act_pts(s, eef, view=0):
         """eef (B,Lw,n_raw,2) -> (B,Lw,n_tok,2) action tokens. dummy5: DexWM virtual constellation.
-        skel: tokens already ARE the isomorphic geometric skeleton points -> identity (no expansion).
+        dummy5rt: retarget human->robot canonical 星座 (per-view 常数, 需 view). skel: identity.
         getattr default covers unpickling checkpoints saved before this attribute existed."""
-        return dummy5(eef) if getattr(s, "action", "dummy5") == "dummy5" else eef
+        a = getattr(s, "action", "dummy5")
+        if a == "dummy5rt":
+            return dummy5rt(eef[:, :, :3], view)
+        if a == "mp":
+            return mp_constellation(eef[:, :, :3], view)                      # 中点星座丢腕, 第4槽是grip(不入星座)
+        if a == "cpt":                                                        # 纯接触点c(单点), 测"mp是否只是单点"
+            return ((eef[:, :, 1] + eef[:, :, 2]) / 2)[:, :, None]            # (B,Lw,1,2)
+        return dummy5(eef[:, :, :3]) if a in ("dummy5", "dummy5g", "dhc") else eef   # dummy5g/dhc: 前3点建星座, 第4槽grip
 
     def fwd_dual(s, hist, eef_a, eef_b):
         """hist (B,2P,K,2) [view0 pts | view1 pts]; eef_a/b (B,K+F,n_raw,2) per view."""
@@ -257,14 +339,30 @@ class DualLWC(FlowWM_LWC):
             x = s.tf(torch.cat([obj, act], 1))[:, :P2]
             logits = s.head(x).reshape(B, P2, F, s.W * s.W)
             return logits, anchor
+        if getattr(s, "action", "dummy5") == "dhc":            # ★DexWM Δ+HC: 喂Δ星座(同域)+grip, HC头预测绝对c
+            a5 = s._act_pts(eef_a, 0) - oc_a[:, :, None]        # (B,Lw,5,2) 对象相对绝对星座
+            b5 = s._act_pts(eef_b, 1) - oc_b[:, :, None]
+            da = torch.cat([torch.zeros_like(a5[:, :1]), a5[:, 1:] - a5[:, :-1]], 1)   # Δ (velocity, 同域)
+            db = torch.cat([torch.zeros_like(b5[:, :1]), b5[:, 1:] - b5[:, :-1]], 1)
+            act = s.act(torch.cat([da.reshape(B, -1), db.reshape(B, -1)], -1))[:, None]
+            act = act + s.act_grip(eef_a[:, :, 3, 0])[:, None]                          # grip 标量(保keyboard可控)
+            x = s.tf(torch.cat([obj, act], 1))[:, :P2]
+            hc_pred = s.hc(x.mean(1))                           # (B,4) 从trunk预测绝对c
+            gt_c = torch.cat([a5[:, K - 1, 1], b5[:, K - 1, 1]], -1)   # 对象相对c(dummy5 idx1=中点), anchor帧
+            s._hc_aux = ((hc_pred - gt_c) ** 2).mean()          # HC辅助loss(_ss_loss读取)
+            logits = s.head(x).reshape(B, P2, F, s.W * s.W)
+            return logits, anchor
         if getattr(s, "action", "dummy5") == "skelv3":
-            d5a = s._act_pts(eef_a).clone(); d5b = s._act_pts(eef_b).clone()
+            d5a = s._act_pts(eef_a, 0).clone(); d5b = s._act_pts(eef_b, 1).clone()
             d5a[:, :, 0] = d5a[:, :, 0] - oc_a
             d5b[:, :, 0] = d5b[:, :, 0] - oc_b
         else:
-            d5a = s._act_pts(eef_a) - oc_a[:, :, None]
-            d5b = s._act_pts(eef_b) - oc_b[:, :, None]
+            d5a = s._act_pts(eef_a, 0) - oc_a[:, :, None]
+            d5b = s._act_pts(eef_b, 1) - oc_b[:, :, None]
         act = s.act(torch.cat([d5a.reshape(B, -1), d5b.reshape(B, -1)], -1))[:, None]
+        if getattr(s, "action", "dummy5") in ("dummy5g", "mp"):  # 显式 grip: 读第4槽x, 加专属嵌入
+            gr = eef_a[:, :, 3, 0]                              # (B,Lw) 归一化 grip (取 view0)
+            act = act + s.act_grip(gr)[:, None]
         x = s.tf(torch.cat([obj, act], 1))[:, :P2]
         logits = s.head(x).reshape(B, P2, F, s.W * s.W)
         return logits, anchor
@@ -287,6 +385,8 @@ def _ss_loss(m, G, Vv, Ea, Eb, R_SS, pteach):
         ce = nn.functional.cross_entropy(lg0.reshape(-1, m.W * m.W), cls.reshape(-1),
                                          reduction="none")
         ce = (ce * w.reshape(-1)).sum() / (w.sum() + 1e-6)
+        if getattr(m, "action", "dummy5") == "dhc" and getattr(m, "_hc_aux", None) is not None:
+            ce = ce + 100.0 * m._hc_aux                        # DexWM HC头 λ=100(逼trunk积分Δ→定位)
         losses.append(ce)
         nxt = buf[:, -1] + m.expected_vel(lg0)
         use_gt = (torch.rand(len(G), 1, 1, device=device) < pteach)
@@ -430,9 +530,15 @@ def main():
     vsD = np.concatenate([vsA, vsB], 2)
 
     ds_dir = os.path.dirname(DS)
-    sk_r = (np.load(f"{ds_dir}/raster_sidecar_robot.npz") if ACTION in ("raster", "rasterg")
-            else np.load(f"{ds_dir}/skel_sidecar_robot_v2.npz") if ACTION in ("skel", "skelv3") else None)
-    efA, efB = load_action_tokens(ACTION, "r", z, sk_r)
+    _PRIM_HUMAN = "human" in os.path.basename(DS)           # ★ho场景 DS=human → 加载human sidecar+dom=h(修skel/raster ho用错robot sidecar的bug)
+    _prim_dom = "h" if _PRIM_HUMAN else "r"
+    if ACTION in ("raster", "rasterg"):
+        sk_r = np.load(f"{ds_dir}/raster_sidecar_{'human' if _PRIM_HUMAN else 'robot'}.npz")
+    elif ACTION in ("skel", "skelv3"):
+        sk_r = np.load(f"{ds_dir}/skel_sidecar_{'human' if _PRIM_HUMAN else 'robot_v2'}.npz")
+    else:
+        sk_r = None
+    efA, efB = load_action_tokens(ACTION, _prim_dom, z, sk_r)
 
     print(f"split={SPLIT} action={ACTION} mix={MIX} nrob={NROB or 'all'}", flush=True)
     if SPLIT == "okfirst":
@@ -443,12 +549,17 @@ def main():
         pool = np.array([i for i in perm[HELDOUT:] if ok[i]])
     if SMOKE: pool = pool[:200]; ho = ho[:24]
     pool = subsample_robot_pool(pool, NROB)
+    force = [int(x) for x in os.environ.get("HELDOUT_IDS", "").split(",") if x]   # 强制留出(与③ e2e seq对齐)
+    if force:
+        fset = set(force); ho = np.array(sorted(set(ho.tolist()) | fset))
+        pool = np.array([i for i in pool if int(i) not in fset])
+        print(f"forced heldout ids {force}: pool now {len(pool)}", flush=True)
     print(f"aligned clips: {int(ok.sum())}/{len(ok)}; train {len(pool)} ho {len(ho)}", flush=True)
 
     trDh = vsDh = efAh = efBh = idxh = None
     n_human = 0
     if MIX == "rh":
-        zh = np.load(f"{ds_dir}/clips_human_L24.npz")
+        zh = np.load(os.environ.get("DS_H", f"{ds_dir}/clips_human_L24.npz"))   # DS_H: retrack human clips
         okh = zh["low_valid"]
         trAh = zh["tracks"].astype(np.float32); trBh = zh["tracks_low"].astype(np.float32)
         vsAh = zh["vis"].astype(np.float32); vsBh = zh["vis_low"].astype(np.float32)
@@ -458,12 +569,20 @@ def main():
                 else np.load(f"{ds_dir}/skel_sidecar_human.npz") if ACTION in ("skel", "skelv3") else None)
         efAh, efBh = load_action_tokens(ACTION, "h", zh, sk_h)
         idxh_np = np.where(okh)[0]
+        hho = [int(x) for x in os.environ.get("HELDOUT_H", "").split(",") if x]   # 排除human cotrain seq(公平eval)
+        if hho:
+            idxh_np = np.array([i for i in idxh_np if int(i) not in set(hho)])
+            print(f"HELDOUT_H {hho}: human cotrain now {len(idxh_np)}", flush=True)
         if SMOKE: idxh_np = idxh_np[:200]
+        hn = int(os.environ.get("HUMAN_N", "0"))                                  # >0: 下采样human cotrain到N(稀缺sweep)
+        if hn and hn < len(idxh_np):
+            idxh_np = np.random.default_rng(SEED).permutation(idxh_np)[:hn]
+            print(f"HUMAN_N={hn}: human cotrain subsampled to {len(idxh_np)}", flush=True)
         idxh = torch.from_numpy(idxh_np)
         n_human = len(idxh)
         print(f"human co-train clips: {n_human}/{len(okh)} (L={trDh.shape[1]})", flush=True)
 
-    m = train_dual(trD, vsD, efA, efB, torch.from_numpy(pool), action=ACTION, seed=SEED,
+    m = train_dual(trD, vsD, efA, efB, torch.from_numpy(pool), action=ACTION, seed=SEED, R_SS=R_SS_ENV,
                    trDh=trDh, vsDh=vsDh, efAh=efAh, efBh=efBh, idxh=idxh)
     torch.save(m, f"{OUT}/wm_dual.pt")
 
