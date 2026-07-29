@@ -137,7 +137,21 @@
 - 修 split(episode 级),不改切片(slicing = Phase 2 独立立项,要重建数据)。
 - 留出 robot 2/human 2 episode;今晚决定性 9 臂。
 
+**★★用户定的大活(2026-07-29 夜):human+robot 都 L48 + episode-split + 重训②③(step足/不覆盖旧ckpt/全sbatch)**
+- robot 已 L48;**human 需从 L24 重建到 L48**(=重 track,human 12ep~2h 够长)。
+- **★这是 8 阶段管线,且 retrack 链写死 human_L24 名 → 先改代码再排,不能盲排(会崩)**:
+  1. base clips human L48: `CLIP_L=48 HUMAN_ONLY=1 gen_flow_render_dataset_caneef.py`(需新 sbatch;CoTracker 重 track,high 视角)
+  2. dualview 对齐 cam_low: `gen_dualview_aligned.py SRC/OUT`
+  3. retrack GDINO+SAM2: `retrack_sam2_full.py DOMAIN=human`(★:104 hardcoded clips_human_L24 → 参数化)
+  4. assemble: `assemble_retrack_clips.py`(★:24 hardcoded "clips_human_L24" → 参数化)
+  5. realwrist patch: `build_human_realwrist_clips.py`(★hardcoded clips_human_L24_retrack → 参数化)+ wrist sidecar L48
+  6. wan latents L48: `build_can256_latents.py SRC=human DS=clips_human_L48`
+  7. cond(agent skel)L48: `build_can_cond.py SRC=human DS=clips_human_L48`
+  8. 重训 ②(exp_scel_dualview_wm)+ ③(train_multihead_wm),HELDOUT_VIDS=100,102,STEPS 足够,新 OUT_DIR 不覆盖。
+- ★需先做:参数化 3 个 retrack 脚本的 human 名(L24→可配)+ 新 gen_flow sbatch;每阶段 smoke 后再排 SLURM 依赖链。**建议用 superpowers 正经设计这条 8 阶段链再排,别盲排。**
+
 **TODO(优先级序)**
+0. **★③ agent-cond 线(park→做)**:human eef3 画成线画匹配 robot 骨架模态(OSCAR 式)。★纠正:OSCAR 用**完整 MANO 骨架**非 pinch(pinch 是我们的便宜变体)。★caveat:我们小③无大先验→稀疏可能更差。选项 A(全MANO需repack)/B(pinch零成本先试)/C(中间)。接 [[project_multihead_aux_wm]] disjoint-cond blocker。
 1. ② 7 臂重训完 → 读干净 drift,复核方向性判决(two-head 无效/human 稀缺帮/满量害)+ 记诚实 headline。
 2. ③ split 同口径修(`train_multihead_wm` HELDOUT→按 vid)+ 重训 {ro,rh} render 一对。
 3. 干净数出来后更新所有相关 memory/report 的绝对数(标注旧数泄漏)。
