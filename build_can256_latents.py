@@ -11,12 +11,18 @@ sys.path.insert(0, ".")
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
 from wan_vae import WanVAE
 
-DS = "outputs/flow_render_dataset_can_dual/clips_robot.npz"
-OUTDIR = "outputs/video_arch_wm/wan_latents_can_dual"; os.makedirs(OUTDIR, exist_ok=True)
+SRC = os.environ.get("SRC", "robot")             # robot(默认) | human
+DS = os.environ.get("DS", "outputs/flow_render_dataset_can_dual/clips_robot.npz"
+                    if SRC == "robot" else "outputs/flow_render_dataset_can_dual/clips_human_L24.npz")
+OUTDIR = os.environ.get("OUTDIR", "outputs/video_arch_wm/wan_latents_can_dual"); os.makedirs(OUTDIR, exist_ok=True)   # L48重建用独立OUTDIR不覆盖L24
 RES = 256
 CROPS = {"high": (60, 60, 390, 390), "low": (0, 0, 640, 480)}
 CAM = {"high": "observation.images.cam_high", "low": "observation.images.cam_low"}
 ROBOT_DIRS = [f"human_play_data/play_robot_can_{i}_eef" for i in range(1, 19)]
+HUMAN_DIRS = [f"human_play_eef_data/play_human_can_eef_{i}" for i in range(1, 13)]
+# vid -> lerobot dir 映射: robot vid=100+(idx), human vid=0..11 直接 idx
+DIRS = ROBOT_DIRS if SRC == "robot" else HUMAN_DIRS
+VID_OFFSET = 100 if SRC == "robot" else 0
 SMOKE = os.environ.get("SMOKE", "0") == "1"
 
 
@@ -54,7 +60,7 @@ def main():
     done = 0
     for vid in vids:
         rows = np.where(VID == vid)[0]
-        d = ROBOT_DIRS[vid - 100]
+        d = DIRS[vid - VID_OFFSET]
         need = set(int(i) for n in rows for i in FIDX[n])
         fh = decode256(f"{d}/videos/chunk-000/{CAM['high']}/episode_000000.mp4", "high", need)
         fl = decode256(f"{d}/videos/chunk-000/{CAM['low']}/episode_000000.mp4", "low", need)
@@ -66,7 +72,8 @@ def main():
             done += 1
         print(f"vid {vid}: {len(rows)} clips encoded  (total {done}/{N if not (SMOKE or os.environ.get('VIDS')) else '~'})", flush=True)
     tag = "smoke" if SMOKE else (os.environ.get("VIDS", "all").replace(",", "_"))
-    outp = f"{OUTDIR}/latents_{tag}.npz"
+    pref = "" if SRC == "robot" else f"{SRC}_"          # human_ 前缀, 不覆盖 robot latents_all.npz
+    outp = f"{OUTDIR}/latents_{pref}{tag}.npz"
     np.savez(outp, lat=lat, lat_low=lat_low, tL=np.array(tL), vids=np.array(list(vids)), low_valid=low_valid)
     print(f"saved {outp}: lat{lat.shape} tL={tL}  (encoded rows for vids {list(vids)})", flush=True)
     print("=== M2b DONE ===", flush=True)
