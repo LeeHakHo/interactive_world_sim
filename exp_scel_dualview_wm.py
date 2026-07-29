@@ -537,6 +537,17 @@ def split_okfirst(ok, heldout=HELDOUT):
     return perm[:heldout], perm[heldout:]
 
 
+def split_by_episode(ok, vid, heldout_vids):
+    """IWS 式 episode(vid)分组 split (照 play_eef_dataset.py:378): heldout_vids 里整段 episode
+    作 heldout, 其余作训练池, 都 ok-过滤。heldout episode 与训练 vid 完全不相交 -> 无跨-episode
+    帧泄漏(修 split_okfirst 按 clip-idx 切致 85% heldout 帧与训练重复, 见 project_clip_heldout_leakage)。"""
+    hv = set(int(v) for v in heldout_vids)
+    okr = np.where(ok)[0]
+    ho = np.array([i for i in okr if int(vid[i]) in hv], dtype=int)
+    pool = np.array([i for i in okr if int(vid[i]) not in hv], dtype=int)
+    return ho, pool
+
+
 def main():
     z = np.load(DS)
     ok = z["low_valid"]
@@ -558,7 +569,11 @@ def main():
     efA, efB = load_action_tokens(ACTION, _prim_dom, z, sk_r)
 
     print(f"split={SPLIT} action={ACTION} mix={MIX} nrob={NROB or 'all'}", flush=True)
-    if SPLIT == "okfirst":
+    heldout_vids = [int(x) for x in os.environ.get("HELDOUT_VIDS", "").split(",") if x]
+    if heldout_vids:                                           # ★episode(vid)分组 split, 修帧泄漏(见 project_clip_heldout_leakage)
+        ho, pool = split_by_episode(ok, z["vid"], heldout_vids)
+        print(f"heldout vids {heldout_vids}: ho {len(ho)} pool {len(pool)} (episode-split, no frame leak)", flush=True)
+    elif SPLIT == "okfirst":
         ho, pool = split_okfirst(ok, HELDOUT)
     else:
         perm = np.random.default_rng(0).permutation(len(trD))
@@ -566,8 +581,8 @@ def main():
         pool = np.array([i for i in perm[HELDOUT:] if ok[i]])
     if SMOKE: pool = pool[:200]; ho = ho[:24]
     pool = subsample_robot_pool(pool, NROB)
-    force = [int(x) for x in os.environ.get("HELDOUT_IDS", "").split(",") if x]   # 强制留出(与③ e2e seq对齐)
-    if force:
+    force = [int(x) for x in os.environ.get("HELDOUT_IDS", "").split(",") if x]   # clip-idx 强制留出(遗留); episode-split 下 demo seq 已随 vid 进 ho, 忽略
+    if force and not heldout_vids:
         fset = set(force); ho = np.array(sorted(set(ho.tolist()) | fset))
         pool = np.array([i for i in pool if int(i) not in fset])
         print(f"forced heldout ids {force}: pool now {len(pool)}", flush=True)
@@ -586,8 +601,13 @@ def main():
                 else np.load(f"{ds_dir}/skel_sidecar_human.npz") if ACTION in ("skel", "skelv3") else None)
         efAh, efBh = load_action_tokens(ACTION, "h", zh, sk_h)
         idxh_np = np.where(okh)[0]
-        hho = [int(x) for x in os.environ.get("HELDOUT_H", "").split(",") if x]   # 排除human cotrain seq(公平eval)
-        if hho:
+        hvh = [int(x) for x in os.environ.get("HELDOUT_VIDS_H", "").split(",") if x]   # ★episode 排除 human cotrain(→human-in-domain eval)
+        if hvh:
+            hvset = set(hvh); vh = zh["vid"]
+            idxh_np = np.array([i for i in idxh_np if int(vh[i]) not in hvset])
+            print(f"HELDOUT_VIDS_H {hvh}: human cotrain now {len(idxh_np)} (episode-excluded)", flush=True)
+        hho = [int(x) for x in os.environ.get("HELDOUT_H", "").split(",") if x]   # clip-idx 排除(遗留); episode-split 下用 HELDOUT_VIDS_H
+        if hho and not hvh:
             idxh_np = np.array([i for i in idxh_np if int(i) not in set(hho)])
             print(f"HELDOUT_H {hho}: human cotrain now {len(idxh_np)}", flush=True)
         if SMOKE: idxh_np = idxh_np[:200]
@@ -623,6 +643,7 @@ def main():
     lift = zr > 0.08
     metrics = {
         "action": ACTION, "mix": MIX, "head_mode": HEAD_MODE, "nrob": int(NROB) if NROB else None,
+        "heldout_vids": heldout_vids or None,
         "n_train_robot": int(len(pool)), "n_human_cotrain": int(n_human), "n_heldout": int(len(ho)),
         "drift_px_cam_high": float(eA.mean()), "drift_px_cam_low": float(eB.mean()),
         "drift_px_cam_high_lift": float(eA[lift].mean()), "drift_px_cam_low_lift": float(eB[lift].mean()),
