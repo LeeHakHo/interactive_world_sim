@@ -44,6 +44,8 @@ def load_one(latp, condp):
     if TLCAP and tL > TLCAP:
         lat = lat[:, :, :TLCAP]; lat_low = lat_low[:, :, :TLCAP]; cond = cond[:, :, :, :TLCAP]; tL = TLCAP
     if CCOND: cond = cond[:, :, :CCOND]
+    if os.environ.get("NOFLOW", "0") == "1":         # ★naive baseline(=IWS-stage2式): 清零 object-flow 通道(前3=dx,dy,footprint), 只留 agent/eef cond
+        cond = cond.copy(); cond[:, :, :3] = 0.0      # flow-cond vs naive-cond 干净 ablation(同 backbone/数据, 只去 flow)
     nz = (np.abs(lat).reshape(len(lat), -1).sum(1) > 0) & valid
     idx = np.where(nz)[0]
     if HELDOUT_VIDS and "vids" in zl.files:                 # ★episode(vid)分组排除, 修帧泄漏(project_clip_heldout_leakage)
