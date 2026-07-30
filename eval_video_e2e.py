@@ -80,6 +80,8 @@ def main():
     K, F = W.K, W.F; P = 48; tL = 12; L = 48
     u8 = lambda a: (np.clip(a, 0, 1) * 255).astype(np.uint8)
     r128 = lambda im: cv2.resize(im, (128, 128))
+    from eval_mh_render import can_pos_err            # cube_px 控制保真(含 det_rate/vanish 防nan陷阱)
+    cube = {"gtflow": [], "e2e": []}                  # 每项: (cube_px, n_gtdet, det_rate, vanish)
     lines = []
     for si in SEQS:
         trg = [np.nan_to_num(z["tracks"][si].astype(np.float32)), np.nan_to_num(z["tracks_low"][si].astype(np.float32))]
@@ -116,7 +118,9 @@ def main():
                 a = torch.from_numpy(gtpx[:Tp]).permute(0, 3, 1, 2).to(dev) * 2 - 1
                 b = torch.from_numpy(outs[tag][v][:Tp]).permute(0, 3, 1, 2).to(dev) * 2 - 1
                 lpv = lp(a, b).mean().item()
-                lines.append(f"seq{si} cam{'high' if v==0 else 'low'} {tag:7s}: LPIPS {lpv:.4f}")
+                cm = can_pos_err(u8(outs[tag][v][:Tp]), u8(gtpx[:Tp]))      # 控制保真: render罐位 vs GT罐位
+                cube[tag].append((cm["cube_px"], cm["n_gtdet"], cm["det_rate"], cm["vanish"]))
+                lines.append(f"seq{si} cam{'high' if v==0 else 'low'} {tag:7s}: LPIPS {lpv:.4f} | cube_px {cm['cube_px']:.2f} (det{cm['det_rate']:.2f} van{cm['vanish']:.2f})")
                 print(lines[-1], flush=True)
             # gif @128: 3 列
             rend = np.stack([np.stack([r128(u8(gtpx[t])) for t in range(Tp)]),
@@ -129,10 +133,18 @@ def main():
             save_combined_gif(f"{OUT}/gifs/seq{si}_cam{'high' if v==0 else 'low'}.gif", rend, fl,
                               ["GT", "3-GTflow(ceil)", "2->3 e2e"], [None, None, None], 0,
                               caption=f"seq{si} cam{'high' if v==0 else 'low'} | replay天花板 vs ②pred-flow e2e")
+    # 跨 seq/view 按检测帧加权汇总 cube_px + det/vanish
+    cube_lines = ["", "=== cube_px 汇总(按检测帧加权; 越小=物体位置越准) ==="]
+    for tag in ["gtflow", "e2e"]:
+        rows = cube[tag]; N = sum(r[1] for r in rows)
+        detc = sum(r[2] * r[1] for r in rows); vanc = sum(r[3] * r[1] for r in rows)
+        valid = [(r[0], r[2] * r[1]) for r in rows if not np.isnan(r[0])]
+        cpx = sum(c * w for c, w in valid) / max(sum(w for _, w in valid), 1e-9) if valid else float("nan")
+        cube_lines.append(f"[cube_px {tag:7s}] {cpx:.2f} (det_rate={detc/max(N,1):.2f} vanish={vanc/max(N,1):.2f} n_gtdet={N})")
     open(f"{OUT}/summary.txt", "w").write(
-        "M5 e2e: ②pred-flow端到端 vs GT-flow天花板 (标准protocol, 含agent LPIPS)\n"
+        "M5 e2e: ②pred-flow端到端 vs GT-flow天花板 (标准protocol, 含agent LPIPS + cube_px控制保真)\n"
         f"③={CKPT}\n②={WM}\ngif列: GT | ③(GT-flow天花板) | ②→③(e2e); flow行 绿=GT锚/红=②预测/黄=eef\n\n"
-        + "\n".join(lines) + "\n\ne2e-天花板差 = ②误差穿过③掉多少。\n")
+        + "\n".join(lines) + "\n".join(cube_lines) + "\n\ne2e-天花板差 = ②误差穿过③掉多少。\n")
     print("=== M5 e2e DONE ===", flush=True)
 
 
