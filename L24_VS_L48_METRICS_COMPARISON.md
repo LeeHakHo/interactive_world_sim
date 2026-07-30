@@ -6,7 +6,7 @@
 > 新数来源:② `outputs/cross_embodiment_wm/epsplit_L48/mp_{r,rh}_all{,_s1,_s2}/summary.txt`(3 种子);③ `outputs/video_arch_wm/epsplit_L48_mh/{ro,rh}` 训练(55038/55039,均训满 40k 步)+ eval `mh_eval_L48_flowcond_vs_naive/flow_ro_rh/render_summary.txt`(job 55080)。
 
 ## 0. TL;DR(一句话)
-**两个"human 有害"的吓人信号在干净 L48 下都塌成噪声**——它们是泄漏 split + L24 短人手 OOD 的假象,不是真具身壁垒。full-data human = 中性(单场景天花板);scarce human = 真帮(唯一存活)。ro 数被诚实地小幅上修(泄漏本来偏乐观)。
+干净 L48 下 **full-data human 在 ② 和 ③ 都是中性**(单场景数据天花板),**scarce human 真帮**(② n100 +4.9 / n300 +2.2,唯一存活 regime)。ro 数被诚实地小幅上修(泄漏本偏乐观)。① ② 之前看到的"human 害 +0.6px"干净后 →+0.06 噪声;② ③ 之前的"human 毁渲染"是 run 不稳挑了坏 run,新 L48 稳定到 rh≈ro(印证用户"差不多"的记忆)。
 
 ## 1. ② object-flow WM drift(cam_high, held-out, px, ↓越小越好, mp 动作表示)
 | | 旧 L24 泄漏 | 新 L48 干净(3 种子均值) | 变化 |
@@ -20,21 +20,24 @@
 cam_low 同向:ro 2.77 均值,rh 2.88 均值(rh−ro +0.11 噪声)。
 
 ## 2. ③ Wan 视频渲染器 render-LPIPS(held-out seqs, ↓越小越好, GT-flow 列=天花板含 agent)
-| | 旧 L24 泄漏(mh_clean) | 新 L48 干净(epsplit_L48_mh) | 变化 |
+⚠️**更正**:旧 ③ rh **run 间不稳**,有两个数,别只挑坏的那个:
+- `mh_clean/rh_full`(40k 步,2586 robot + 1791 human)→ **0.1521**(坏 run)
+- `mh_full/rh_N2550`(60k 步,2550 robot + human)→ **0.0640 ≈ ro 0.0658**(好 run,即"差不多")
+
+| | 旧 L24 泄漏 | 新 L48 干净(epsplit_L48_mh) | 变化 |
 |---|---|---|---|
-| ro | **0.0590** | **0.0638** | +0.005 ≈同 |
-| rh | **0.1521** | **0.0654** | **−0.087 巨降** |
-| rh−ro(全量 human 效应) | **+0.093(渲染烂 2.6×)** | **+0.0016(噪声)** | 害消失 |
+| ro | 0.0590(mh_clean)/ 0.0658(N2550) | **0.0638** | ≈同 |
+| rh | **0.064~0.152(不稳!)** | **0.0654** | 稳到 ro 附近 |
+| rh−ro(全量 human 效应) | +0.006(好run)~ +0.093(坏run) | **+0.0016(噪声)** | 稳定为噪声 |
 | cube_px 控制保真(新 metric) | — | ro 3.69 / rh 3.49(det 1.00, 零消失) | — |
 
-rh 两个 ③ ckpt 都训满 40000 步(ro recon MSE 0.0759 / rh 0.0848),非半途。
+**正确读法**:旧 ③ rh 渲染质量 run-to-run 不稳(0.064~0.152),不能说"human 稳定毁渲染 2.6×"——那是挑了坏 run。新干净 L48 把 rh **稳定**到 ro 附近(0.0654 vs 0.0638),与旧的好 run 一致。结论 = **full-data human 在 ③ 渲染层中性**(既不帮也不稳定地害),这也印证了用户"③ rh≈ro 差不多"的记忆。rh 两个新 ③ ckpt 都训满 40000 步(ro recon MSE 0.0759 / rh 0.0848)。
 
 ## 3. 读表(可写进 paper 的 3 条)
 1. **泄漏→干净 = 诚实上修**:ro 在 ②(2.08→2.29)和 ③(0.059→0.064)都小幅变差,方向正确——泄漏 split(heldout 与 train 共享帧)本来偏乐观。
-2. **两个"human 有害"信号都是假象**:
-   - ② "human 害 robot +0.6px" → 干净后 +0.06(噪声)。
-   - ③ "human 毁渲染 2.6×"(0.152 vs 0.059)→ 干净后 rh≈ro(+0.0016 噪声)。
-   根因 = 泄漏 clip-idx split + L24 短人手 clip 相对 robot 更 OOD;把人手切到 L48 等长 + episode 干净分组后,两者一起消掉。**不是具身迁移壁垒。**
+2. **两个"human 有害"信号站不住**:
+   - ② "human 害 robot +0.6px"(旧 2.08→2.69)→ 干净后 +0.06(噪声)。真信号,泄漏 split 放大了它。
+   - ③ "human 毁渲染 2.6×" = **挑了坏 run**;旧 ③ rh 本就 run 间不稳(0.064~0.152),好 run 早就 rh≈ro。新 L48 稳定到 0.0654 vs 0.0638。**不是具身迁移壁垒,是训练不稳 + 评测口径。**
 3. **稀缺 human-help 存活**(n100 +4.9 / n300 +2.2)——干净 split 下唯一真的 human-help regime,与 seed 复核一致([[project_dualwm_domain_head]] 全量 −0.066 噪声)。
 
 ## 4. 结论对 story 的影响
