@@ -324,6 +324,9 @@ class DualLWC(FlowWM_LWC):
             s.act_pos = nn.Linear(_posdim, s.Dm)                 # 双视角末端位置(+归一化 grip)
         if head_mode == "two":
             s.head_h = copy.deepcopy(s.head)          # human 头, init = robot 头(暖启)
+        if head_mode == "film":                       # ★软域条件(EgoWAM 式): 共享单头 + domain-embedding FiLM 调制 trunk
+            s.dom_film = nn.Embedding(2, 2 * s.Dm)     # [robot,human] -> (γ,β); init 全0 => 恒等(1+γ=1, β=0)不改初始行为
+            nn.init.zeros_(s.dom_film.weight)
 
     def _readout(s, x, dom):
         """trunk 特征 x (B,P,Dm) -> logits (B,P,F*W*W), 按域路由读出头。
@@ -331,8 +334,10 @@ class DualLWC(FlowWM_LWC):
         hm = getattr(s, "head_mode", "single")
         if hm == "two":
             return (s.head_h if dom == "h" else s.head)(x)
-        if hm == "film":
-            raise NotImplementedError("HEAD_MODE=film is Phase-2 (deferred)")
+        if hm == "film":                              # 共享头, 域 embedding 出 γ/β 调制 x: x*(1+γ)+β
+            gb = s.dom_film(x.new_tensor(1 if dom == "h" else 0, dtype=torch.long))
+            g, b = gb[:s.Dm], gb[s.Dm:]
+            return s.head(x * (1 + g) + b)
         return s.head(x)                              # single
 
     def _act_pts(s, eef, view=0, dom="r"):

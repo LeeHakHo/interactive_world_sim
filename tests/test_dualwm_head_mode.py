@@ -46,10 +46,26 @@ def test_readout_shape_matches_head():
     assert m._readout(x, "h").shape == m.head(x).shape
 
 
-def test_film_raises_not_implemented():
+def test_film_identity_at_init():
+    m = _model("film")                                  # dom_film 全0 init => 恒等
+    x = torch.randn(2, 6, 32)
+    assert torch.allclose(m._readout(x, "r"), m.head(x), atol=1e-6)
+    assert torch.allclose(m._readout(x, "h"), m.head(x), atol=1e-6)
+
+
+def test_film_routes_by_domain_after_perturb():
     m = _model("film")
-    with pytest.raises(NotImplementedError):
-        m._readout(torch.randn(1, 6, 32), "r")
+    with torch.no_grad():
+        m.dom_film.weight[1].add_(0.5)                  # 扰动 human(idx1) 的 γ/β
+    x = torch.randn(2, 6, 32)
+    assert torch.allclose(m._readout(x, "r"), m.head(x), atol=1e-6)   # robot(idx0) 仍恒等
+    assert not torch.allclose(m._readout(x, "h"), m.head(x), atol=1e-4)  # human 被调制
+
+
+def test_film_has_dom_film_others_dont():
+    assert hasattr(_model("film"), "dom_film")
+    assert not hasattr(_model("single"), "dom_film")
+    assert not hasattr(_model("two"), "dom_film")
 
 
 def test_fwd_dual_accepts_dom_and_routes():
