@@ -83,7 +83,8 @@ def main():
         d_px = np.linalg.norm((w2d_high[both] - ohi[both]) * 128, axis=-1)
         print(f"验证 3D投影high腕 vs 2D检测腕: 中位差 {np.median(d_px):.1f}px 均值 {d_px.mean():.1f}px (n={both.sum()})", flush=True)
     # 眼检叠加: 4 clip, high|low 两行, 腕=3D投影(青), high再叠2D检测腕(黄)对比
-    viz_clips(z, w2d_high, w2d_low, ohi, ov)
+    if old is not None:                          # 仅当有 old 对照(ohi/ov 才定义); L48 全新建 old=None 跳过 viz(修 UnboundLocalError)
+        viz_clips(z, w2d_high, w2d_low, ohi, ov)
     print("=== DONE ===", flush=True)
 
 
