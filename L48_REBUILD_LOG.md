@@ -54,3 +54,7 @@ robot 已 L48 不动。新数据全进独立目录 `outputs/flow_render_dataset_
 - rh (MIX=rh single):
 - rh_two (MIX=rh two):
 (L24 旧: rh_two 2.314 ≈ rh_single 2.318 ≫ ro 2.083 = 两头无效)
+
+## ★recovery (2026-07-30): jid5 realwrist 秒挂(build_human_wrist_low viz UnboundLocalError ohi, L48 old=None)
+- 修 build_human_wrist_low.py: viz_clips 仅 old!=None 时跑(commit 14b40f4)。sidecar 本已存好, 只崩非必要viz。
+- 撤死链 54866-876, 从阶段5重提: realwrist=55028(无dep) → latents=55029 → cond=55030 → ②{ro=55031,rh=55032,rh_two=55033,+稀缺} → ③{ro=55038,rh=55039}。
