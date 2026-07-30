@@ -14,10 +14,11 @@ import exp_scel_dualview_wm as W
 import exp_scel_dualview_comb as DC
 import exp_v3_human_helps_pixels as HP
 from video_dit import VideoDiT
+from video_multihead_wm import MultiHeadVideoWM       # ③ multihead(scarce e2e 用)
 from wan_vae import WanVAE
 from viz_combined import save_combined_gif, build_flow_cols
 # ② WM / ③ ckpt 是整模型 pickle -> 注册类到 __main__ 供 torch.load
-for _c in [W.DualLWC, DC.DualCombLWC, DIT.DualViewDiT, G.DualViewDiTG, VideoDiT]:
+for _c in [W.DualLWC, DC.DualCombLWC, DIT.DualViewDiT, G.DualViewDiTG, VideoDiT, MultiHeadVideoWM]:
     setattr(sys.modules["__main__"], _c.__name__, _c)
 
 DS = "outputs/flow_render_dataset_can_dual/clips_robot.npz"
@@ -26,6 +27,8 @@ WM = os.environ.get("WM_CKPT", "outputs/cross_embodiment_wm/abs_vs_rel_humanhelp
 OUT = os.environ.get("OUT", "outputs/video_arch_wm/m5_e2e"); os.makedirs(f"{OUT}/gifs", exist_ok=True)
 SEQS = [int(x) for x in os.environ.get("SEQS", "332,59,418,442").split(",")]
 NS = int(os.environ.get("STEPS_SAMPLE", "20")); dev = "cuda"; GRID = 16; POOL = 128 // GRID
+CCOND = int(os.environ.get("CCOND", "0"))            # >0=切cond前CCOND通道(multihead ③=4: flow3+agent1); 0=全7ch(老VideoDiT)
+ACTION = os.environ.get("ACTION", "dummy5")          # ②动作表示: mp/dhc需grip第4槽, 用load_action_tokens同训练口径建eef
 CROPS = {0: (60, 60, 390, 390), 1: (0, 0, 640, 480)}
 VIDP = {v: f"human_play_data/play_robot_can_{{}}_eef/videos/chunk-000/observation.images.cam_{n}/episode_000000.mp4"
         for v, n in [(0, "high"), (1, "low")]}
@@ -66,6 +69,9 @@ def gt256(vid, fidx, v):
 
 def main():
     z = np.load(DS)
+    # ★②rollout 用的 eef 必须与训练同款(mp/dhc = 3点+grip第4槽); dummy5 保持3点。
+    # 全数据集一次性建(grip 归一化按全集 nanmax, 与训练一致), 再逐seq索引。
+    efA_wm, efB_wm = W.load_action_tokens(ACTION, "r", z)
     m3 = torch.load(CKPT, map_location=dev, weights_only=False).eval()
     wm = torch.load(WM, map_location=dev, weights_only=False).eval()
     vae = WanVAE(device=dev); lp = lpips.LPIPS(net="alex").to(dev).eval()
@@ -83,7 +89,7 @@ def main():
         fidx = z["fidx"][si]; vid = int(z["vid"][si])
         # ② rollout: GT首帧上下文 + GT eef 驱动 -> pred tracks (L,2P,2)
         trD = np.concatenate([trg[0][:K], trg[1][:K]], 1)[None]                       # (1,K,2P,2)
-        efA = efg[0][None]; efB = efg[1][None]
+        efA = efA_wm[si][None]; efB = efB_wm[si][None]                                # ②rollout用同训练口径(mp含grip槽)
         pred = W.rollout_dual(wm, torch.from_numpy(trD).float().to(dev),
                               torch.from_numpy(efA).float().to(dev), torch.from_numpy(efB).float().to(dev), L - K)[0].cpu().numpy()
         predtr = [np.concatenate([trg[v][:K], pred[:, v * P:(v + 1) * P]], 0) for v in range(2)]   # (L,P,2) 每视角
@@ -99,6 +105,7 @@ def main():
                     src = predtr[v] if use_pred else trg[v]
                     cond[v, :, k] = cond7(trg[v][0], src[rf], efg[v][0], efg[v][rf], vsg[v][rf], jt[rf], frs[v][0], v)
             c = torch.from_numpy(cond[None]).float().to(dev)
+            if CCOND: c = c[:, :, :CCOND]            # multihead ③ 训练时只吃前CCOND通道(flow3+agent1)
             xs = sample(m3, za, c, NS)
             outs[tag] = [vae.decode(xs[:, v])[0].permute(1, 2, 3, 0).cpu().numpy() for v in range(2)]  # per view (Tpix,256,256,3)
         # 指标 + gif (两视角各出一个 gif, 3列: GT | gtflow | e2e)
