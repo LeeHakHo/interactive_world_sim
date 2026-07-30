@@ -138,6 +138,18 @@ def main():
         model.load_state_dict(sd, strict=False); print(f"[warm-start] loaded {INIT} (strict=False, aux 保留 init)", flush=True)
     ema.load_state_dict(model.state_dict()); [p.requires_grad_(False) for p in ema.parameters()]
     opt = torch.optim.AdamW(model.parameters(), lr=LR, weight_decay=0.0)
+    # ★真 resume: 存 model/ema/opt/step 的 resume.pt → 续训从 saved step 跑到 STEPS(LR恒定, 无近似).
+    # RESUME=1|auto → 读 {OUT}/resume.pt; RESUME=<path> → 读该文件; 空=不 resume. resume 覆盖 INIT warm-start.
+    start_step = 0
+    RESUME = os.environ.get("RESUME", "")
+    resume_path = f"{OUT}/resume.pt" if RESUME in ("1", "auto") else RESUME
+    if RESUME and os.path.exists(resume_path):
+        ck = torch.load(resume_path, map_location=dev, weights_only=False)
+        model.load_state_dict(ck["model"]); ema.load_state_dict(ck["ema"]); opt.load_state_dict(ck["opt"])
+        start_step = int(ck["step"])
+        print(f"[resume] {resume_path} @ step {start_step} → 续训到 {STEPS}", flush=True)
+    elif RESUME:
+        print(f"[resume] 请求 RESUME={RESUME} 但 {resume_path} 不存在 → 从头训", flush=True)
     print(f"MultiHeadVideoWM {sum(p.numel() for p in model.parameters())/1e6:.1f}M  aux_specs={aux_specs}", flush=True)
 
     def batch(bs):
@@ -159,7 +171,7 @@ def main():
         return tt(z), tt(c), {name: tt(a[name]) for name in a}
 
     run_m = run_a = 0.0
-    for step in range(1, STEPS + 1):
+    for step in range(start_step + 1, STEPS + 1):
         z, c, at = batch(BS)
         main_l, aux_l = losses(model, z, c, at)
         loss = LAM_MAIN * main_l + sum(LAM.get(k, 0.5) * v for k, v in aux_l.items())   # Stage-1 LAM_MAIN=0=只aux塑trunk
@@ -173,6 +185,8 @@ def main():
         if SNAP_EVERY and step % SNAP_EVERY == 0: torch.save(ema, f"{OUT}/mh_ema_step{step}.pt")
         if step % EVAL_EVERY == 0 or step == STEPS:
             torch.save(ema, f"{OUT}/mh_ema.pt")
+            torch.save({"model": model.state_dict(), "ema": ema.state_dict(),
+                        "opt": opt.state_dict(), "step": step}, f"{OUT}/resume.pt")  # ★可 resume
             z, c, _ = batch(min(BS, 8))
             xs = sample(ema, z[:, :, :, :1], c, steps=20)
             rec = ((xs - z) ** 2)[:, :, :, 1:].mean().item()
