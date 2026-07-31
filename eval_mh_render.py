@@ -24,7 +24,8 @@ CONDP = os.environ.get("CONDP", "outputs/video_arch_wm/cond_can_dual/cond_skel_a
 DS = "outputs/flow_render_dataset_can_dual/clips_robot.npz"
 RUNS = os.environ.get("RUNS", "ro_noaux,ro_dino,rh_noaux,rh_dino").split(",")
 SEQS = [int(x) for x in os.environ.get("SEQS", "332,59,418,442").split(",")]
-CCOND, TLCAP, NS = 4, 6, 20
+CCOND = int(os.environ.get("CCOND", "4"))    # ★读env: grip③=7(flow+grip-skel+warp), 普通多头=4; 硬编码4会砍warp误伤grip③
+TLCAP, NS = 6, 20
 Bdir = os.environ.get("BDIR", "outputs/video_arch_wm/mh_N100"); dev = "cuda"
 OUT = os.environ.get("OUT", "outputs/video_arch_wm/mh_eval"); os.makedirs(f"{OUT}/gifs", exist_ok=True)
 CROPS = {0: (60, 60, 390, 390), 1: (0, 0, 640, 480)}
