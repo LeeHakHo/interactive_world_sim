@@ -13,7 +13,7 @@ dev = "cuda"; TLCAP = 6; NS = 20; POOL = 8
 def pool16(x): return torch.nn.functional.avg_pool2d(torch.from_numpy(x[None]).float(), POOL)[0].numpy()
 LAT = np.load("outputs/video_arch_wm/wan_latents_can_dual/latents_all.npz")
 lat, lat_low = LAT["lat"][:, :, :TLCAP], LAT["lat_low"][:, :, :TLCAP]
-DS = np.load("outputs/flow_render_dataset_can_dual/clips_robot.npz")
+DS = np.load("outputs/flow_render_dataset_can_dual/clips_robot_retrack.npz")   # ★retrack口径
 CG = np.load("outputs/video_arch_wm/cond_can_dual/cond_skel_grip_retrack.npz")["cond"]
 vae = WanVAE(device=dev); lp = lpips.LPIPS(net="alex").to(dev).eval()
 wm = torch.load("outputs/cross_embodiment_wm/epsplit_L48/mp_rh_all/wm_dual.pt", map_location=dev, weights_only=False).eval()

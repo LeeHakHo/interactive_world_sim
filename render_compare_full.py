@@ -15,7 +15,7 @@ dev = "cuda"; TLCAP = int(os.environ.get("TLCAP", "12")); NS = 20; GRID = 16; PO
 def pool16(x): return torch.nn.functional.avg_pool2d(torch.from_numpy(x[None]).float(), POOL)[0].numpy()
 LAT = np.load("outputs/video_arch_wm/wan_latents_can_dual/latents_all.npz")
 lat, lat_low = LAT["lat"][:, :, :TLCAP], LAT["lat_low"][:, :, :TLCAP]
-DS = np.load("outputs/flow_render_dataset_can_dual/clips_robot.npz")
+DS = np.load("outputs/flow_render_dataset_can_dual/clips_robot_retrack.npz")   # ★retrack: ②输入+GT overlay口径对齐训练
 CG = np.load("outputs/video_arch_wm/cond_can_dual/cond_skel_grip_retrack.npz")["cond"]      # 7ch flow+grip-skel+warp
 CA = np.load("outputs/video_arch_wm/cond_can_dual/cond_skel_all_retrack.npz")["cond"]        # 7ch flow+skel+warp
 vae = WanVAE(device=dev); lp = lpips.LPIPS(net="alex").to(dev).eval()
