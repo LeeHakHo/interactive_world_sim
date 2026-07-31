@@ -17,12 +17,15 @@ lat, lat_low = LAT["lat"][:, :, :TLCAP], LAT["lat_low"][:, :, :TLCAP]
 DS = np.load("outputs/flow_render_dataset_can_dual/clips_robot.npz")
 GRIPCOND = np.load("outputs/video_arch_wm/cond_can_dual/cond_skel_grip_retrack.npz")["cond"]  # (N,2,7,tL,16,16) GTflow+grip-skel+warp
 vae = WanVAE(device=dev)
-wm = torch.load("outputs/cross_embodiment_wm/epsplit_L48/dummy5_rh_all/wm_dual.pt", map_location=dev, weights_only=False).eval()
+# ★参数化: ②(WM_CKPT+ACTION) 可换 dummy5/mp; ③ 固定 grip③(隔离②轴)
+WM_CKPT = os.environ.get("WM_CKPT", "outputs/cross_embodiment_wm/epsplit_L48/dummy5_rh_all/wm_dual.pt")
+ACTION = os.environ.get("ACTION", "dummy5")
+wm = torch.load(WM_CKPT, map_location=dev, weights_only=False).eval()
 m3 = torch.load("outputs/video_arch_wm/epsplit_L48_mh/grip_ro/mh_ema.pt", map_location=dev, weights_only=False).eval()
 K, F = W.K, W.F; P = 48; L = 48
-efA_full, efB_full = W.load_action_tokens("dummy5", "r", DS)
+efA_full, efB_full = W.load_action_tokens(ACTION, "r", DS)
 u8 = lambda a: (np.clip(a, 0, 1) * 255).astype(np.uint8)
-OUT = "outputs/video_arch_wm/dummy5_e2e_render"; os.makedirs(f"{OUT}/gifs", exist_ok=True)
+OUT = os.environ.get("OUT", "outputs/video_arch_wm/dummy5_e2e_render"); os.makedirs(f"{OUT}/gifs", exist_ok=True)
 SEQS = [int(x) for x in os.environ.get("SEQS", "332,418").split(",")]
 
 for si in SEQS:
@@ -54,7 +57,7 @@ for si in SEQS:
         print(f"seq{si} {tag} done", flush=True)
     Tp = min(outs["gtflow"].shape[0], outs["e2e"].shape[0], 40)
     gt = gt256(vid, fidx[:Tp], 0).astype(np.float32) / 255.
-    cols = [("GT", gt), ("grip3 GTflow", outs["gtflow"]), ("dummy5->grip3 e2e", outs["e2e"])]
+    cols = [("GT", gt), ("grip3 GTflow", outs["gtflow"]), (f"{ACTION}->grip3 e2e", outs["e2e"])]
     frames = []
     for t in range(Tp):
         row = np.concatenate([u8(c[1][t]) for c in cols], 1)
