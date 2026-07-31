@@ -41,7 +41,12 @@ def load_human_arrays():
     keys = ["tracks", "tracks_low", "eef", "eef_low", "vis", "vis_low", "eef3d", "frames", "frames_low", "vid"]
     A = {k: z[k][:] for k in keys}
     A["skel2d_high"] = _SKH["skel2d_high"][:]; A["skel2d_low"] = _SKH["skel2d_low"][:]
-    A["grip"] = _SKH["grip"][:].astype(np.float32)                    # human sidecar grip(自身range已映射)
+    # ★human grip 用自身range重算(sidecar grip 是旧robot-range映射, 饱和near-open p50=0.04死信号);
+    #   自身range后 mean~0.022 与 robot~0.026 一致, contact/attachment 才活。skel手指开合仍是sidecar的(cosmetic).
+    heef = np.nan_to_num(z["eef3d"].astype(np.float64))
+    gap = np.linalg.norm(heef[:, :, 1] - heef[:, :, 2], axis=-1)
+    glo, ghi = np.nanpercentile(gap, [5, 95])
+    A["grip"] = (np.clip((gap - glo) / (ghi - glo + 1e-6), 0, 1) * S.GRIP_MAX).astype(np.float32)
     e3 = z["eef3d"]; t2 = z["tracks"]
     valid = np.isfinite(e3.reshape(len(e3), e3.shape[1], -1)).all(-1).all(-1) & \
             np.isfinite(t2.reshape(len(t2), t2.shape[1], -1)).all(-1).all(-1)   # (N,) per-clip 全帧有效

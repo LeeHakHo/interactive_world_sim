@@ -7,7 +7,7 @@ def test_robot_sketch_shape_and_channels():
     out = build_clip_sketch(A, 356, tL=6, L=48, src="robot")
     assert out.shape == (2, 8, 6, 16, 16)
     assert np.abs(out[0, :4]).sum() > 0        # flow+skel high 有内容
-    assert out[0, 4].mean() >= 0               # grip 广播
+    assert all(np.allclose(out[0, 4, k], out[0, 4, k].flat[0]) for k in range(6))  # grip每帧空间恒定(广播)
 
 
 def test_human_sketch_shape():
