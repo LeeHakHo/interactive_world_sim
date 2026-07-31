@@ -6,16 +6,16 @@
 
 **Architecture:** 复用现有标定投影(`keyboard_3d_control.project_norm/can_KT/CROP`)、flow_cond(`exp_scel_dualview_dit`)、robot skel sidecar 与 human IK(`ik_eef2skel_derisk`)。新增一个纯函数库 `sketch_lib.py`(可单测)、一个几何接触检测 `contact_detector.py`(可单测)、一个驱动 `build_sketch.py`(组装+可视化)。草图 = 3D 世界系算,投影到 cam_high/cam_low 各一张 2D 图,pool 到 16×16。
 
-**Tech Stack:** numpy, cv2, torch(human IK), pinocchio(robot FK,仅取已存 sidecar 则不需), pytest。建草图在 conda `phantom` env(有 torch+pinocchio+cv2)。
+**Tech Stack:** numpy, cv2, torch, pytest。★**建草图与 pytest 全在 `.venv_wan`**(flow_cond 源 `exp_scel_dualview_dit` 需 diffusers,在 phantom env 会因 torch/diffusers 版本崩)。**skel 从现成 sidecar 读,不跑 pinocchio/IK**:robot=`skel_sidecar_robot.npz`、human=`skel_sidecar_human_ik.npz`(全量 1800 已做,与 clips_human_L48 对齐)。命令用 `.venv_wan/bin/python -m pytest ...`。
 
 ## Global Constraints
 
-- 数据版本一律 **retrack + human L48 + episode-split(heldout vids 100,102)**。robot=`outputs/flow_render_dataset_can_dual/clips_robot_retrack.npz`;human=`outputs/flow_render_dataset_can_dual_L48/clips_human_L48_retrack_realwrist.npz`;robot skel sidecar=`outputs/flow_render_dataset_can_dual/skel_sidecar_robot.npz`;human IK 权重=`outputs/cross_embodiment_wm/ik_eef2skel_derisk/ik_net.pt`。
+- 数据版本一律 **retrack + human L48 + episode-split(heldout vids 100,102)**。robot=`outputs/flow_render_dataset_can_dual/clips_robot_retrack.npz`;human=`outputs/flow_render_dataset_can_dual_L48/clips_human_L48_retrack_realwrist.npz`;robot skel sidecar=`outputs/flow_render_dataset_can_dual/skel_sidecar_robot.npz`;**human skel sidecar=`outputs/flow_render_dataset_can_dual/skel_sidecar_human_ik.npz`(全量1800, skel2d_high/low+grip, 同robot结构;不再运行时跑IK)**。
 - 草图 8 通道顺序固定:`[flow_dx, flow_dy, footprint, agent_skel, grip, agent_trace, attachment, contact_splat]`。warp **不在**草图里(归 decoder,Plan B)。
 - 每视角 2D、128 建、`pool16` 到 16×16;输出 `(N, V=2, 8, tL, 16, 16)` float16,tL=6(TLCAP)。
-- GRIP_MAX=0.04;human grip 用**自身百分位**映射(避免饱和,见 `translate_h2r_step1_skel`)。
+- GRIP_MAX=0.04。robot/human 的 grip 都**直接从各自 skel sidecar 的 `grip` 字段读**(human sidecar 的 grip 已是自身range映射)。
 - 每中间产物出 `原帧|通道|叠加` 三联可视化;结果传 Drive。别建冗余脚本,扩展/复用最干净已有。
-- 建草图在 conda `phantom`;GPU 无关(纯几何+cv2),但仍**别在登录节点跑批量**,批量走 sbatch。
+- 建草图在 **`.venv_wan`**(不跑 pinocchio/GPU,纯几何+cv2+flow_cond),但仍**别在登录节点跑批量**,全量走 sbatch(env=iws 或 .venv_wan,见 Task 8)。
 - 只 git add 自己的文件,commit 不加 Co-Authored-By。
 
 ---
@@ -467,15 +467,17 @@ git commit -m "build_sketch: robot分支组装8ch草图(flow3+skel+grip+trace+co
 
 ---
 
-### Task 6: build_sketch — human 分支(IK skel + 自身range grip)
+### Task 6: build_sketch — human 分支(读现成 human skel sidecar)
+
+★human IK skel 全量已做完(`skel_sidecar_human_ik.npz`,1800,同 robot 结构)。所以 human 分支**不跑 IK**,和 robot **同一套** `build_clip_sketch`,只是 `load_human_arrays` 从 human clips + human sidecar 组 A。
 
 **Files:**
 - Modify: `build_sketch.py`
 - Test: `tests/test_build_sketch.py`
 
 **Interfaces:**
-- Consumes: `ik_eef2skel_derisk`(`canon_eef3d`, `IK`, `fk_skel2d_dual`), human 自身range grip(同 `translate_h2r_step1_skel`)
-- Produces: `load_human_arrays() -> dict`(含 IK 生成的 `skel2d_high/low`、自身range `grip`);`build_clip_sketch(..., src="human")` 走 human 分支
+- Consumes: `outputs/flow_render_dataset_can_dual/skel_sidecar_human_ik.npz`(skel2d_high/low + grip)、`clips_human_L48`(tracks3d/eef/eef3d/frames)
+- Produces: `load_human_arrays() -> dict`(键与 `load_robot_arrays` 一致:`tracks3d/eef/eef_low/vis/vis_low/eef3d/grip/frames/frames_low/skel2d_high/skel2d_low/vid` + `_valid_idx`);`build_clip_sketch(A, n, tL, L, "human")` **body 不变**(统一读 A 的 skel2d/grip)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -486,83 +488,67 @@ def test_human_sketch_shape():
     n = int(A["_valid_idx"][0])
     out = build_clip_sketch(A, n, tL=6, L=48, src="human")
     assert out.shape == (2, 8, 6, 16, 16)
-    assert np.abs(out[0, 3]).sum() > 0        # human IK skel high 非空
+    assert np.abs(out[0, 3]).sum() > 0        # human skel high 非空
 ```
 
 - [ ] **Step 2: Run test to verify it fails**
 
-Run: `python -m pytest tests/test_build_sketch.py::test_human_sketch_shape -v`
+Run: `.venv_wan/bin/python -m pytest tests/test_build_sketch.py::test_human_sketch_shape -v`
 Expected: FAIL — `ImportError: cannot import name 'load_human_arrays'`
 
 - [ ] **Step 3: Write minimal implementation**
 
+在 Task 5 里 `build_clip_sketch` 的 `main()` 顶部把 `assert src == "robot", "human 分支见 Task 6"` 改为按 src 选 loader(见下);`build_clip_sketch` **body 保持不变**(它统一读 `A["skel2d_high"/"skel2d_low"][n, rf]` 与 `A["grip"][n]`,human/robot 都从各自 sidecar 填这两个键)。追加:
+
 ```python
-# 追加/修改 build_sketch.py:
-from fk_skel2d import fk_skel2d_dual, GRIP_MAX as _GM
-from ik_eef2skel_derisk import canon_eef3d, IK
-
-_IKN = None
-def _ik_net():
-    global _IKN
-    if _IKN is None:
-        ck = torch.load("outputs/cross_embodiment_wm/ik_eef2skel_derisk/ik_net.pt", map_location="cpu")
-        net = IK(); net.load_state_dict(ck["state"]); net.eval()
-        _IKN = (net, ck)
-    return _IKN
-
-def _human_ikskel(eef3d_clip, grip_clip):
-    """(L,3,3),(L,) -> skel2d_high(L,9,2), skel2d_low(L,9,2)。canon->IK->joint->FK。"""
-    net, ck = _ik_net()
-    Xh = canon_eef3d(eef3d_clip, ck["R0"], ck["Lw"], ck["gap_med"]).reshape(-1, 9)
-    with torch.no_grad():
-        hj = (net(torch.tensor((np.nan_to_num(Xh) - ck["xm"]) / ck["xs"], dtype=torch.float32)).numpy()) * ck["ys"] + ck["ym"]
-    hj7 = np.concatenate([hj, np.zeros((len(hj), 1))], 1)
-    sh, sl, _ = fk_skel2d_dual(hj7, grip_clip)
-    return sh, sl
+# 追加到 build_sketch.py(模块顶):
+_SKH = np.load("outputs/flow_render_dataset_can_dual/skel_sidecar_human_ik.npz")
 
 def load_human_arrays():
     z = np.load(HM)
     keys = ["tracks3d", "eef", "eef_low", "vis", "vis_low", "eef3d", "frames", "frames_low", "vid"]
     A = {k: z[k][:] for k in keys}
-    heef = np.nan_to_num(z["eef3d"].astype(np.float64))
-    gap = np.linalg.norm(heef[:, :, 1] - heef[:, :, 2], axis=-1)
-    lo, hi = np.nanpercentile(gap, [5, 95])
-    A["grip"] = (np.clip((gap - lo) / (hi - lo + 1e-6), 0, 1) * _GM).astype(np.float32)   # 自身range
-    valid = np.isfinite(z["eef3d"].reshape(len(heef), heef.shape[1], -1)).all(-1).all(-1) & \
-            np.isfinite(z["tracks3d"].reshape(len(heef), heef.shape[1], -1)).all(-1).all(-1)
+    A["skel2d_high"] = _SKH["skel2d_high"][:]; A["skel2d_low"] = _SKH["skel2d_low"][:]
+    A["grip"] = _SKH["grip"][:].astype(np.float32)                     # human sidecar grip(自身range已映射)
+    e3 = z["eef3d"]; t3 = z["tracks3d"]
+    valid = np.isfinite(e3.reshape(len(e3), e3.shape[1], -1)).all(-1).all(-1) & \
+            np.isfinite(t3.reshape(len(t3), t3.shape[1], -1)).all(-1).all(-1)
     A["_valid_idx"] = np.where(valid.all(1))[0]
     return A
 ```
 
-在 `build_clip_sketch` 里,`src=="human"` 时 skel 用 IK 生成(不查 sidecar):
+`main()` 改为:
 
 ```python
-    if src == "human":
-        if "_ikskel_cache" not in A or A.get("_ikskel_n") != n:
-            A["_ikskel_cache"] = _human_ikskel(eef3d, grip); A["_ikskel_n"] = n
-        skh, skl = A["_ikskel_cache"]
-        skel_of = lambda v, rf: skel_chan(skh[rf] if v == 0 else skl[rf])[None]
-    else:
-        skel_of = lambda v, rf: skel_chan(A["skel2d_high" if v == 0 else "skel2d_low"][n, rf])[None]
+def main():
+    src = os.environ.get("SRC", "robot")
+    A = load_human_arrays() if src == "human" else load_robot_arrays()
+    N = A["tracks3d"].shape[0]; L = A["tracks3d"].shape[1]; tL = 6
+    idx = A["_valid_idx"] if src == "human" else np.arange(N)
+    rows = idx[:4] if os.environ.get("SMOKE") == "1" else idx
+    sketch = np.zeros((N, 2, 8, tL, GRID, GRID), np.float16)
+    for i, n in enumerate(rows):
+        sketch[n] = build_clip_sketch(A, n, tL, L, src)
+        if i % 100 == 0: print(f"sketch {i} (clip {n})", flush=True)
+    np.savez(f"{OUTDIR}/sketch_{src}.npz", sketch=sketch, tL=np.array(tL))
+    print(f"saved {OUTDIR}/sketch_{src}.npz {sketch.shape}", flush=True)
 ```
-
-并把循环里 `sk = skel_chan(...)[None]` 改为 `sk = skel_of(v, rf)`。`main()` 里 `SRC=human` 时 `A=load_human_arrays()`、`rows` 限 `A["_valid_idx"]`。
 
 - [ ] **Step 4: Run test to verify it passes**
 
-Run: `python -m pytest tests/test_build_sketch.py -v`
+Run: `.venv_wan/bin/python -m pytest tests/test_build_sketch.py -v`
 Expected: PASS(2 passed)
 
 - [ ] **Step 5: Smoke human run**
 
-Run: `SMOKE=1 SRC=human python build_sketch.py`
-Expected: 打印 `saved .../sketch_human.npz` 不崩。
+Run: `SMOKE=1 SRC=human .venv_wan/bin/python build_sketch.py`
+Expected: 打印 `saved .../sketch_human.npz (1800,2,8,6,16,16)` 不崩。
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add build_sketch.py tests/test_build_sketch.py
-git commit -m "build_sketch: human分支(IK skel+自身range grip)组装同8ch草图"
+git commit -m "build_sketch: human分支读现成human skel sidecar(同robot一套8ch草图)"
 ```
 
 ---
@@ -658,12 +644,10 @@ git commit -m "build_sketch: VIZ模式出8通道原帧|通道|叠加三联(眼�
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=48G
 #SBATCH --time=02:00:00
-source /scr/yusenluo/anaconda3/etc/profile.d/conda.sh
-conda activate phantom
 cd /scr2/yusenluo/interactive_world_sim
 export HF_HUB_OFFLINE=1
-SRC=robot python build_sketch.py
-SRC=human python build_sketch.py
+SRC=robot .venv_wan/bin/python build_sketch.py
+SRC=human .venv_wan/bin/python build_sketch.py
 echo "=== DONE ==="
 ```
 
