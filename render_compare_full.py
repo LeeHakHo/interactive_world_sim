@@ -49,7 +49,7 @@ def render(m3, condfull, si, v, pred=None, efg=None, vsg=None):
                 fc = DIT.flow_cond(pred[vv][0], pred[vv][rf], efg[vv][0], efg[vv][rf], vsg[vv][rf])
                 cond[vv, :3, k] = pool16(fc)
     C = 4 if m3 is M_ro else 7
-    c = torch.from_numpy(cond[None, :, :, :C].astype(np.float32)).to(dev)
+    c = torch.from_numpy(cond[None, :, :C].astype(np.float32)).to(dev)   # 切channel(dim2)非tL
     za = torch.from_numpy(np.stack([lat[si], lat_low[si]])[None, :, :, :1].astype(np.float32)).to(dev)
     with torch.no_grad():
         xs = sample(m3, za, c, NS)
