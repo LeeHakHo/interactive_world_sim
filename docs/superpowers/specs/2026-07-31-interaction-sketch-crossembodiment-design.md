@@ -93,9 +93,13 @@ canonical 形态在 **3D 世界系**算,给 decoder 时投影到 cam_high/cam_lo
 - **训练目标 = robot 重建**:encode robot 视频 → 草图 → decode 回 robot 像素。z0 = 该 clip **自己的首帧**(无匹配问题)。
 - **主头 robot-only + aux 头 robot+human**(用户关键补充,利用 human 不重蹈"输入robot输出human"矛盾):
   - 主 latent 头(rf recon):loss **mask 到 batch 里 robot 那半**(human 不进主 recon MSE)。
-  - aux 头(抽象目标,**DINO** 默认已验证 [[project_multihead_aux_wm]],可插拔):robot+human 全 batch 训,塑共享 trunk。
+  - aux 头(**域共享 object-centric 目标**,robot+human 全 batch 训,塑共享 trunk)。
+  - ★**aux 目标必须域共享**(用户抓):**DINO 全帧 disjoint(582× 可分),两域两个不相干目标 → trunk 按域分流、不被逼共享 → 否决**。改用**物体**(同一罐子,object-flow probe 0.645 基本同域):
+    - **主形式 = 物体位置 heatmap**(每视角在物体质心放 2D 高斯,trunk 从带噪 latent 预测)——空间、易监督、逼 trunk 定位共享物体,有 related-work 先例。
+    - 备选/补充:物体 3D 位置回归(tracks3d 质心)、contact heatmap。可 ablate(heatmap vs 回归)。
+    - 非循环:虽 object-flow 在 cond,但从**带噪 latent** 预测**干净物体位置**是非平凡去噪任务;担心循环可换未来物体运动。
   - 推理只用主头(纯 robot),但 trunk 已吃过 human → scarce 区受益 [[project_human_helps_renderer_exp]]。
-  - **代码改动**:`train_multihead_wm.py::losses` 现在 main 全 batch 算,须改成 main 只算 robot 子集、aux 算全 batch。
+  - **代码改动**:`train_multihead_wm.py::losses` 现在 main 全 batch 算,须改成 main 只算 robot 子集、aux 算全 batch;aux 目标 builder 出物体 heatmap(替 DINO)。
 - **z0 = 普通输入**:训练时 = 自身首帧;下游应用自己负责 z0 来源(翻译=状态感知检索,已 de-risk)。
 
 ## 7. 数据流(端到端)
@@ -109,7 +113,7 @@ canonical 形态在 **3D 世界系**算,给 decoder 时投影到 cam_high/cam_lo
 **框架层(本 spec)**:
 - **robot 重建保真**:heldout robot clip,encode→草图→decode vs GT,报 **render LPIPS(含 agent)** + cube_px + 眼检并排 [[feedback_measure_real_deliverable_metric]]。目标 ≈ grip_ro 水平(LPIPS ~0.055–0.062)或更好。
 - **草图可视化核验**:每通道 原帧|通道|叠加 三联,眼检 8 通道都对(flow/skel/grip/trace/attachment/contact)[[feedback_visualize_intermediates]]。
-- **aux 头帮扶(scarce 消融)**:scarce robot 下,主头 robot-only + aux(robot+human) vs 无 aux,比 render LPIPS/cube。判 human 经 aux 有没有帮到。
+- **aux 头帮扶(scarce 消融)**:scarce robot 下,主头 robot-only + aux(robot+human) vs 无 aux,比 render LPIPS/cube。判 human 经 aux 有没有帮到。★aux 目标须**域共享**(物体 heatmap),别用 disjoint 的 DINO;可再 ablate heatmap vs 3D 回归。
 - **ContactDetector 消融**:几何 vs 学习,比下游(重建保真 + 下游翻译穿模率)。
 
 **下游(非本 spec,记录)**:翻译穿模率(状态感知锚)、数据生成保真。
@@ -121,4 +125,5 @@ canonical 形态在 **3D 世界系**算,给 decoder 时投影到 cam_high/cam_lo
 - **warp 留在草图**:破坏"草图=纯抽象动态"解耦,移出归 decoder。
 - **learned latent 草图**(非显式通道):域不变 latent 是老大难(DINO 582× 可分),且非"简笔画";用显式通道。
 - **主头含 human recon**:重蹈"输入robot输出human"矛盾;human 只走 aux 头。
+- **DINO 当 aux 目标**:全帧 DINO human/robot 完全 disjoint(582× 可分),两域两个不相干目标,trunk 不被逼共享 → 换域共享 object-centric(物体 heatmap)。
 - **框架层解决锚匹配**:锚匹配是翻译下游的事,框架 z0 只是普通输入。
