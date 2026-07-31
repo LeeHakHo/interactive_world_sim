@@ -79,3 +79,7 @@
 | `2026-07-30_scarce③human帮渲染+flowcond碾压naive/` | scarce human帮③ + flow-cond vs naive |
 
 本地结果树:`outputs/video_arch_wm/COMPARE_FINAL/`(终版)、`COMPARE_16seq/`、`COMPARE_6col/`、`render_ablation/`;summary.txt 在各目录。脚本:`render_compare_full.py`(5-6列双视角)、`render_grip_rh.py`(③human-help)。
+
+## 9. 附:dummy5-on-regularized-human(负结果,2026-07-31)
+另 session `regularize_human_eef.py` 把人手3点强制robot几何(gap2.2×→1×/腕角60°→90°,canon≈robot)。测 dummy5 用它 human-help 是否改善 → **反而更害**:dummy5 rh human效应 raw +0.31 → regularized **+0.85**。
+★机制:regularize改了eef但配对object-flow还是真手产生→action↔flow因果断裂→②学错映射→human更害。**降域差不能强改agent几何(砸因果),要velocity/Δ(域不变+保运动因果)。** mp不害=丢绝对位置+保真实指轴/开合(不砸因果)。→ regularize别喂②(可视化overlay无妨)。见 [[project_regularize_eef_breaks_causality]]。
