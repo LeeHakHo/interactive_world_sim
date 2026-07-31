@@ -23,6 +23,7 @@ WMS = {"mp": torch.load("outputs/cross_embodiment_wm/epsplit_L48/mp_rh_all/wm_du
        "dummy5": torch.load("outputs/cross_embodiment_wm/epsplit_L48/dummy5_rh_all/wm_dual.pt", map_location=dev, weights_only=False).eval()}
 M_ro = torch.load("outputs/video_arch_wm/epsplit_L48_mh/ro_80k/mh_ema.pt", map_location=dev, weights_only=False).eval()
 M_grip = torch.load("outputs/video_arch_wm/epsplit_L48_mh/grip_ro/mh_ema.pt", map_location=dev, weights_only=False).eval()
+M_grip_rh = torch.load("outputs/video_arch_wm/epsplit_L48_mh/grip_rh/mh_ema.pt", map_location=dev, weights_only=False).eval()
 EF = {a: W.load_action_tokens(a, "r", DS) for a in WMS}
 K, P, L = W.K, 48, 48
 u8 = lambda a: (np.clip(a, 0, 1) * 255).astype(np.uint8)
@@ -67,8 +68,9 @@ for si in SEQS:
         cols = {
             "grip3-GTflow(ceil)": render(M_grip, CG, si, v),
             "mp->ro_80k":         render(M_ro, CA, si, v, pr_mp, efg, vsg),
-            "mp->grip3":          render(M_grip, CG, si, v, pr_mp, efg, vsg),
-            "dummy5->grip3":      render(M_grip, CG, si, v, pr_d5, efg, vsg),
+            "mp->grip_ro":        render(M_grip, CG, si, v, pr_mp, efg, vsg),
+            "mp->grip_rh":        render(M_grip_rh, CG, si, v, pr_mp, efg, vsg),
+            "dummy5->grip_ro":    render(M_grip, CG, si, v, pr_d5, efg, vsg),
         }
         Tp = min(min(r.shape[0] for r in cols.values()), 44)
         gt = gt256(vid, fidx[:Tp], v).astype(np.float32) / 255.
@@ -92,11 +94,12 @@ for si in SEQS:
             summ.append(f"seq{si} cam{'high' if v==0 else 'low'} {lab:20s}: cube_px {cpx:.1f}  LPIPS {lp(a,b).mean().item():.4f}")
         # flow overlay: GT列=绿only; ceiling=绿only(GT flow); mp列=红mp cube; dummy5列=红d5 cube
         gt_obj = trg[v][:Tp]; eef_v = efg[v][:Tp]
-        preds = [None, None, pr_mp[v][:Tp], pr_mp[v][:Tp], pr_d5[v][:Tp]]
-        flow_all = build_flow_cols(gt128, gt_obj, preds, eef_v)  # (5,Tp,128,128,3)
+        preds = [None, None, pr_mp[v][:Tp], pr_mp[v][:Tp], pr_mp[v][:Tp], pr_d5[v][:Tp]]
+        flow_all = build_flow_cols(gt128, gt_obj, preds, eef_v)  # (6,Tp,128,128,3)
+        NC = len(cols) + 1
         frames = []
         for t in range(Tp):
-            fr = compose_frame([render128[c][t] for c in range(5)], [flow_all[c][t] for c in range(5)],
+            fr = compose_frame([render128[c][t] for c in range(NC)], [flow_all[c][t] for c in range(NC)],
                                titles, errs, t, caption=f"seq{si} cam{'high' if v==0 else 'low'} | 绿GT红②pred黄eef | sub=cube_px")
             frames.append(np.array(fr))
         out = f"{OUT}/gifs/compare_seq{si}_cam{'high' if v==0 else 'low'}.gif"
