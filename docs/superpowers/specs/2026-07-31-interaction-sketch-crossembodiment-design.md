@@ -19,7 +19,7 @@
 **非目标(本 spec 不含,属下游应用)**:
 - human→robot 翻译的**锚来源/匹配**(是翻译这个下游应用的事,已用状态感知检索 de-risk,见 [[project_human2robot_translate_ro3]])。
 - 草图→policy 下游。
-- ② 预测草图演化(本 spec 只做 encode/decode,不做 dynamics 预测)。
+- **② 的重新实现/重训**:rollout 机制在 §6.5 规定,但 ② 预测器 **引用现有 `rollout_dual`**(只预测 object-flow);attachment/contact 由 ContactDetector 导出。本 spec 不重造/重训 ②。
 
 ## 2. 全局约束(Global Constraints)
 
@@ -101,6 +101,29 @@ canonical 形态在 **3D 世界系**算,给 decoder 时投影到 cam_high/cam_lo
   - 推理只用主头(纯 robot),但 trunk 已吃过 human → scarce 区受益 [[project_human_helps_renderer_exp]]。
   - **代码改动**:`train_multihead_wm.py::losses` 现在 main 全 batch 算,须改成 main 只算 robot 子集、aux 算全 batch;aux 目标 builder 出物体 heatmap(替 DINO)。
 - **z0 = 普通输入**:训练时 = 自身首帧;下游应用自己负责 z0 来源(翻译=状态感知检索,已 de-risk)。
+
+## 6.5 Dynamics & Rollout(world-model 闭环)
+
+框架不止 encode→decode(那只是渲染器/autoencoder)。作为 **world model 必须能自回归预测未来**。关键:**草图 = world-model 的状态空间**,8 通道分两半——
+
+| 半 | 通道 | 角色 |
+|---|---|---|
+| **控制/动作** | agent-skel、grip、agent-trace | **输入**:policy/teleop/human-demo 命令的 agent 轨迹 |
+| **状态/响应** | object-flow、attachment、contact-point | 物体对 agent 的**响应** |
+
+**预测器现状(重要):我们只有 object-flow 预测器 ②,attachment/contact 没有独立预测器。**
+- **②** = 现成 `rollout_dual`(object-flow WM,action=agent eef 星座 dummy5/mp),从数据学 grasp carry-follow(grip 闭合→物体跟随),非硬编码 [[project_grasp_dynamics_hardcoded_blocker]]。**只预测 object-flow**。
+- ★**attachment/contact 不单独预测,由 ContactDetector(§5)从 rollout 状态确定性导出**:ContactDetector 在 **encode 和 rollout 用同一套** `(tracks3d, eef3d, grip) → (attachment, contact_pt3d)`。所以 ② 只需预测 object-flow(它已隐含 grasp 效应),contact 两通道随预测出的物体位置 + 命令的 agent **自洽导出**。这就是"只有 flow 预测器"够用的原因。
+
+**自回归 rollout 循环**:
+1. 状态 = 物体 3D track 点(+ 当前 agent 状态);给 agent 动作序列(skel/grip/trace = 控制)。
+2. 每步:agent 动作 → **②** 预测物体下一步 3D 运动(含 grasp 跟随)。
+3. 用(命令 agent + ②预测 object + **ContactDetector 导出** attachment/contact)**建下一帧草图**。
+4. **③** decode 草图 → 像素。回到 2。
+
+→ 完整 WM = **② (草图/点空间动力学) → ③ (草图→像素 decode)**,草图是状态接口。e2e 就是 `eval_e2e_combined`:② rollout → 建草图 cond → ③ sample。③ 在 **GT 草图**训、用在 **②预测草图**(warp+grip 让 ③ 对 ② 误差鲁棒 [[project_gripwarp_e2e_robustness]])。
+
+**边界**:② 是**引用现有**(不在本框架 spec 重实现/重训);本框架贡献 = 统一草图作状态接口 + ③ decode + contact 导出闭环。**未来选项(YAGNI,现由导出满足)**:学习式 contact 预测头 / 让 ② 直接预测 attachment。
 
 ## 7. 数据流(端到端)
 
