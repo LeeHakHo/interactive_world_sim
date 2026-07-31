@@ -14,7 +14,7 @@ mkdir -p outputs/cross_embodiment_wm/logs "$OUT_DIR"
 export ACTION=dummy5 SPLIT=okfirst
 export HELDOUT_VIDS="100,102"          # ← 内部export, comma安全
 export DS=outputs/flow_render_dataset_can_dual/clips_robot_retrack.npz
-export DS_H=outputs/flow_render_dataset_can_dual/clips_human_L24_retrack_realwrist.npz
+export DS_H=${DS_H:-outputs/flow_render_dataset_can_dual_L48/clips_human_L48_retrack_realwrist.npz}   # ★L48对齐mp(原L24是confound)
 # MIX / OUT_DIR 由 --export 传(无逗号)
 echo "=== d5wm2 ACTION=$ACTION MIX=$MIX OUT=$OUT_DIR DS=$DS HELDOUT_VIDS=$HELDOUT_VIDS ==="
 python exp_scel_dualview_wm.py
