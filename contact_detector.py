@@ -27,3 +27,26 @@ def detect_contact_geometric(tracks3d, eef3d, grip):
     attachment = closed * near * corr
     contact_pt3d = (gmid + obj) / 2
     return attachment.astype(np.float32), contact_pt3d.astype(np.float32)
+
+
+D_NEAR_2D = 0.12       # crop-norm 2D "近"尺度(帧宽的~12%)
+
+
+def detect_contact_2d(tracks2d, eef2d, grip):
+    """2D per-view 版(human 无 3D 物体轨迹)。tracks2d (T,K,2) crop-norm, eef2d (T,3,2), grip (T,)
+    -> (attachment (T,), contact_pt2d (T,2))。逻辑同 3D 版, 在图像 2D 里算。"""
+    tracks2d = np.asarray(tracks2d, np.float64); eef2d = np.asarray(eef2d, np.float64)
+    grip = np.asarray(grip, np.float64)
+    obj = np.nanmean(tracks2d, axis=1)                       # (T,2) 物体 2D 质心
+    gmid = (eef2d[:, 1] + eef2d[:, 2]) / 2                   # (T,2) 夹爪 2D 中点
+    closed = 1.0 - np.clip(grip / GRIP_MAX, 0, 1)
+    dist = np.linalg.norm(gmid - obj, axis=1)
+    near = _sig((D_NEAR_2D - dist) / (0.5 * D_NEAR_2D))
+    vo = np.diff(obj, axis=0, prepend=obj[:1]); vg = np.diff(gmid, axis=0, prepend=gmid[:1])
+    mo = np.linalg.norm(vo, axis=1); mg = np.linalg.norm(vg, axis=1)
+    cos = np.clip((vo * vg).sum(1) / (mo * mg + EPS), 0, 1)
+    moving = (mo > 5e-4) & (mg > 5e-4)                       # crop-norm 速度门控
+    corr = np.where(moving, cos, 0.5)
+    attachment = closed * near * corr
+    contact_pt2d = (gmid + obj) / 2
+    return attachment.astype(np.float32), contact_pt2d.astype(np.float32)

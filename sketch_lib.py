@@ -60,3 +60,20 @@ def contact_channels(attachment, contact_pt3d, view, sigma=4.0):
         yy, xx = np.ogrid[:IMG, :IMG]
         splat = np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma ** 2)).astype(np.float32)
     return np.concatenate([attach, splat[None]], 0)
+
+
+def object_flow_2d(tr2d0, tr2dt, ef0_2d, eft_2d, vis_t):
+    """2D per-view object flow(human 无 tracks3d, 走两域都有的 2D tracks)-> (3,128,128)[dx,dy,footprint]。"""
+    import exp_scel_dualview_dit as DIT
+    return DIT.flow_cond(tr2d0, tr2dt, ef0_2d, eft_2d, vis_t)
+
+
+def contact_channels_2d(attachment, contact_pt2d, sigma=4.0):
+    """attachment 广播 + 2D接触点(crop-norm, 已在视角内)高斯splat -> (2,128,128)。"""
+    attach = np.full((1, IMG, IMG), float(np.clip(attachment, 0, 1)), np.float32)
+    splat = np.zeros((IMG, IMG), np.float32)
+    if np.all(np.isfinite(contact_pt2d)):
+        cx, cy = int(np.clip(contact_pt2d[0] * IMG, 0, IMG - 1)), int(np.clip(contact_pt2d[1] * IMG, 0, IMG - 1))
+        yy, xx = np.ogrid[:IMG, :IMG]
+        splat = np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma ** 2)).astype(np.float32)
+    return np.concatenate([attach, splat[None]], 0)
