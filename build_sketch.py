@@ -73,8 +73,48 @@ def build_clip_sketch(A, n, tL, L, src):
     return out.astype(np.float16)
 
 
+def viz_clip(A, n, src, view_i, out_png):
+    """出 8 通道 原帧|通道|叠加 三联(128分辨率, 取 rf 中段一帧)供眼检。"""
+    f32 = lambda a: np.nan_to_num(np.asarray(a, np.float32))
+    view = "high" if view_i == 0 else "low"
+    frames = A["frames"] if view_i == 0 else A["frames_low"]
+    L = A["tracks"].shape[1]; rf = min(20, L - 1)
+    tr2d = f32(A["tracks"][n] if view_i == 0 else A["tracks_low"][n])
+    eef3d = f32(A["eef3d"][n]); grip = f32(A["grip"][n])
+    ef = f32(A["eef"][n] if view_i == 0 else A["eef_low"][n])
+    vs = f32(A["vis"][n] if view_i == 0 else A["vis_low"][n])
+    att, cpt = detect_contact_2d(tr2d, ef, grip)
+    sk2d = A["skel2d_high" if view_i == 0 else "skel2d_low"][n, rf]
+    chans = {
+        "flow": S.object_flow_2d(tr2d[0], tr2d[rf], ef[0], ef[rf], vs[rf]),
+        "skel": skel_chan(sk2d)[None], "grip": S.grip_channel(grip[rf]),
+        "trace": S.agent_trace_channel(eef3d[:rf + 1], view),
+        "contact": S.contact_channels_2d(att[rf], cpt[rf]),
+    }
+    bg = frames[n, rf].astype(np.uint8)
+    rows = []
+    for name, ch in chans.items():
+        c = ch[0] if ch.shape[0] == 1 else (ch[:3] if ch.shape[0] >= 3 else ch[1:2][0])
+        if isinstance(c, np.ndarray) and c.ndim == 3: c = c.transpose(1, 2, 0)
+        cimg = (np.clip(np.abs(c), 0, 1) * 255).astype(np.uint8)
+        if cimg.ndim == 2: cimg = cv2.cvtColor(cimg, cv2.COLOR_GRAY2RGB)
+        over = cv2.addWeighted(bg, 0.6, cv2.resize(cimg, (IMG, IMG)), 0.6, 0)
+        lab = bg.copy(); cv2.putText(lab, name, (4, 14), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 0), 1)
+        rows.append(np.concatenate([lab, cimg, over], 1))
+    grid = np.concatenate(rows, 0)
+    cv2.imwrite(out_png, cv2.cvtColor(grid, cv2.COLOR_RGB2BGR))
+    print(f"[viz] {out_png}", flush=True)
+
+
 def main():
     src = os.environ.get("SRC", "robot")
+    if os.environ.get("VIZ") == "1":
+        os.makedirs(f"{OUTDIR}/viz", exist_ok=True)
+        A = load_human_arrays() if src == "human" else load_robot_arrays()
+        n = int(A["_valid_idx"][0]) if src == "human" else 356
+        for v in range(2):
+            viz_clip(A, n, src, v, f"{OUTDIR}/viz/sketch_{src}_clip{n}_cam{'hi' if v == 0 else 'lo'}.png")
+        return
     A = load_human_arrays() if src == "human" else load_robot_arrays()
     N = A["tracks"].shape[0]; L = A["tracks"].shape[1]; tL = 6
     idx = A["_valid_idx"]
