@@ -27,7 +27,7 @@ EF = {a: W.load_action_tokens(a, "r", DS) for a in WMS}
 K, P, L = W.K, 48, 48
 u8 = lambda a: (np.clip(a, 0, 1) * 255).astype(np.uint8)
 r128 = lambda im: cv2.resize(im, (128, 128))
-OUT = "outputs/video_arch_wm/COMPARE_full"; os.makedirs(f"{OUT}/gifs", exist_ok=True)
+OUT = os.environ.get("OUTDIR","outputs/video_arch_wm/COMPARE_full"); os.makedirs(f"{OUT}/gifs", exist_ok=True)
 SEQS = [int(x) for x in os.environ.get("SEQS", "332,418,59,442").split(",")]
 
 def rollout(action, si):
