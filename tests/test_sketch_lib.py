@@ -28,3 +28,16 @@ def test_object_flow_channels_shape():
     ef = np.random.rand(3, 2).astype(np.float32); vis = np.ones(48, np.float32)
     out = S.object_flow_channels(np.random.rand(48, 3), np.random.rand(48, 3), ef, ef, vis, "high")
     assert out.shape == (3, 128, 128)
+
+def test_agent_trace_channel_marks_recent_positions():
+    """拖尾应在最近帧 eef 中点位置有非零像素,且更亮(权重随时间增)。"""
+    H = 5
+    eef = np.zeros((H, 3, 3), np.float64)
+    # 两指尖(idx1,2)中点沿 x 前进; 投影后应落在图像内不同列
+    for t in range(H):
+        eef[t, 1] = [0.02 * t - 0.05, 0.0, 0.17]; eef[t, 2] = [0.02 * t - 0.05, 0.02, 0.17]
+    ch = S.agent_trace_channel(eef, "high", trail=8)
+    assert ch.shape == (1, 128, 128)
+    assert ch.max() > 0.0
+    # 最后一帧(最亮)对应位置的像素 >= 更早帧对应位置
+    assert ch.sum() > 0

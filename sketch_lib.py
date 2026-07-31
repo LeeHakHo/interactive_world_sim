@@ -26,3 +26,17 @@ def object_flow_channels(tr3d0, tr3dt, ef0_2d, eft_2d, vis_t, view):
 
 def pool16(x):
     return torch.nn.functional.avg_pool2d(torch.from_numpy(x[None]).float(), POOL)[0].numpy()
+
+
+def agent_trace_channel(eef3d_hist, view, trail=8):
+    """eef3d_hist (H,3,3) 历史(含当前) -> (1,128,128) 中点投影渐亮拖尾。"""
+    img = np.zeros((IMG, IMG), np.float32)
+    hist = np.asarray(eef3d_hist, np.float64)[-trail:]
+    mids = (hist[:, 1] + hist[:, 2]) / 2                      # (h,3) 两指尖中点
+    p = project_world_to_view(mids, view)                     # (h,2)
+    n = len(p)
+    for i, (x, y) in enumerate(p):
+        w = (i + 1) / n                                       # 越近越亮
+        xi, yi = int(np.clip(x * IMG, 0, IMG - 1)), int(np.clip(y * IMG, 0, IMG - 1))
+        cv2.circle(img, (xi, yi), 2, float(w), -1)
+    return img[None]
