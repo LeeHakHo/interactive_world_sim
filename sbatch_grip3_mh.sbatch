@@ -18,7 +18,7 @@ set -e
 export CCOND=7 TLCAP=6 HFRAC=0.5 PRED=abs OVERFIT=0
 export HELDOUT_VIDS="100,102"          # ← 内部export, comma安全; 干净episode-split
 export LAT=outputs/video_arch_wm/wan_latents_can_dual/latents_all.npz
-export COND=outputs/video_arch_wm/cond_can_dual/cond_skel_grip_retrack.npz
+export COND=${COND:-outputs/video_arch_wm/cond_can_dual/cond_skel_grip_retrack.npz}   # 默认grip; 外部可传非grip(warp隔离)
 export LAT_H=${LAT_H:-outputs/video_arch_wm/wan_latents_can_dual_L48/latents_human_all.npz}
 export COND_H=${COND_H:-outputs/video_arch_wm/cond_can_dual/cond_human_eef3_L48.npz}
 export STEPS=${STEPS:-80000} BS=16 EVAL_EVERY=4000
