@@ -11,12 +11,16 @@ DS = np.load("outputs/flow_render_dataset_can_dual/clips_robot.npz")   # vid/fid
 vae = WanVAE(device=dev)
 SEQS = [int(x) for x in os.environ.get("SEQS", "332,418").split(",")]
 # (label, ckpt, cond文件, CCOND)
+# ★干净3变体: 全 from-scratch 80k, robot-only, clean L48, 只差 cond(noWarp/warp/grip)
+# old_m4 = 不受控参考(VideoDiT+老数据+老flow+泄漏, 多变量), 只作视觉参照不下结论
 VARIANTS = [
-    ("old_m4_VideoDiT",  "outputs/video_arch_wm/m4_skel_gripaware_60k/video_dit_ema.pt",
-        "outputs/video_arch_wm/cond_can_dual/cond_skel_grip_retrack.npz", 7),
-    ("ro_80k_multihead", "outputs/video_arch_wm/epsplit_L48_mh/ro_80k/mh_ema.pt",
+    ("noWarp(clean,scratch)", "outputs/video_arch_wm/epsplit_L48_mh/nowarp_ro/mh_ema.pt",
         "outputs/video_arch_wm/cond_can_dual/cond_skel_all_retrack.npz", 4),
-    ("grip3_multihead",  "outputs/video_arch_wm/epsplit_L48_mh/grip_ro/mh_ema.pt",
+    ("warp(scratch)", "outputs/video_arch_wm/epsplit_L48_mh/warp_ro/mh_ema.pt",
+        "outputs/video_arch_wm/cond_can_dual/cond_skel_all_retrack.npz", 7),
+    ("grip+warp(scratch)",  "outputs/video_arch_wm/epsplit_L48_mh/grip_ro/mh_ema.pt",
+        "outputs/video_arch_wm/cond_can_dual/cond_skel_grip_retrack.npz", 7),
+    ("old_m4_REF(uncontrolled)",  "outputs/video_arch_wm/m4_skel_gripaware_60k/video_dit_ema.pt",
         "outputs/video_arch_wm/cond_can_dual/cond_skel_grip_retrack.npz", 7),
 ]
 u8 = lambda a: (np.clip(a, 0, 1) * 255).astype(np.uint8)
