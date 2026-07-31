@@ -41,3 +41,20 @@ def test_agent_trace_channel_marks_recent_positions():
     assert ch.max() > 0.0
     # 最后一帧(最亮)对应位置的像素 >= 更早帧对应位置
     assert ch.sum() > 0
+
+
+def test_grip_channel_broadcast():
+    import sketch_lib as S
+    ch = S.grip_channel(0.02)
+    assert ch.shape == (1, 128, 128)
+    assert np.allclose(ch, 0.02 / 0.04)
+
+
+def test_contact_channels_attachment_and_splat():
+    import sketch_lib as S
+    ch = S.contact_channels(1.0, np.array([-0.05, 0.0, 0.17]), "high")
+    assert ch.shape == (2, 128, 128)
+    assert np.allclose(ch[0], 1.0)                    # attachment 广播
+    assert ch[1].max() > 0.5                          # splat 有峰
+    ch0 = S.contact_channels(0.0, np.array([-0.05, 0.0, 0.17]), "high")
+    assert np.allclose(ch0[0], 0.0)

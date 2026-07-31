@@ -40,3 +40,23 @@ def agent_trace_channel(eef3d_hist, view, trail=8):
         xi, yi = int(np.clip(x * IMG, 0, IMG - 1)), int(np.clip(y * IMG, 0, IMG - 1))
         cv2.circle(img, (xi, yi), 2, float(w), -1)
     return img[None]
+
+
+GRIP_MAX = 0.04
+
+
+def grip_channel(grip_scalar):
+    """grip 标量 -> (1,128,128) 整层广播([0,1]=grip/GRIP_MAX)。"""
+    return np.full((1, IMG, IMG), np.clip(grip_scalar / GRIP_MAX, 0, 1), np.float32)
+
+
+def contact_channels(attachment, contact_pt3d, view, sigma=4.0):
+    """attachment 标量广播(第0层) + 接触点3D投影2D高斯splat(第1层) -> (2,128,128)。"""
+    attach = np.full((1, IMG, IMG), float(np.clip(attachment, 0, 1)), np.float32)
+    splat = np.zeros((IMG, IMG), np.float32)
+    if np.all(np.isfinite(contact_pt3d)):
+        x, y = project_world_to_view(np.asarray(contact_pt3d)[None], view)[0]
+        cx, cy = int(np.clip(x * IMG, 0, IMG - 1)), int(np.clip(y * IMG, 0, IMG - 1))
+        yy, xx = np.ogrid[:IMG, :IMG]
+        splat = np.exp(-((xx - cx) ** 2 + (yy - cy) ** 2) / (2 * sigma ** 2)).astype(np.float32)
+    return np.concatenate([attach, splat[None]], 0)
