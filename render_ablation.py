@@ -5,9 +5,9 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1"); sys.path.insert(0, ".")
 from eval_mh_render import sample, gt256          # 复用 sample + GT帧(256, retrack同crop)
 from wan_vae import WanVAE
 dev = "cuda"; TLCAP = 6; NS = 20
-LAT = np.load("outputs/video_arch_wm/wan_latents_can_dual/latents.npz")
+LAT = np.load("outputs/video_arch_wm/wan_latents_can_dual/latents_all.npz")
 lat, lat_low = LAT["lat"][:, :, :TLCAP], LAT["lat_low"][:, :, :TLCAP]
-DS = np.load("outputs/flow_render_dataset_can_dual/clips_robot_retrack.npz")   # vid/fidx 取GT帧
+DS = np.load("outputs/flow_render_dataset_can_dual/clips_robot.npz")   # vid/fidx 取GT帧(与eval_mh_render一致; retrack只改tracks不改vid/fidx)
 vae = WanVAE(device=dev)
 SEQS = [int(x) for x in os.environ.get("SEQS", "332,418").split(",")]
 # (label, ckpt, cond文件, CCOND)
