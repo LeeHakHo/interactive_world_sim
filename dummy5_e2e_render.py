@@ -15,13 +15,15 @@ def pool16(x): return torch.nn.functional.avg_pool2d(torch.from_numpy(x[None]).f
 LAT = np.load("outputs/video_arch_wm/wan_latents_can_dual/latents_all.npz")
 lat, lat_low = LAT["lat"][:, :, :TLCAP], LAT["lat_low"][:, :, :TLCAP]
 DS = np.load("outputs/flow_render_dataset_can_dual/clips_robot.npz")
-GRIPCOND = np.load("outputs/video_arch_wm/cond_can_dual/cond_skel_grip_retrack.npz")["cond"]  # (N,2,7,tL,16,16) GTflow+grip-skel+warp
+CCOND3 = int(os.environ.get("CCOND3", "7"))     # ③ cond通道: grip③=7, ro_80k=4
+COND3 = os.environ.get("COND3", "outputs/video_arch_wm/cond_can_dual/cond_skel_grip_retrack.npz")
+GRIPCOND = np.load(COND3)["cond"]  # (N,2,7,tL,16,16) GTflow+(grip-)skel+[warp]
 vae = WanVAE(device=dev)
 # ★参数化: ②(WM_CKPT+ACTION) 可换 dummy5/mp; ③ 固定 grip③(隔离②轴)
 WM_CKPT = os.environ.get("WM_CKPT", "outputs/cross_embodiment_wm/epsplit_L48/dummy5_rh_all/wm_dual.pt")
 ACTION = os.environ.get("ACTION", "dummy5")
 wm = torch.load(WM_CKPT, map_location=dev, weights_only=False).eval()
-m3 = torch.load("outputs/video_arch_wm/epsplit_L48_mh/grip_ro/mh_ema.pt", map_location=dev, weights_only=False).eval()
+m3 = torch.load(os.environ.get("CK3","outputs/video_arch_wm/epsplit_L48_mh/grip_ro/mh_ema.pt"), map_location=dev, weights_only=False).eval()
 K, F = W.K, W.F; P = 48; L = 48
 efA_full, efB_full = W.load_action_tokens(ACTION, "r", DS)
 u8 = lambda a: (np.clip(a, 0, 1) * 255).astype(np.uint8)
@@ -43,7 +45,7 @@ for si in SEQS:
     tL = GRIPCOND.shape[3]
     outs = {}
     for tag, use_pred in [("gtflow", False), ("e2e", True)]:
-        cond = GRIPCOND[si].copy()[:, :, :TLCAP]      # (2,7,TLCAP,16,16): GTflow+grip-skel+warp
+        cond = GRIPCOND[si].copy()[:, :CCOND3, :TLCAP]      # (2,7,TLCAP,16,16): GTflow+grip-skel+warp
         if use_pred:
             for k in range(TLCAP):
                 rf = 0 if k == 0 else min(4*k, L-1)
