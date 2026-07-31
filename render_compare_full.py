@@ -20,7 +20,7 @@ CG = np.load("outputs/video_arch_wm/cond_can_dual/cond_skel_grip_retrack.npz")["
 CA = np.load("outputs/video_arch_wm/cond_can_dual/cond_skel_all_retrack.npz")["cond"]        # 7ch flow+skel+warp
 vae = WanVAE(device=dev); lp = lpips.LPIPS(net="alex").to(dev).eval()
 WMS = {"mp": torch.load("outputs/cross_embodiment_wm/epsplit_L48/mp_rh_all/wm_dual.pt", map_location=dev, weights_only=False).eval(),
-       "dummy5": torch.load("outputs/cross_embodiment_wm/epsplit_L48/dummy5_rh_all/wm_dual.pt", map_location=dev, weights_only=False).eval()}
+       "dummy5": torch.load(os.environ.get("D5_CKPT", "outputs/cross_embodiment_wm/epsplit_L48/dummy5_rh_all/wm_dual.pt"), map_location=dev, weights_only=False).eval()}
 M_ro = torch.load("outputs/video_arch_wm/epsplit_L48_mh/ro_80k/mh_ema.pt", map_location=dev, weights_only=False).eval()
 M_grip = torch.load("outputs/video_arch_wm/epsplit_L48_mh/grip_ro/mh_ema.pt", map_location=dev, weights_only=False).eval()
 M_grip_rh = torch.load("outputs/video_arch_wm/epsplit_L48_mh/grip_rh/mh_ema.pt", map_location=dev, weights_only=False).eval()
