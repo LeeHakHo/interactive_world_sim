@@ -7,6 +7,6 @@
 #SBATCH --time=01:00:00
 cd /scr2/yusenluo/interactive_world_sim
 export HF_HUB_OFFLINE=1
-SRC=robot .venv_wan/bin/python build_sketch.py
-SRC=human .venv_wan/bin/python build_sketch.py
+WARP=1 TL=12 SRC=robot .venv_wan/bin/python build_sketch.py
+WARP=1 TL=12 SRC=human .venv_wan/bin/python build_sketch.py
 echo "=== DONE ==="
