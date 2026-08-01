@@ -68,6 +68,27 @@ def object_flow_2d(tr2d0, tr2dt, ef0_2d, eft_2d, vis_t):
     return DIT.flow_cond(tr2d0, tr2dt, ef0_2d, eft_2d, vis_t)
 
 
+def object_dz_scalar(tr3d0, tr3dt, valid):
+    """物体世界z位移均值(米, 刚性→单标量)。valid (K,)两帧都有效。无有效点->0。"""
+    tr3d0 = np.asarray(tr3d0, np.float64); tr3dt = np.asarray(tr3dt, np.float64)
+    dz = (tr3dt[:, 2] - tr3d0[:, 2])[np.asarray(valid, bool)]
+    dz = dz[np.isfinite(dz)]
+    return float(np.mean(dz)) if len(dz) else 0.0
+
+
+def world_dz_channel(tr2d_t, dz_scalar, vis_t=None, scale=5.0):
+    """世界系 z 位移通道(把"抬起"从图像2D flow分离)。dz_scalar=物体世界z位移(米),
+    splat 到当前帧每个可见物体2D点 tr2d_t (K,2) -> (1,128,128) signed。"""
+    img = np.zeros((IMG, IMG), np.float32)
+    tr2d_t = np.asarray(tr2d_t, np.float64)
+    val = float(np.clip(dz_scalar * scale, -1, 1))
+    for i in range(len(tr2d_t)):
+        if vis_t is not None and vis_t[i] < 0.5: continue
+        x, y = int(np.clip(tr2d_t[i, 0] * IMG, 0, IMG - 1)), int(np.clip(tr2d_t[i, 1] * IMG, 0, IMG - 1))
+        cv2.circle(img, (x, y), 3, val, -1)
+    return img[None]
+
+
 def contact_channels_2d(attachment, contact_pt2d, sigma=4.0):
     """attachment 广播 + 2D接触点(crop-norm, 已在视角内)高斯splat -> (2,128,128)。"""
     attach = np.full((1, IMG, IMG), float(np.clip(attachment, 0, 1)), np.float32)

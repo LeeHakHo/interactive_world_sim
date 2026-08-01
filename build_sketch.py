@@ -1,6 +1,6 @@
-"""组装 8 通道交互草图(2026-07-31 spec)。SRC=robot|human。3D世界系算->投影双视角2D->pool16。
+"""组装 9 通道交互草图(2026-07-31 spec + world_dz)。SRC=robot|human。3D世界系算->投影双视角2D->pool16。
 robot/human 的 skel2d+grip 都从各自现成 sidecar 读(不运行时跑 IK/FK/pinocchio)。在 .venv_wan 跑。
-通道序: [flow(3), skel(1), grip(1), trace(1), attachment(1), contact(1)] = 8。
+通道序: [flow_img(3), world_dz(1), skel(1), grip(1), trace(1), attachment(1), contact_splat(1)] = 9。
 用法: SRC=robot .venv_wan/bin/python build_sketch.py   (env: SMOKE=1 只前4条)
 """
 import os, numpy as np, cv2
@@ -29,7 +29,7 @@ def skel_chan(pts2d):
 
 def load_robot_arrays():
     z = np.load(RB)
-    keys = ["tracks", "tracks_low", "eef", "eef_low", "vis", "vis_low", "eef3d", "grip", "frames", "frames_low", "vid"]
+    keys = ["tracks", "tracks_low", "tracks3d", "tracks3d_valid", "eef", "eef_low", "vis", "vis_low", "eef3d", "grip", "frames", "frames_low", "vid"]
     A = {k: z[k][:] for k in keys}
     A["skel2d_high"] = _SKR["skel2d_high"][:]; A["skel2d_low"] = _SKR["skel2d_low"][:]
     A["_valid_idx"] = np.arange(A["tracks"].shape[0])
@@ -55,25 +55,29 @@ def load_human_arrays():
 
 
 def build_clip_sketch(A, n, tL, L, src):
-    """★object-flow+contact 走 2D per-view(human 无 tracks3d, 用两域都有的 2D tracks);
-    agent-trace 走 eef3d(两域都有)投影; agent-skel 从 sidecar。"""
+    """9通道: [flow_img(3), world_dz(1), skel(1), grip(1), trace(1), attach(1), contact_splat(1)]。
+    ★object-flow 图像2D(两域都有tracks); ★world_dz 从tracks3d(depth反投影, 物理竖直, 把lift从平移分离);
+    trace走eef3d投影; skel从sidecar。"""
     f32 = lambda a: np.nan_to_num(np.asarray(a, np.float32))
     tr2d = [f32(A["tracks"][n]), f32(A["tracks_low"][n])]
+    tr3d = f32(A["tracks3d"][n]); tr3dv = np.asarray(A["tracks3d_valid"][n], bool)   # (L,K,3),(L,K)
     eef3d = f32(A["eef3d"][n]); grip = f32(A["grip"][n])
     ef = [f32(A["eef"][n]), f32(A["eef_low"][n])]; vs = [f32(A["vis"][n]), f32(A["vis_low"][n])]
     contact = [detect_contact_2d(tr2d[v], ef[v], grip) for v in range(2)]   # 每视角 (att(L,), cpt(L,2))
-    out = np.zeros((2, 8, tL, GRID, GRID), np.float32)
+    out = np.zeros((2, 9, tL, GRID, GRID), np.float32)
     views = ["high", "low"]
     for k in range(tL):
         rf = 0 if k == 0 else min(4 * k, L - 1)
+        dz = S.object_dz_scalar(tr3d[0], tr3d[rf], tr3dv[0] & tr3dv[rf])                               # 物体世界z位移(标量)
         for v in range(2):
             flow = S.object_flow_2d(tr2d[v][0], tr2d[v][rf], ef[v][0], ef[v][rf], vs[v][rf])           # (3,128,128)
+            dzc = S.world_dz_channel(tr2d[v][rf], dz, vs[v][rf])                                       # (1,128,128) 物理竖直
             sk = skel_chan(A["skel2d_high" if v == 0 else "skel2d_low"][n, rf])[None]                  # (1,128,128)
             gp = S.grip_channel(grip[rf])                                                              # (1,128,128)
             trc = S.agent_trace_channel(eef3d[:rf + 1], views[v])                                      # (1,128,128)
             att_v, cpt_v = contact[v]
             ct = S.contact_channels_2d(att_v[rf], cpt_v[rf])                                           # (2,128,128) [attach,splat]
-            chans = np.concatenate([flow, sk, gp, trc, ct], 0)                                         # (8,128,128)
+            chans = np.concatenate([flow, dzc, sk, gp, trc, ct], 0)                                    # (9,128,128)
             out[v, :, k] = S.pool16(chans)
     return out.astype(np.float16)
 
@@ -90,8 +94,11 @@ def viz_clip(A, n, src, view_i, out_png):
     vs = f32(A["vis"][n] if view_i == 0 else A["vis_low"][n])
     att, cpt = detect_contact_2d(tr2d, ef, grip)
     sk2d = A["skel2d_high" if view_i == 0 else "skel2d_low"][n, rf]
+    tr3d = f32(A["tracks3d"][n]); tr3dv = np.asarray(A["tracks3d_valid"][n], bool)
+    dz = S.object_dz_scalar(tr3d[0], tr3d[rf], tr3dv[0] & tr3dv[rf])
     chans = {
         "flow": S.object_flow_2d(tr2d[0], tr2d[rf], ef[0], ef[rf], vs[rf]),
+        "world_dz": S.world_dz_channel(tr2d[rf], dz, vs[rf]),
         "skel": skel_chan(sk2d)[None], "grip": S.grip_channel(grip[rf]),
         "trace": S.agent_trace_channel(eef3d[:rf + 1], view),
         "contact": S.contact_channels_2d(att[rf], cpt[rf]),
@@ -124,7 +131,7 @@ def main():
     N = A["tracks"].shape[0]; L = A["tracks"].shape[1]; tL = 6
     idx = A["_valid_idx"]
     rows = idx[:4] if os.environ.get("SMOKE") == "1" else idx
-    sketch = np.zeros((N, 2, 8, tL, GRID, GRID), np.float16)
+    sketch = np.zeros((N, 2, 9, tL, GRID, GRID), np.float16)
     import time; t0 = time.time()
     for i, n in enumerate(rows):
         sketch[int(n)] = build_clip_sketch(A, int(n), tL, L, src)
