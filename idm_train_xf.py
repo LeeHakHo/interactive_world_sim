@@ -23,7 +23,7 @@ Xn = torch.tensor((Xtok - xm) / xs).to(dev)
 Yn = torch.tensor((Y - ym) / ys).to(dev)
 m = M.IDMTransformer(C=C, N=N, W=W, ptype=ptype).to(dev)
 opt = torch.optim.AdamW(m.parameters(), 3e-4, weight_decay=1e-4)
-bs = 2048; n = len(Xn)
+bs = int(os.environ.get("BS", "256")); n = len(Xn)
 print(f"[xf] ARM={ARM} M={M_} W={W} N={N} C={C} params={sum(p.numel() for p in m.parameters())/1e6:.2f}M", flush=True)
 for ep in range(EPOCHS):
     perm = torch.randperm(n); tot = 0.0
