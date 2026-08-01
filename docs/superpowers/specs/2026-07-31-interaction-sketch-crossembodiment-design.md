@@ -51,22 +51,22 @@
 
 ## 4. §1+§2 — 草图表示 & 编码器
 
-### 4.1 草图通道(3D canonical → 投影 2D per view)
+### 4.1 草图通道(★已实现 9 通道,每视角 2D)
 
-canonical 形态在 **3D 世界系**算,给 decoder 时投影到 cam_high/cam_low 各一张 2D 图。8 通道:
+每视角一张 2D 图(cam_high/cam_low),128 建 pool 到 16×16。**实现为 9 通道**(原设计 8ch + 补的 world_dz):
 
-| # | 通道 | 3D 内容 | 投影后(decoder 输入,每视角) | robot 来源 | human 来源 |
-|---|---|---|---|---|---|
-| 1–3 | object-flow | tracks3d 的 3D 位移 | 2D flow(dx,dy,footprint) | tracker | tracker |
-| 4 | agent-skel | 3D joint(grip 烘入手指开合) | 2D 9 点线画 | joint→**FK** | 手(HaMeR)→eef3→**IK**→joint→FK |
-| 5 | grip 标量 | 标量(视角无关) | 广播成一层 | 本体感觉 grip | 手开合→自身range映射 |
-| 6 | agent-trace | agent 3D 历史轨迹(eef3d) | 2D 拖尾 | eef3d 轨迹 | eef3d 轨迹 |
-| 7 | attachment 标量 | 标量(物体是否被夹爪绑定) | 广播成一层 | ContactDetector | ContactDetector |
-| 8 | contact-point | 3D 接触点 | 2D splat | ContactDetector | ContactDetector |
+| # | 通道 | 内容(decoder 输入,每视角 2D) | robot 来源 | human 来源 |
+|---|---|---|---|---|
+| 0–2 | object-flow | 图像2D flow(dx,dy,footprint) | 2D tracker | 2D tracker |
+| 3 | **world_dz** | 物体世界z位移 splat(物理竖直, 把lift从平移分离) | tracks3d(depth反投影) | tracks3d(★2026-08-01 augment补) |
+| 4 | agent-skel | 2D 9点线画(grip烘入手指) | joint→FK sidecar | 手→**IK**→FK sidecar |
+| 5 | grip 标量 | 广播成一层 | 本体感觉 grip | 手开合→自身range(sidecar grip饱和弃用) |
+| 6 | agent-trace | eef3d 历史投影拖尾 | eef3d | eef3d |
+| 7 | attachment 标量 | 广播(物体是否被夹爪绑定) | ContactDetector 2D | ContactDetector 2D |
+| 8 | contact-splat | 接触点2D splat | ContactDetector 2D | ContactDetector 2D |
 
-- **grip 两处都在**:烘在 skel 手指开合里 + 单独标量通道(用户定)。
-- **warp 不在草图里**:warp 是外观派生,归 decoder(§6 从 z0+flow 算)。草图保持纯抽象动态。
-- **全可视化**:每通道都是可解释图 → paper 可展示 `encode → 看得见的草图 → decode`。
+- ★**为何 2D + world_dz 而非纯3D-canonical**: object-flow 用两域都有的图像2D tracks(human物体轨迹原只2D); 物理竖直靠**单独 world_dz 通道**(从两域parquet都有的depth反投影的tracks3d, `augment_clips_tracks3d.py`)补回——图像flow看不出lift, dz给出来。can任务有lift/place, 这个通道有实价值(12-22cm抬升→通道0.6-0.86)。
+- **grip 两处**:烘在skel手指 + 单独标量。**warp 不在草图**(归decoder §6, 从z0+flow算)。**全可视化**(每通道可解释图)。
 
 ### 4.2 编码器结构
 
@@ -89,7 +89,7 @@ canonical 形态在 **3D 世界系**算,给 decoder 时投影到 cam_high/cam_lo
 ## 6. §3 — SketchDecoder
 
 - **架构**:MultiHeadVideoWM(= VideoDiT + 可选 aux 头),Wan-latent(C=48),z0 pin,rf 采样。承接 grip_ro([[project_mh3_warp_retrack_renderer]] 的 `epsplit_L48_mh/grip_ro`)。
-- **输入通道**:8ch 草图 + warp(3,decode 时从 z0+flow 算) = **11ch**(每视角)。**重训**(grip_ro 是 flow+skel+warp 7ch)。
+- **输入通道**:9ch 草图 + warp(3,decode 时从 z0+flow 算) = **12ch**(每视角)。**重训**(grip_ro 是 flow+skel+warp 7ch)。
 - **训练目标 = robot 重建**:encode robot 视频 → 草图 → decode 回 robot 像素。z0 = 该 clip **自己的首帧**(无匹配问题)。
 - **主头 robot-only + aux 头 robot+human**(用户关键补充,利用 human 不重蹈"输入robot输出human"矛盾):
   - 主 latent 头(rf recon):loss **mask 到 batch 里 robot 那半**(human 不进主 recon MSE)。
