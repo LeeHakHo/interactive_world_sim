@@ -13,7 +13,12 @@ OUT = os.environ.get("OUT_DIR", f"outputs/idm_derisk/{ARM}")
 K, P = W.K, 48
 z = np.load("outputs/flow_render_dataset_can_dual/clips_robot_retrack.npz")
 ck = torch.load(f"{OUT}/idm.pt", map_location="cpu", weights_only=False)
-m = M.IDM(din=ck["din"]); m.load_state_dict(ck["state"]); m.eval()
+XF = ck.get("model") == "xf"
+if XF:
+    m = M.IDMTransformer(C=ck["C"], N=ck["N"], W=ck["W"], ptype=ck["ptype"])
+else:
+    m = M.IDM(din=ck["din"], hidden=ck.get("hid", 512), n_layers=ck.get("nlayer", 3))
+m.load_state_dict(ck["state"]); m.eval()
 spec, KP, FF = ck["spec"], ck["KP"], ck["FF"]
 xm, xs, ym, ys = ck["x_mean"], ck["x_std"], ck["y_mean"], ck["y_std"]
 wm2 = torch.load("outputs/cross_embodiment_wm/epsplit_L48/mp_r_all/wm_dual.pt", map_location="cpu", weights_only=False).eval()
@@ -35,13 +40,21 @@ def mp_tokens(eef_hi, eef_lo):   # (T,3,2)x2 -> (T,4,2)x2, 口径同训练
 
 
 def idm_joint_traj(ci):
-    X, _, _ = D.build_windows(z, spec, KP, FF, clips=[ci])
-    with torch.no_grad():
-        Yp = m(torch.tensor((X - xm) / xs).float()).numpy() * ys + ym   # (L-1,7)
+    if XF:
+        Xt, _, _, _ = D.build_windows_tokens(z, spec, KP, FF, clips=[ci])
+        with torch.no_grad():
+            Yp = m(torch.tensor((Xt - xm) / xs).float()).numpy() * ys + ym
+    else:
+        X, _, _ = D.build_windows(z, spec, KP, FF, clips=[ci])
+        with torch.no_grad():
+            Yp = m(torch.tensor((X - xm) / xs).float()).numpy() * ys + ym   # (L-1,7)
     dj, gp = Yp[:, :6], Yp[:, 6]
-    jt = np.zeros((len(dj) + 1, 6)); jt[0] = z["joint"][ci, 0, :6]       # 从GT joint_0积分
-    for t in range(len(dj)):
-        jt[t + 1] = jt[t] + dj[t]
+    jt = np.zeros((len(dj) + 1, 6)); jt[0] = z["joint"][ci, 0, :6]       # 帧0锚GT
+    if D.YMODE == "abs":
+        jt[1:] = dj                                                      # 直接取预测的绝对joint(无积分漂移)
+    else:
+        for t in range(len(dj)):
+            jt[t + 1] = jt[t] + dj[t]                                    # Δ积分
     grip = np.concatenate([gp, gp[-1:]])
     return jt, grip
 

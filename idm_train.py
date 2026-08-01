@@ -14,12 +14,13 @@ spec = D.INPUT_SPECS[ARM]
 tr, ho = D.episode_split(z)
 if SMOKE:
     tr = tr[:20]
+dev = "cuda" if torch.cuda.is_available() else "cpu"
 X, Y, meta = D.build_windows(z, spec, KP, FF, clips=tr)
 xm, xs = X.mean(0), X.std(0) + 1e-6
 ym, ys = Y.mean(0), Y.std(0) + 1e-6
-Xn = torch.tensor((X - xm) / xs)
-Yn = torch.tensor((Y - ym) / ys)
-m = M.IDM(din=X.shape[1])
+Xn = torch.tensor((X - xm) / xs).to(dev)
+Yn = torch.tensor((Y - ym) / ys).to(dev)
+m = M.IDM(din=X.shape[1]).to(dev)
 opt = torch.optim.Adam(m.parameters(), 1e-3)
 bs = 4096
 n = len(Xn)
@@ -36,7 +37,8 @@ for ep in range(EPOCHS):
     if ep % 50 == 0 or ep == EPOCHS - 1:
         print(f"ep{ep} loss {tot / n:.4f}", flush=True)
 torch.save({"state": m.state_dict(), "spec": spec, "KP": KP, "FF": FF,
-            "x_mean": xm, "x_std": xs, "y_mean": ym, "y_std": ys, "din": X.shape[1]}, f"{OUT}/idm.pt")
+            "x_mean": xm, "x_std": xs, "y_mean": ym, "y_std": ys, "din": X.shape[1],
+            "hid": int(os.environ.get("HID", "512")), "nlayer": int(os.environ.get("NLAYER", "3"))}, f"{OUT}/idm.pt")
 open(f"{OUT}/train_summary.txt", "w").write(
     f"ARM={ARM} din={X.shape[1]} nwin_train={n} epochs={EPOCHS} smoke={SMOKE}\n")
 print(f"[ckpt] {OUT}/idm.pt", flush=True)

@@ -21,7 +21,7 @@ if [ "$DO_TRAIN" = "1" ]; then
   conda activate iws
   for ARM in $ARMS; do
     echo "--- train $ARM ---"
-    ARM=$ARM EPOCHS=$EPOCHS OUT_DIR=outputs/idm_derisk/$ARM python idm_train.py
+    ARM=$ARM EPOCHS=$EPOCHS OUT_DIR=outputs/idm_derisk/$ARM${OUT_SUF} python idm_train.py
   done
 fi
 
@@ -29,7 +29,7 @@ if [ "$DO_EVAL" = "1" ]; then
   conda activate phantom
   for ARM in $ARMS; do
     echo "--- eval $ARM ---"
-    ARM=$ARM OUT_DIR=outputs/idm_derisk/$ARM python idm_eval.py
+    ARM=$ARM OUT_DIR=outputs/idm_derisk/$ARM${OUT_SUF} python idm_eval.py
   done
 fi
 
