@@ -9,7 +9,7 @@ from contact_detector import detect_contact_2d
 
 IMG = 128; GRID = 16
 RB = "outputs/flow_render_dataset_can_dual/clips_robot_retrack.npz"
-HM = "outputs/flow_render_dataset_can_dual_L48/clips_human_L48_retrack_realwrist.npz"
+HM = "outputs/flow_render_dataset_can_dual_L48/clips_human_L48_retrack_realwrist_3d.npz"  # ★带tracks3d(augment加, depth反投影)
 SKELF_R = "outputs/flow_render_dataset_can_dual/skel_sidecar_robot.npz"
 SKELF_H = "outputs/flow_render_dataset_can_dual/skel_sidecar_human_ik.npz"
 OUTDIR = "outputs/video_arch_wm/sketch_can_dual"; os.makedirs(OUTDIR, exist_ok=True)
@@ -38,7 +38,7 @@ def load_robot_arrays():
 
 def load_human_arrays():
     z = np.load(HM)
-    keys = ["tracks", "tracks_low", "eef", "eef_low", "vis", "vis_low", "eef3d", "frames", "frames_low", "vid"]
+    keys = ["tracks", "tracks_low", "tracks3d", "tracks3d_valid", "eef", "eef_low", "vis", "vis_low", "eef3d", "frames", "frames_low", "vid"]
     A = {k: z[k][:] for k in keys}
     A["skel2d_high"] = _SKH["skel2d_high"][:]; A["skel2d_low"] = _SKH["skel2d_low"][:]
     # ★human grip 用自身range重算(sidecar grip 是旧robot-range映射, 饱和near-open p50=0.04死信号);
