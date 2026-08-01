@@ -36,7 +36,10 @@ def solve(ci):
         with torch.no_grad(): Yp = m(torch.tensor((X - xm) / xs).float()).numpy() * ys + ym
     dj, gp = Yp[:, :6], Yp[:, 6]
     jt = np.zeros((len(dj) + 1, 6)); jt[0] = J0
-    for t in range(len(dj)): jt[t + 1] = jt[t] + dj[t]
+    if D.YMODE == "abs":
+        jt[1:] = dj                                          # 绝对关节: 无锚点依赖(人类迁移关键)
+    else:
+        for t in range(len(dj)): jt[t + 1] = jt[t] + dj[t]
     grip = np.concatenate([gp, gp[-1:]])
     sh, sl, _ = fk_skel2d_dual(np.concatenate([jt, np.zeros((len(jt), 1))], 1), grip)   # (T,9,2)x2
     return sh, grip
