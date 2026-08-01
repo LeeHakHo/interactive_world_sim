@@ -8,6 +8,14 @@ import sketch_lib as S
 from contact_detector import detect_contact_2d
 
 IMG = 128; GRID = 16
+WARP = os.environ.get("WARP") == "1"        # ★加warp(3): 12ch cond(9草图+warp3), 存 _warp.npz. grip+warp证明很重要
+NCH = 12 if WARP else 9
+_G = None
+def _warp_mod():
+    global _G
+    if _G is None:
+        import exp_scel_dualview_gmaskcond as G; _G = G
+    return _G
 RB = "outputs/flow_render_dataset_can_dual/clips_robot_retrack.npz"
 HM = "outputs/flow_render_dataset_can_dual_L48/clips_human_L48_retrack_realwrist_3d.npz"  # ★带tracks3d(augment加, depth反投影)
 SKELF_R = "outputs/flow_render_dataset_can_dual/skel_sidecar_robot.npz"
@@ -63,8 +71,9 @@ def build_clip_sketch(A, n, tL, L, src):
     tr3d = f32(A["tracks3d"][n]); tr3dv = np.asarray(A["tracks3d_valid"][n], bool)   # (L,K,3),(L,K)
     eef3d = f32(A["eef3d"][n]); grip = f32(A["grip"][n])
     ef = [f32(A["eef"][n]), f32(A["eef_low"][n])]; vs = [f32(A["vis"][n]), f32(A["vis_low"][n])]
+    fr = [A["frames"][n], A["frames_low"][n]] if WARP else None
     contact = [detect_contact_2d(tr2d[v], ef[v], grip) for v in range(2)]   # 每视角 (att(L,), cpt(L,2))
-    out = np.zeros((2, 9, tL, GRID, GRID), np.float32)
+    out = np.zeros((2, NCH, tL, GRID, GRID), np.float32)
     views = ["high", "low"]
     for k in range(tL):
         rf = 0 if k == 0 else min(4 * k, L - 1)
@@ -77,8 +86,10 @@ def build_clip_sketch(A, n, tL, L, src):
             trc = S.agent_trace_channel(eef3d[:rf + 1], views[v])                                      # (1,128,128)
             att_v, cpt_v = contact[v]
             ct = S.contact_channels_2d(att_v[rf], cpt_v[rf])                                           # (2,128,128) [attach,splat]
-            chans = np.concatenate([flow, dzc, sk, gp, trc, ct], 0)                                    # (9,128,128)
-            out[v, :, k] = S.pool16(chans)
+            chs = [flow, dzc, sk, gp, trc, ct]                                                         # 9ch 抽象草图
+            if WARP:
+                chs.append(_warp_mod().warp_preview(fr[v][0], tr2d[v][0], tr2d[v][rf], vs[v][rf]))     # +warp(3)=12ch
+            out[v, :, k] = S.pool16(np.concatenate(chs, 0))
     return out.astype(np.float16)
 
 
@@ -131,13 +142,14 @@ def main():
     N = A["tracks"].shape[0]; L = A["tracks"].shape[1]; tL = 6
     idx = A["_valid_idx"]
     rows = idx[:4] if os.environ.get("SMOKE") == "1" else idx
-    sketch = np.zeros((N, 2, 9, tL, GRID, GRID), np.float16)
+    sketch = np.zeros((N, 2, NCH, tL, GRID, GRID), np.float16)
     import time; t0 = time.time()
     for i, n in enumerate(rows):
         sketch[int(n)] = build_clip_sketch(A, int(n), tL, L, src)
         if i % 100 == 0: print(f"sketch {i}/{len(rows)} (clip {n})  {(time.time()-t0)/max(i,1):.3f}s/clip", flush=True)
-    np.savez(f"{OUTDIR}/sketch_{src}.npz", sketch=sketch, tL=np.array(tL))
-    print(f"saved {OUTDIR}/sketch_{src}.npz {sketch.shape}", flush=True)
+    suffix = "_warp" if WARP else ""
+    np.savez(f"{OUTDIR}/sketch_{src}{suffix}.npz", sketch=sketch, tL=np.array(tL))
+    print(f"saved {OUTDIR}/sketch_{src}{suffix}.npz {sketch.shape}", flush=True)
 
 
 if __name__ == "__main__":
