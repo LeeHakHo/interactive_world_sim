@@ -25,6 +25,8 @@
 
 ## 3. 表示与数据流
 
+> ★**输入集是起点假设,不是定论**:哪些组件真帮 IDM 是经验问题 → Step 0 **含输入消融**(见 §4.5),用闭环判据挑最小够用集。下面是起点。
+
 ### 输入(每个时刻 t 的双向窗口 `[t-K, t+F]`)
 - **object-flow**: 物体 48-track 2D 轨迹(双视角),**含未来段** F —— 动作的"效果"可见,是逆模型 well-posed 的关键。
 - **agent 接触 trace**: mp 式(接触点 c + 指轴单位向量 + 开合标量),逐帧。
@@ -47,6 +49,22 @@
 - **监督**: robot 数据 supervised regression(MSE / Huber on Δjoint;grip 用 MSE 或 BCE)。
 - **为什么双向窗口**: 单看 t 之前推不出动作(自由空间 flow=0);把物体**未来怎么动**放进输入,IDM 反推"什么动作造成了这个效果"。
 - 参数:`K,F` 复用 ② 的量级(K=4,F=20)作起点,可 sweep。
+
+## 4.5 输入消融(Step 0 的一部分 —— 挑最小够用输入集)
+
+输入组件用**闭环判据(§5)判**,不靠先验。精简网格(每臂训一个 IDM,同 held-out 评):
+
+| 臂 | 输入 | 测什么 |
+|---|---|---|
+| **A0** | 只 object-flow | 薄基线,预期**自由段崩**(坐实病态) |
+| **A1** | flow + agent-trace(mp) | 加 agent 运动,自由段是否被救 |
+| **A2** | A1 + 显式 grip 通道 | grip timing 是否需要单列 |
+| **A3** | A1 但 **causal 窗口(只过去)** vs 双向 | 未来 object-flow(VPT 假设)到底帮不帮逆推 |
+| A4(可选) | agent-trace 变体:mp vs 原始 eef 3 点 vs 只接触点 c | 接触 trace 的最简形式 |
+
+- **判据**: 每臂报 eef-recon(自由/接触分开)+ object-flow-recon;**挑通过闭环的最小集**当 IDM 定稿。
+- **YAGNI**: A0/A1/A3 是核心必跑(证病态 + 救没救 + 窗口方向);A2/A4 视 A1 结果决定要不要。
+- 这样"输入端组件调整"是**实验驱动**的,不在 plan 里拍死。
 
 ## 5. 闭环判据(Step 0 de-risk 的成功判据)
 
@@ -77,9 +95,10 @@ held-out robot demo 上:
 
 ## 7. 交付物(Step 0)
 
-- `idm_train.py`(训练)+ `idm_eval.py`(闭环判据,含 FK + 前向 ② + 并排 overlay gif)。
-- held-out 闭环 summary(eef-recon / object-flow-recon / grip,自由/接触分开)+ Drive 上的 overlay gif。
-- PASS/FAIL 判决,决定是否进 Step 1。
+- `idm_train.py`(训练,输入集经 env/config 可切 → 支持 §4.5 消融)+ `idm_eval.py`(闭环判据,含 FK + 前向 ② + 并排 overlay gif)。
+- **输入消融表**(§4.5 各臂 × eef-recon/object-flow-recon,自由/接触分开)→ 挑最小够用输入集。
+- held-out 闭环 summary + Drive 上的 overlay gif。
+- PASS/FAIL 判决(基于选定输入集),决定是否进 Step 1。
 
 ## 8. 明确不做(scope 边界)
 
