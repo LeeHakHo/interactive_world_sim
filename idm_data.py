@@ -19,6 +19,9 @@ INPUT_SPECS = {
     "B1": {"flow": True,  "trace": True,  "grip": False, "future": True, "traceraw": True},
     # C1: 3D 物体流 + 3D eef 轨迹(depth+标定反投影, 天生域不变, 不丢腕/尺度)。测"精度限制是不是2D丢深度"
     "C1": {"flow3d": True, "trace3d": True, "future": True},
+    # ★消融"Thread B是不是只是IK人手": Cf=只object-flow(强命题) / Ct=只eef轨迹(≈学出来的IK人手)
+    "Cf": {"flow3d": True, "future": True},
+    "Ct": {"trace3d": True, "future": True},
 }
 
 
