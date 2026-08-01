@@ -48,8 +48,8 @@ lines = ["IDM 输入消融汇总 (px@128, heldout episode 100/102; 自由=物体
 for r in rows:
     lines.append(f"{r[0]:<4} {r[1]:<16} {r[2]:>8.1f} {r[3]:>8.1f} {r[4]:>9.1f} {r[5]:>9.1f} {r[6]:>9.1f} {r[7]:>9.1f}")
 lines += ["",
-          "判据: A1接触段flow-recon接近ceil→动作可从flow+trace解出(PASS); A0(flow-only)自由段崩→证需trace;",
-          "A3(causal)vs A1(双向)看未来窗价值。"]
+          "判据: A1接触段flow-recon接近ceil→动作可从flow+trace解出(PASS); A0(flow-only)自由段eef崩→证需trace;",
+          "A3(causal去未来窗)eef崩→逆动力学需双向/未来窗(离线解demo合法)。详见 VERDICT.txt。"]
 out = f"{ROOT}/ABLATION.txt"
 open(out, "w").write("\n".join(lines) + "\n")
 print("\n".join(lines))
