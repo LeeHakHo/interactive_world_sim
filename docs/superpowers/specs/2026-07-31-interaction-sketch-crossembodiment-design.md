@@ -150,3 +150,31 @@
 - **主头含 human recon**:重蹈"输入robot输出human"矛盾;human 只走 aux 头。
 - **DINO 当 aux 目标**:全帧 DINO human/robot 完全 disjoint(582× 可分),两域两个不相干目标,trunk 不被逼共享 → 换域共享 object-centric(物体 heatmap)。
 - **框架层解决锚匹配**:锚匹配是翻译下游的事,框架 z0 只是普通输入。
+
+## 10. Related Work — 交互如何建模 & 我们的差异化(2026-08-01 调研)
+
+领域共识:**"抽象交互表示"是跨具身正确接口**;分歧在**表示→policy vs decode→像素**。
+
+| 交互表示 | 代表 | 去向 | 与我们关系 |
+|---|---|---|---|
+| **物-物相对位姿 SE(3)** | Human2Any(2606.28813) | 组合规划/policy | agent-free, 缺关系任务时可借(加物-物通道) |
+| **3D 交互点 trace**(物体/手/工具/接触区) | **μ₀**(Furong Huang UMD, 2606.13769) | trace→policy(★不渲染) | ★最强对标+最强质疑: 批评pixel模型"浪费容量在外观"→只policy |
+| **物体 flow**(2D/3D场) | Im2Flow2Act "Flow as cross-domain interface"(2407.15208), AMPLIFY(FSQ motion token) | policy | =我们object-flow通道 |
+| **统一骨架/retarget** | OSCAR, DexWM(ACTION-Δ vs STATE), MT-π | policy | =我们agent-skel(IK统一, 像Human2Any retarget) |
+| **学习式latent action** | LAPA, Genie, LAC-WM(ICML26) | WM/policy | 学习式对照(见下), 我们手设计绕开582×墙 |
+| **★我们:交互草图** | object-flow+world_dz+agent-skel+grip+contact+warp, decode→像素 | **decode→像素** | 差异化=渲染 |
+
+### 我们的差异化(护城河) & 核心质疑
+- **几乎全场 表示→policy;只有我们 decode 回像素。** 这既是差异化也是 μ₀ 正面质疑点。
+- **decode值不值**: 支持=①human→robot数据生成(翻译已验证)②可视化/可解释WM③想象/验证; 质疑(μ₀)=渲染烧容量在外观。护城河成立⇔"渲染下游价值"撑得住这句质疑。
+
+### 学习式 latent action 怎么做(LAPA/Genie/LAC-WM)
+- **无action标签, 从视频反推latent动作**: (1)**IDM** 看相邻两帧(x_t,x_{t+k})→推离散latent z(VQ码本); (2)**FDM** (x_t,z)→预测x_{t+k}; (3)**瓶颈**逼z只编码"变化/动作"(能从x_t看到的静态丢掉)。
+- **跨具身**: z从像素转移学, 不绑robot action space; human"抬"和robot"抬"视觉转移像→映到相近z→同套latent action共享。
+- **用法**: LAPA=Stage1学码本→Stage2视频预训policy预测z→Stage3少量真标签z→真action; LAC-WM=WM条件在统一latent action→迁移未见具身更好; Genie=同机制生成可交互世界。
+- **vs 我们**: 他们**学**z(不透明VQ, 靠瓶颈逼共享粗动作); 我们**手设计**通道(靠已知共享object-flow probe0.645)。两条路通往同一目标(共享粗动作接口): 学习式(可扩展/不透明)vs手设计(可解释/可控/能decode)。★学习式能work正因瓶颈让z只抓粗动作(共享)不抓细外观(disjoint)——同我们object-flow道理, 只是自动vs显式。
+
+### 可选升级(从related work借, YAGNI待需)
+1. **物-物相对位姿通道**(Human2Any)→关系任务(A放进B), 现单物体flow缺关系。
+2. **点trace表示**(μ₀)替/补图像通道(更3D紧凑), 已部分做(tracks3d→dz)。
+3. **学习式latent通道**(LAPA)——但域不变latent难(582×), 手设计正为绕它。
