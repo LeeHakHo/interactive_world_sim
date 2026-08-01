@@ -139,7 +139,7 @@ def main():
             viz_clip(A, n, src, v, f"{OUTDIR}/viz/sketch_{src}_clip{n}_cam{'hi' if v == 0 else 'lo'}.png")
         return
     A = load_human_arrays() if src == "human" else load_robot_arrays()
-    N = A["tracks"].shape[0]; L = A["tracks"].shape[1]; tL = 6
+    N = A["tracks"].shape[0]; L = A["tracks"].shape[1]; tL = int(os.environ.get("TL", "12"))
     idx = A["_valid_idx"]
     rows = idx[:4] if os.environ.get("SMOKE") == "1" else idx
     sketch = np.zeros((N, 2, NCH, tL, GRID, GRID), np.float16)

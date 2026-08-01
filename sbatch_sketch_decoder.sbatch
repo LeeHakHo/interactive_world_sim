@@ -13,7 +13,7 @@ export LAT=outputs/video_arch_wm/wan_latents_can_dual/latents_all.npz
 export COND=outputs/video_arch_wm/sketch_can_dual/sketch_robot_warp.npz
 export LAT_H=outputs/video_arch_wm/wan_latents_can_dual_L48/latents_human_all.npz
 export COND_H=outputs/video_arch_wm/sketch_can_dual/sketch_human_warp.npz
-export CCOND=12 TLCAP=6 PRED=abs HELDOUT_VIDS=100,102 STEPS=60000 BS=16 EVAL_EVERY=4000
+export CCOND=12 TLCAP=0 PRED=abs HELDOUT_VIDS=100,102 STEPS=60000 BS=16 EVAL_EVERY=4000
 mkdir -p outputs/video_arch_wm/logs
 echo "=== sketch decoder MIX=${MIX:-robot-only} AUX=${AUX:-none} OUT=$OUT ==="
 .venv_wan/bin/python train_sketch_decoder.py
