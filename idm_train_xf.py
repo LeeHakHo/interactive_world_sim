@@ -33,6 +33,10 @@ for ep in range(EPOCHS):
         loss.backward(); opt.step(); tot += loss.item() * len(idx)
     if ep % 25 == 0 or ep == EPOCHS - 1:
         print(f"ep{ep} loss {tot / n:.4f}", flush=True)
+    if ep % 20 == 0 or ep == EPOCHS - 1:                 # ★中途存盘(超时/重启防护)
+        torch.save({"model": "xf", "state": m.state_dict(), "spec": spec, "KP": KP, "FF": FF,
+                    "x_mean": xm, "x_std": xs, "y_mean": ym, "y_std": ys, "ptype": ptype,
+                    "N": N, "W": W, "C": C, "ep": ep}, f"{OUT}/idm.pt")
 torch.save({"model": "xf", "state": m.state_dict(), "spec": spec, "KP": KP, "FF": FF,
             "x_mean": xm, "x_std": xs, "y_mean": ym, "y_std": ys, "ptype": ptype,
             "N": N, "W": W, "C": C}, f"{OUT}/idm.pt")
