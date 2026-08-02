@@ -19,10 +19,11 @@ FOLLOW_TH = float(os.environ.get("FOLLOW_TH", "0.4"))
 DELTA = float(os.environ.get("DELTA", "0.012"))
 GRIP_DELTA = float(os.environ.get("GRIP_DELTA", "0.006"))
 REPEAT = int(os.environ.get("REPEAT", "3"))
-RENDER_H = 48                    # 视频块固定 48 帧 (tL=12)
+RENDER_H = int(os.environ.get("RENDER_H", "48"))   # ②rollout步数; 自回归无硬限制, env可调长(rollout_dual/③DiT T可变)
 Z_LIFT_CAP = 0.28                # BOX3D z 上限 = z0 + 此值
-GRID, POOL, tL = 16, 8, 12
-DS = "outputs/flow_render_dataset_can_dual/clips_robot.npz"
+GRID, POOL = 16, 8
+tL = int(os.environ.get("TL", str(RENDER_H // 4)))  # ③ latent帧数(stride4采样② rollout), 随RENDER_H延长
+DS = os.environ.get("DS", "outputs/flow_render_dataset_can_dual/clips_robot_retrack.npz")  # ★retrack新flow(与②训练/eval一致)
 OUT = os.environ.get("OUT", "outputs/video_arch_wm/keyboard_3d")
 WM_CKPT = os.environ.get("WM_CKPT", "outputs/cross_embodiment_wm/abs_vs_rel_humanhelps/wm_dummy5_rh_N3000.pt")
 IK_CKPT = os.environ.get("IK_CKPT", "outputs/cross_embodiment_wm/ik_adapter_can/ik_adapter.pt")
@@ -93,6 +94,17 @@ def precompute_script(si, script, R):
     traj3d = np.concatenate([traj_m, np.repeat(traj_m[-1:], pad, 0)], 0)[:Ltot]
     grip_traj = np.concatenate([grip_m, np.repeat(grip_m[-1:], pad)], 0)[:Ltot]
     efA, efB = project_eef_dual(traj3d)                                   # (Ltot,3,2), efA[f]=世界帧f
+    # ★mp/dhc/dummy5g 等需第4槽 grip: 合成eef指尖冻结, 故把 grip 命令(grip_traj)归一化注入第4槽(匹配训练 gripslot 语义)
+    _action = getattr(wm, "action", "dummy5")
+    def _add_gripslot(ef):
+        # ★标定(r=0.967): 训练 gripslot = norm(指尖2D距离)/0.1137, 与 physical grip 关系 slot≈18.97*grip+0.006
+        # (旧错误用 grip/0.04 偏开0.16 → mp误以为没夹紧 → fb虚高)
+        gn = np.clip(18.9747 * grip_traj + 0.0057, 0.0, 1.0).astype(np.float32)  # (Ltot,) physical grip→训练gripslot空间
+        return np.concatenate([ef, np.stack([gn, np.zeros_like(gn)], -1)[:, None]], 1)  # (Ltot,4,2)
+    if _action in ("mp", "dhc", "dummy5g", "dummy5rs"):
+        efA_act, efB_act = _add_gripslot(efA), _add_gripslot(efB)
+    else:
+        efA_act, efB_act = efA, efB
     # ② rollout: 初始 tracks 两视角 repeat K 当历史; 预测世界帧 K..H-1, 前 K 帧 object=静止起始(与 za 世界帧0锚对齐, 照 eval_e2e_combined)
     trA0 = np.nan_to_num(z["tracks"][si, 0].astype(np.float32))          # (P,2)
     trB0 = np.nan_to_num(z["tracks_low"][si, 0].astype(np.float32))
@@ -100,7 +112,7 @@ def precompute_script(si, script, R):
     t2 = lambda a: torch.from_numpy(a[None]).float().to(dev)
     with torch.no_grad():
         pr = W.rollout_dual(wm, torch.from_numpy(trDseq).float().to(dev),
-                            t2(efA), t2(efB), RENDER_H - K)[0].cpu().numpy()   # (H-K,2P,2) 世界帧 K..H-1
+                            t2(efA_act), t2(efB_act), RENDER_H - K)[0].cpu().numpy()   # (H-K,2P,2) 世界帧 K..H-1
     pred2_A = np.concatenate([np.repeat(trA0[None], K, 0), pr[:, :P]], 0)      # (H,P,2) 世界帧 0..H-1
     pred2_B = np.concatenate([np.repeat(trB0[None], K, 0), pr[:, P:2*P]], 0)
     # 渲染帧 = 世界帧 0..H-1 (与 za 锚对齐, cond rf 直接索引世界帧)
@@ -149,13 +161,16 @@ def render_from_precompute(pre_npz, skel_npz, models):
     vis = np.ones(P, np.float32)
     za = torch.stack([vae.encode(torch.from_numpy(f0[v].astype(np.float32).transpose(2, 0, 1)[None, :, None] / 255.).to(dev))[0, :, :1]
                       for v in range(2)])[None]
-    cond = np.zeros((2, 7, tL, GRID, GRID), np.float32)
-    for k in range(tL):
+    tL_r = 1 + (H - 1) // 4                                               # ★latent帧数随实际H(支持早停后的短rollout)
+    cond = np.zeros((2, 7, tL_r, GRID, GRID), np.float32)
+    for k in range(tL_r):
         rf = 0 if k == 0 else min(4 * k, H - 1)
         for v in range(2):
             cond[v, :, k] = cond_v(v, tr0[v], traj[v][rf], ef[v][0], ef[v][rf], vis, joint[rf], fr0[v], skel[v][rf], "skel")
+    from video_multihead_wm import MultiHeadVideoWM
+    cch = m3S.c_embed.in_features // 4                                    # ★从c_embed反推真Ccond(patch²=4): grip③=7/skel③=4; 别硬编码
     with torch.no_grad():
-        xs = sample(m3S, za, torch.from_numpy(cond[None]).float().to(dev))
+        xs = sample(m3S, za, torch.from_numpy(cond[:, :cch][None]).float().to(dev))
         rend = np.stack([vae.decode(xs[:, v])[0].permute(1, 2, 3, 0).cpu().numpy() for v in range(2)])  # (2,H,128,128,3)
     return rend, d, skel
 
@@ -168,9 +183,10 @@ def stage_render():
     import exp_scel_dualview_wm as W, exp_scel_dualview_comb as DC, exp_scel_dualview_dit as DIT
     import exp_scel_dualview_gmaskcond as G
     from video_dit import VideoDiT
+    from video_multihead_wm import MultiHeadVideoWM, AuxHead      # ★干净L48多头③
     from keyboard_3d_control import _AR
     dev = "cuda" if torch.cuda.is_available() else "cpu"
-    for _c in [W.DualLWC, DC.DualCombLWC, G.DualViewDiTG, DIT.DualViewDiT, VideoDiT]:
+    for _c in [W.DualLWC, DC.DualCombLWC, G.DualViewDiTG, DIT.DualViewDiT, VideoDiT, MultiHeadVideoWM, AuxHead]:
         setattr(sys.modules["__main__"], _c.__name__, _c)
     m3S = torch.load(CK_SKEL, map_location=dev, weights_only=False).eval()
     vae = WanVAE(device=dev); z = np.load(DS)
@@ -195,13 +211,15 @@ def stage_render():
                 rcols.append(Rr); fcols.append(Fl)
             cmdstr = " ".join(f"{n}{_AR.get(c, c)}" for c, n in script)
             gstate = "grip %d->%d%%" % (100 * d["grip"][0] / 0.04, 100 * d["grip"][Tp-1] / 0.04)
+            gif_k0 = int(os.environ.get("GIF_K0", str(K)))     # 冷启动demo标签从0起(GIF_K0=0); keyboard默认K
             save_combined_gif(f"{OUT}/gifs/{name}_si{si}.gif", np.stack(rcols), np.stack(fcols),
-                              ["cam_high", "cam_low"], [None, None], K,
+                              ["cam_high", "cam_low"], [None, None], gif_k0,
                               caption=f"{name} | {cmdstr} | {gstate} | grasp{grasp[:Tp].mean():.0%} | H={Tp}")
             print(f"[render] {name}_si{si} done (Tp={Tp} grasp {grasp[:Tp].mean():.0%} fb {d['fb'].mean():.0%})", flush=True)
     open(f"{OUT}/README.txt", "w").write(
         "keyboard 3D demo (视频架构skel③). 双视角并列: Rendered行 + Flow+Skel overlay行(②/兜底物体红+静态起始绿+eef黄+skel白线).\n"
-        f"scripts={list(SCRIPTS)} seqs={SEQS} DELTA={DELTA} REPEAT={REPEAT}. ②wm_dummy5_rh_N3000 ③m4_ablB_skel IK=ik_adapter_can.\n")
+        f"scripts={list(SCRIPTS)} seqs={SEQS} DELTA={DELTA} REPEAT={REPEAT}. "
+        f"②={os.path.basename(os.path.dirname(WM_CKPT))} ③={os.path.basename(os.path.dirname(CK_SKEL))} IK={os.path.basename(os.path.dirname(IK_CKPT))}.\n")
     print("=== render DONE ===", flush=True)
 
 

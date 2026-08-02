@@ -65,6 +65,8 @@ def main():
         if i % 20 == 0: print(f"  {i}/{len(clips)} clip{n}", flush=True)
     cond = np.stack(conds)                                                # (Nsel,2,96,tL,16,16)
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
+    if os.path.isdir(OUT):                                                # ★防遗留目录占用npz路径(栽过两次)
+        import shutil; shutil.rmtree(OUT)
     np.savez(OUT, cond=cond, clips=np.array(clips), tL=tL)
     print(f"[save] {OUT} cond{cond.shape}", flush=True)
 
