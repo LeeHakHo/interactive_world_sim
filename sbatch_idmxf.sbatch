@@ -2,7 +2,7 @@
 #SBATCH --job-name=idmxf
 #SBATCH --output=/scr2/yusenluo/interactive_world_sim/outputs/idm_derisk/logs/idmxf_%j.txt
 #SBATCH --ntasks=1
-#SBATCH --gres=gpu:1
+#SBATCH --gres=shard:22        # ★分片(小任务),整卡计48挤QoS;按峰值显存调
 #SBATCH --cpus-per-task=8
 #SBATCH --time=3:00:00
 #SBATCH --mem=48G
